@@ -16,6 +16,7 @@
 #include <errno.h>
 #include <sched.h>
 #include <stdarg.h>
+#include <time.h>
 
 #define STORAGE_STOP_DRAIN_POLLS_DEFAULT 1000u
 #define STORAGE_STOP_DRAIN_SLEEP_US 1000u
@@ -123,11 +124,13 @@ typedef struct {
     uint64_t window_received_bytes;
     uint64_t window_nvme_bytes;
     uint64_t dma_desc_completed_count;
-    uint64_t dma_desc_interval_count;
-    uint64_t dma_desc_interval_total_us;
-    uint64_t dma_desc_interval_min_us;
-    uint64_t dma_desc_interval_max_us;
+    uint64_t dma_harvest_interval_count;
+    uint64_t dma_harvest_interval_total_us;
+    uint64_t dma_harvest_interval_min_us;
+    uint64_t dma_harvest_interval_max_us;
+    uint64_t first_dma_desc_us;
     uint64_t last_dma_desc_us;
+    uint64_t window_backlog_bytes;
     uint64_t ring_full_count;
     uint64_t ring_full_total_us;
     uint64_t ring_full_start_us;
@@ -177,11 +180,16 @@ static void storage_trace_flush_done(const ChannelRuntime *rt,
 void storage_write_request_stop(void);
 
 static uint64_t storage_wall_time_us(void) {
-    struct timeval tv;
-    if (gettimeofday(&tv, NULL) != 0) {
+    struct timespec ts;
+#ifdef CLOCK_MONOTONIC_RAW
+    if (clock_gettime(CLOCK_MONOTONIC_RAW, &ts) != 0 &&
+        clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+#else
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+#endif
         return 0u;
     }
-    return ((uint64_t)tv.tv_sec * 1000000ull) + (uint64_t)tv.tv_usec;
+    return ((uint64_t)ts.tv_sec * 1000000ull) + (uint64_t)ts.tv_nsec / 1000ull;
 }
 
 static uint64_t storage_elapsed_us(uint64_t start_us) {
@@ -563,8 +571,10 @@ static void storage_nvme_timing_snapshot(const ChannelRuntime *rt,
     out->cq_pop_total_us = rt->nvme_cq_pop_total_us;
     out->cq_completed = rt->nvme_cq_completed;
     out->cmd_count = __atomic_load_n(&rt->nvme_cmd_count, __ATOMIC_ACQUIRE);
-    out->active_qd_integral_us = rt->nvme_active_qd_integral_us;
-    out->active_qd_observed_us = rt->nvme_active_qd_observed_us;
+    out->active_qd_integral_us = __atomic_load_n(&rt->nvme_active_qd_integral_us,
+                                                 __ATOMIC_ACQUIRE);
+    out->active_qd_observed_us = __atomic_load_n(&rt->nvme_active_qd_observed_us,
+                                                 __ATOMIC_ACQUIRE);
 }
 
 static double storage_nvme_active_qd_avg_delta(const StorageNvmeTimingSnapshot *before,
@@ -670,8 +680,13 @@ static int storage_trace_chunk_enabled(uint64_t chunk_index, uint32_t slot)
 {
     uint64_t trace_chunk;
     uint64_t trace_slot;
-    int has_chunk = storage_env_u64("SRC_REAL_STORAGE_TRACE_CHUNK", &trace_chunk);
+    int has_chunk;
     int has_slot = storage_env_u64("SRC_REAL_STORAGE_TRACE_SLOT", &trace_slot);
+
+    if (!storage_log_enabled(STORAGE_LOG_TRACE)) {
+        return 0;
+    }
+    has_chunk = storage_env_u64("SRC_REAL_STORAGE_TRACE_CHUNK", &trace_chunk);
 
     if (!has_chunk && !has_slot) {
         return 0;
@@ -1026,15 +1041,18 @@ static void storage_stats_record_dma_desc(StorageProducerStats *stats, uint64_t 
     }
     ++stats->dma_desc_completed_count;
     ++stats->dma_harvest_batch_current;
+    if (stats->first_dma_desc_us == 0u) {
+        stats->first_dma_desc_us = now_us;
+    }
     if (stats->last_dma_desc_us != 0u && now_us >= stats->last_dma_desc_us) {
         uint64_t interval_us = now_us - stats->last_dma_desc_us;
-        ++stats->dma_desc_interval_count;
-        stats->dma_desc_interval_total_us += interval_us;
-        if (stats->dma_desc_interval_min_us == 0u || interval_us < stats->dma_desc_interval_min_us) {
-            stats->dma_desc_interval_min_us = interval_us;
+        ++stats->dma_harvest_interval_count;
+        stats->dma_harvest_interval_total_us += interval_us;
+        if (stats->dma_harvest_interval_min_us == 0u || interval_us < stats->dma_harvest_interval_min_us) {
+            stats->dma_harvest_interval_min_us = interval_us;
         }
-        if (interval_us > stats->dma_desc_interval_max_us) {
-            stats->dma_desc_interval_max_us = interval_us;
+        if (interval_us > stats->dma_harvest_interval_max_us) {
+            stats->dma_harvest_interval_max_us = interval_us;
         }
     }
     stats->last_dma_desc_us = now_us;
@@ -1173,6 +1191,10 @@ static void storage_stats_print_periodic(StorageProducerStats *stats,
     uint64_t nvme_cmd_delta;
     uint64_t nvme_cq_delta;
     uint64_t harvest_batch_avg;
+    uint64_t active_qd_integral_us;
+    uint64_t active_qd_observed_us;
+    uint64_t submit_stall_count;
+    uint64_t submit_stall_max_us;
     uint32_t busy_slots;
     bool print_zero_stats;
     StorageQueueSnapshot snapshot;
@@ -1191,6 +1213,10 @@ static void storage_stats_print_periodic(StorageProducerStats *stats,
     nvme_delta = nvme_bytes - stats->window_nvme_bytes;
     nvme_cmd_delta = nvme_cmd_count - stats->window_nvme_cmd_count;
     nvme_cq_delta = nvme_cq_completed - stats->window_nvme_cq_completed;
+    active_qd_integral_us = __atomic_load_n(&rt->nvme_active_qd_integral_us, __ATOMIC_ACQUIRE);
+    active_qd_observed_us = __atomic_load_n(&rt->nvme_active_qd_observed_us, __ATOMIC_ACQUIRE);
+    submit_stall_count = __atomic_load_n(&rt->nvme_submit_stall_count, __ATOMIC_ACQUIRE);
+    submit_stall_max_us = __atomic_load_n(&rt->nvme_submit_stall_max_us, __ATOMIC_ACQUIRE);
     harvest_batch_avg = stats->dma_harvest_batches > 0u
                             ? stats->dma_harvest_batch_total / stats->dma_harvest_batches
                             : 0u;
@@ -1216,7 +1242,7 @@ static void storage_stats_print_periodic(StorageProducerStats *stats,
     if (storage_env_flag_enabled("SRC_REAL_ENABLE_STORAGE_STATS")) {
         printf("storage_stats channel=%d task=%s file_index=%u"
                " received_bytes=%" PRIu64 " written_bytes=%" PRIu64
-               " dma_mib_s=%.3f nvme_mib_s=%.3f busy_slots=%u software_free_slots=%u"
+               " rx_mib_s=%.3f nvme_complete_mib_s=%.3f busy_slots=%u software_free_slots=%u"
                " buffered_bytes=%" PRIu64 " ring_full_count=%" PRIu64
                " nvme_cmd_count=%" PRIu64 " nvme_cmd_size_bytes=%u"
                " nvme_qd_effective=%u nvme_active_qd_current=%u"
@@ -1238,31 +1264,29 @@ static void storage_stats_print_periodic(StorageProducerStats *stats,
                (unsigned)__atomic_load_n(&rt->nvme_active_qd_current, __ATOMIC_ACQUIRE),
                (unsigned)__atomic_load_n(&rt->nvme_active_qd_max, __ATOMIC_ACQUIRE));
     }
-    storage_emit_line("storage_pipeline channel=%d sec=%u task=%s file_index=%u"
-           " dma_mib_s=%.3f nvme_mib_s=%.3f input_mib_s=%.3f"
+    storage_emit_line("storage_pipeline channel=%d window_ms=%" PRIu64 " task=%s file_index=%u"
+           " rx_mib_s=%.3f nvme_complete_mib_s=%.3f"
            " ready_q=%u ready_q_avg=%u ready_q_max=%u"
            " dma_writable_slots=%u software_free_slots=%u ready_slots=%u nvme_busy_slots=%u"
-           " busy_count=%u buffered=%" PRIu64
+           " busy_count=%u backlog_bytes=%" PRIu64 " backlog_delta_bytes=%" PRId64
            " ring_full=%" PRIu64 " no_free=%" PRIu64
            " writer_idle_us=%" PRIu64 " writer_active_us=%" PRIu64
            " dma_harvest_count=%" PRIu64 " harvest_batch_avg=%" PRIu64
-           " harvest_batch_max=%u nvme_cmd_submitted_1s=%" PRIu64
-           " nvme_cmd_completed_1s=%" PRIu64
+           " harvest_batch_max=%u nvme_cmd_submitted_window=%" PRIu64
+           " nvme_cmd_completed_window=%" PRIu64
            " active_qd_avg=%.3f active_qd_max=%u"
            " writer_rt_enabled=%u writer_rt_prio=%u"
-           " writer_submit_stall_count=%" PRIu64 " writer_submit_stall_max_us=%" PRIu64
            " submit_stall_count=%" PRIu64 " submit_stall_max_us=%" PRIu64
            " writer_empty_wait_us=%" PRIu64 " writer_drain_active_us=%" PRIu64
            " ready_q_nonempty_us=%" PRIu64
            " writer_drain_loop_count=%" PRIu64
            " writer_slots_per_drain_loop=%" PRIu64,
            rt->cfg->id,
-           (unsigned)(stats->interval_ms / 1000u),
+           elapsed_us / 1000u,
            task_no,
            (unsigned)file_index,
            elapsed_us > 0u ? ((double)received_delta * 1000000.0 / (double)elapsed_us / 1048576.0) : 0.0,
            elapsed_us > 0u ? ((double)nvme_delta * 1000000.0 / (double)elapsed_us / 1048576.0) : 0.0,
-           elapsed_us > 0u ? ((double)received_delta * 1000000.0 / (double)elapsed_us / 1048576.0) : 0.0,
            (unsigned)snapshot.ready_depth_current,
            (unsigned)snapshot.ready_depth_avg,
            (unsigned)snapshot.ready_depth_max,
@@ -1272,6 +1296,7 @@ static void storage_stats_print_periodic(StorageProducerStats *stats,
            (unsigned)snapshot.nvme_busy_slots,
            (unsigned)snapshot.busy_count,
            snapshot.buffered_bytes,
+           (int64_t)snapshot.buffered_bytes - (int64_t)stats->window_backlog_bytes,
            stats->ring_full_count,
            stats->dma_no_free_slot_count,
            snapshot.writer_idle_us,
@@ -1281,17 +1306,14 @@ static void storage_stats_print_periodic(StorageProducerStats *stats,
            (unsigned)stats->dma_harvest_batch_max,
            nvme_cmd_delta,
            nvme_cq_delta,
-           rt->nvme_active_qd_observed_us > 0u
-               ? (double)rt->nvme_active_qd_integral_us /
-                     (double)rt->nvme_active_qd_observed_us
+           active_qd_observed_us > 0u
+               ? (double)active_qd_integral_us / (double)active_qd_observed_us
                : 0.0,
            (unsigned)__atomic_load_n(&rt->nvme_active_qd_max, __ATOMIC_ACQUIRE),
            snapshot.writer_rt_enabled ? 1u : 0u,
            (unsigned)snapshot.writer_rt_prio,
-           rt->nvme_submit_stall_count,
-           rt->nvme_submit_stall_max_us,
-           rt->nvme_submit_stall_count,
-           rt->nvme_submit_stall_max_us,
+           submit_stall_count,
+           submit_stall_max_us,
            snapshot.writer_idle_us,
            snapshot.writer_active_us,
            snapshot.ready_q_nonempty_us,
@@ -1303,6 +1325,7 @@ static void storage_stats_print_periodic(StorageProducerStats *stats,
     stats->window_start_us = now_us;
     stats->window_received_bytes = received_bytes;
     stats->window_nvme_bytes = nvme_bytes;
+    stats->window_backlog_bytes = snapshot.buffered_bytes;
     stats->window_nvme_cmd_count = nvme_cmd_count;
     stats->window_nvme_cq_completed = nvme_cq_completed;
     stats->next_log_us = now_us + (uint64_t)stats->interval_ms * 1000ull;
@@ -2521,13 +2544,15 @@ int execute_write_with_result(const ParsedArgs *args, GlobalOptions gopt, WriteR
     data_persisted = true;
 
     printf("metadata_write_done backend=ramfs channel=%d name=%s slot=%d task=%s file_index=%u size=%" PRIu64
-           " start_lba=0x%08" PRIx64 " sectors=%" PRIu64 " file_type=%u chunks=%u continuous=%u\n",
+           " metadata_size_saturated=%u start_lba=0x%08" PRIx64
+           " sectors=%" PRIu64 " file_type=%u chunks=%u continuous=%u\n",
            cfg->id,
            cfg->name,
            metadata_slot,
            args->task_no,
            (unsigned)effective_file_index,
            bytes_written,
+           bytes_written > UINT32_MAX ? 1u : 0u,
            start_lba,
            total_sectors,
            (unsigned)(args->has_proto_file_type ? args->proto_file_type : cfg->file_type),
@@ -2538,6 +2563,15 @@ int execute_write_with_result(const ParsedArgs *args, GlobalOptions gopt, WriteR
         uint64_t nvme_cmd_bytes_total = __atomic_load_n(&rt.nvme_cmd_bytes_total, __ATOMIC_ACQUIRE);
         uint64_t nvme_write_bytes_done = __atomic_load_n(&rt.nvme_write_bytes_done, __ATOMIC_ACQUIRE);
         uint64_t latency_total_us = __atomic_load_n(&rt.nvme_cmd_latency_total_us, __ATOMIC_ACQUIRE);
+        uint64_t latency_sample_count = __atomic_load_n(&rt.nvme_latency_sample_count, __ATOMIC_ACQUIRE);
+        uint64_t nvme_first_submit_us = __atomic_load_n(&rt.nvme_first_submit_us, __ATOMIC_ACQUIRE);
+        uint64_t nvme_last_completion_us = __atomic_load_n(&rt.nvme_last_completion_us, __ATOMIC_ACQUIRE);
+        uint64_t nvme_wall_us = nvme_last_completion_us >= nvme_first_submit_us
+                                    ? nvme_last_completion_us - nvme_first_submit_us
+                                    : 0u;
+        uint64_t dma_observed_us = producer_stats.last_dma_desc_us >= producer_stats.first_dma_desc_us
+                                       ? producer_stats.last_dma_desc_us - producer_stats.first_dma_desc_us
+                                       : 0u;
         uint64_t harvest_batch_avg = producer_stats.dma_harvest_batches > 0u
                                          ? producer_stats.dma_harvest_batch_total /
                                                producer_stats.dma_harvest_batches
@@ -2557,21 +2591,26 @@ int execute_write_with_result(const ParsedArgs *args, GlobalOptions gopt, WriteR
             integrity_risk = "dma_stop_recovery_failed";
         }
 
-        printf("storage_transfer_done channel=%d task=%s file_index=%u effective_file_index=%u"
+        if (storage_env_flag_enabled("SRC_REAL_LEGACY_RESULT_LINE")) {
+            printf("storage_transfer_done channel=%d task=%s file_index=%u effective_file_index=%u"
                " dma_received_bytes=%" PRIu64 " file_bytes=%" PRIu64
                " ssd_sector_bytes=%" PRIu64 " sectors=%" PRIu64
                " chunks=%u elapsed_ms=%" PRIu64 " nvme_write_ms=%" PRIu64
-               " dma_mib_s=%.3f file_mib_s=%.3f nvme_mib_s=%.3f"
+               " dma_mib_s=%.3f file_mib_s=%.3f nvme_active_mib_s=%.3f"
                " dma_desc_completed_count=%" PRIu64
-               " dma_desc_interval_min_us=%" PRIu64
-               " dma_desc_interval_max_us=%" PRIu64
-               " dma_desc_interval_avg_us=%" PRIu64
+               " first_dma_desc_us=%" PRIu64 " last_dma_desc_us=%" PRIu64
+               " dma_observed_mib_s=%.3f"
+               " dma_harvest_interval_min_us=%" PRIu64
+               " dma_harvest_interval_max_us=%" PRIu64
+               " dma_harvest_interval_avg_us=%" PRIu64
                " nvme_cmd_size_bytes=%u nvme_max_dts_bytes=%u nvme_cmd_count=%" PRIu64
                " nvme_cmd_bytes_total=%" PRIu64
                " nvme_write_bytes_done=%" PRIu64
                " nvme_cmd_latency_min_us=%" PRIu64
                " nvme_cmd_latency_max_us=%" PRIu64
                " nvme_cmd_latency_avg_us=%" PRIu64
+               " nvme_latency_sample_count=%" PRIu64
+               " nvme_wall_ms=%" PRIu64 " nvme_wall_mib_s=%.3f"
                " nvme_qd_requested=%u nvme_qd_effective=%u"
                " nvme_active_qd_max=%u nvme_active_qd_avg=%.3f"
                " ring_full_count=%" PRIu64 " ring_full_total_ms=%" PRIu64
@@ -2608,10 +2647,13 @@ int execute_write_with_result(const ParsedArgs *args, GlobalOptions gopt, WriteR
                elapsed_us > 0u ? ((double)bytes_written * 1000000.0 / (double)elapsed_us / 1048576.0) : 0.0,
                nvme_write_us > 0u ? ((double)nvme_write_bytes_done * 1000000.0 / (double)nvme_write_us / 1048576.0) : 0.0,
                producer_stats.dma_desc_completed_count,
-               producer_stats.dma_desc_interval_min_us,
-               producer_stats.dma_desc_interval_max_us,
-               producer_stats.dma_desc_interval_count > 0u
-                   ? producer_stats.dma_desc_interval_total_us / producer_stats.dma_desc_interval_count
+               producer_stats.first_dma_desc_us,
+               producer_stats.last_dma_desc_us,
+               dma_observed_us > 0u ? ((double)dma_received_bytes * 1000000.0 / (double)dma_observed_us / 1048576.0) : 0.0,
+               producer_stats.dma_harvest_interval_min_us,
+               producer_stats.dma_harvest_interval_max_us,
+               producer_stats.dma_harvest_interval_count > 0u
+                   ? producer_stats.dma_harvest_interval_total_us / producer_stats.dma_harvest_interval_count
                    : 0u,
                (unsigned)rt.nvme_cmd_size_bytes,
                (unsigned)rt.nvme_max_dts_bytes,
@@ -2620,7 +2662,10 @@ int execute_write_with_result(const ParsedArgs *args, GlobalOptions gopt, WriteR
                nvme_write_bytes_done,
                __atomic_load_n(&rt.nvme_cmd_latency_min_us, __ATOMIC_ACQUIRE),
                __atomic_load_n(&rt.nvme_cmd_latency_max_us, __ATOMIC_ACQUIRE),
-               nvme_cmd_count > 0u ? latency_total_us / nvme_cmd_count : 0u,
+               latency_sample_count > 0u ? latency_total_us / latency_sample_count : 0u,
+               latency_sample_count,
+               nvme_wall_us / 1000u,
+               nvme_wall_us > 0u ? ((double)nvme_write_bytes_done * 1000000.0 / (double)nvme_wall_us / 1048576.0) : 0.0,
                (unsigned)rt.nvme_qd_requested,
                (unsigned)rt.nvme_qd_effective,
                (unsigned)__atomic_load_n(&rt.nvme_active_qd_max, __ATOMIC_ACQUIRE),
@@ -2662,7 +2707,57 @@ int execute_write_with_result(const ParsedArgs *args, GlobalOptions gopt, WriteR
                rt.dma_rxsof_count,
                rt.dma_rxeof_count,
                rt.dma_rx_packet_open ? 1u : 0u,
-               bounded ? 0u : 1u);
+                   bounded ? 0u : 1u);
+        }
+
+        storage_emit_line("storage_result channel=%d task=%s file_index=%u status=%s"
+                          " file_bytes=%" PRIu64 " data_persisted=%u integrity_ok=%u"
+                          " integrity_risk=%s ring_full_count=%" PRIu64,
+                          cfg->id,
+                          args->task_no,
+                          (unsigned)effective_file_index,
+                          integrity_ok ? "success" : "failed",
+                          bytes_written,
+                          data_persisted ? 1u : 0u,
+                          integrity_ok ? 1u : 0u,
+                          integrity_risk,
+                          producer_stats.ring_full_count);
+        storage_emit_line("storage_result_perf elapsed_ms=%" PRIu64
+                          " nvme_active_ms=%" PRIu64 " nvme_active_mib_s=%.3f"
+                          " nvme_wall_ms=%" PRIu64 " nvme_wall_mib_s=%.3f"
+                          " dma_observed_mib_s=%.3f nvme_qd_effective=%u"
+                          " nvme_active_qd_avg=%.3f nvme_active_qd_max=%u",
+                          elapsed_us / 1000u,
+                          nvme_write_us / 1000u,
+                          nvme_write_us > 0u ? ((double)nvme_write_bytes_done * 1000000.0 /
+                                                   (double)nvme_write_us / 1048576.0) : 0.0,
+                          nvme_wall_us / 1000u,
+                          nvme_wall_us > 0u ? ((double)nvme_write_bytes_done * 1000000.0 /
+                                                 (double)nvme_wall_us / 1048576.0) : 0.0,
+                          dma_observed_us > 0u ? ((double)dma_received_bytes * 1000000.0 /
+                                                   (double)dma_observed_us / 1048576.0) : 0.0,
+                          (unsigned)rt.nvme_qd_effective,
+                          rt.nvme_active_qd_observed_us > 0u
+                              ? (double)rt.nvme_active_qd_integral_us /
+                                    (double)rt.nvme_active_qd_observed_us : 0.0,
+                          (unsigned)__atomic_load_n(&rt.nvme_active_qd_max, __ATOMIC_ACQUIRE));
+        storage_emit_line("storage_result_diag ready_q_max=%u ready_q_avg=%u"
+                          " max_ddr_busy_slots=%u max_ddr_buffered_bytes=%" PRIu64
+                          " submit_stall_count=%" PRIu64 " submit_stall_max_us=%" PRIu64
+                          " dma_harvest_interval_min_us=%" PRIu64
+                          " dma_harvest_interval_avg_us=%" PRIu64
+                          " dma_harvest_interval_max_us=%" PRIu64,
+                          (unsigned)final_queue_snapshot.ready_depth_max,
+                          (unsigned)final_queue_snapshot.ready_depth_avg,
+                          (unsigned)max_busy_slots,
+                          max_buffered_bytes,
+                          rt.nvme_submit_stall_count,
+                          rt.nvme_submit_stall_max_us,
+                          producer_stats.dma_harvest_interval_min_us,
+                          producer_stats.dma_harvest_interval_count > 0u
+                              ? producer_stats.dma_harvest_interval_total_us /
+                                    producer_stats.dma_harvest_interval_count : 0u,
+                          producer_stats.dma_harvest_interval_max_us);
 
         if (result) {
             result->integrity_ok = integrity_ok;
@@ -2684,7 +2779,7 @@ int execute_write_with_result(const ParsedArgs *args, GlobalOptions gopt, WriteR
         result->data_persisted = data_persisted;
         strncpy(result->task_no, args->task_no, sizeof(result->task_no) - 1u);
     }
-    rc = dma_stop_failed ? -1 : 0;
+    rc = (dma_stop_failed || producer_stats.integrity_risk_ring_full) ? -1 : 0;
     dbg_printf("[DBG][WRITE] %s ch=%d task=%s idx=%u bytes=%" PRIu64 " lba=0x%08" PRIx64
                " sectors=%" PRIu64 " chunks=%u dma_stop_result=%d\n",
                dma_stop_failed ? "persisted with DMA stop failure" : "success",
@@ -2775,6 +2870,45 @@ out:
                rt.dma_rxsof_count,
                rt.dma_rxeof_count,
                rt.dma_rx_packet_open ? 1u : 0u);
+        storage_emit_line("storage_result channel=%d task=%s file_index=%u status=failed"
+                          " file_bytes=%" PRIu64 " data_persisted=%u integrity_ok=0"
+                          " integrity_risk=%s ring_full_count=%" PRIu64,
+                          cfg ? cfg->id : args->channel_id,
+                          args->task_no,
+                          (unsigned)effective_file_index,
+                          bytes_written,
+                          data_persisted ? 1u : 0u,
+                          producer_stats.integrity_risk_ring_full
+                              ? "ddr_ring_full_no_aurora_backpressure"
+                              : (tail_incomplete ? "tail_descriptor_incomplete"
+                                                 : (dma_stop_failed ? "dma_stop_recovery_failed"
+                                                                    : "storage_error")),
+                          producer_stats.ring_full_count);
+        storage_emit_line("storage_result_perf elapsed_ms=%" PRIu64
+                          " nvme_active_ms=%" PRIu64 " nvme_active_mib_s=%.3f"
+                          " nvme_wall_ms=0 nvme_wall_mib_s=0.000 dma_observed_mib_s=0.000"
+                          " nvme_qd_effective=%u nvme_active_qd_avg=0.000 nvme_active_qd_max=%u",
+                          elapsed_us / 1000u,
+                          nvme_write_us / 1000u,
+                          nvme_write_us > 0u ? ((double)bytes_written * 1000000.0 /
+                                                   (double)nvme_write_us / 1048576.0) : 0.0,
+                          (unsigned)rt.nvme_qd_effective,
+                          (unsigned)__atomic_load_n(&rt.nvme_active_qd_max, __ATOMIC_ACQUIRE));
+        storage_emit_line("storage_result_diag ready_q_max=0 ready_q_avg=0"
+                          " max_ddr_busy_slots=%u max_ddr_buffered_bytes=%" PRIu64
+                          " submit_stall_count=%" PRIu64 " submit_stall_max_us=%" PRIu64
+                          " dma_harvest_interval_min_us=%" PRIu64
+                          " dma_harvest_interval_avg_us=%" PRIu64
+                          " dma_harvest_interval_max_us=%" PRIu64,
+                          (unsigned)max_busy_slots,
+                          max_buffered_bytes,
+                          rt.nvme_submit_stall_count,
+                          rt.nvme_submit_stall_max_us,
+                          producer_stats.dma_harvest_interval_min_us,
+                          producer_stats.dma_harvest_interval_count > 0u
+                              ? producer_stats.dma_harvest_interval_total_us /
+                                    producer_stats.dma_harvest_interval_count : 0u,
+                          producer_stats.dma_harvest_interval_max_us);
         fflush(stdout);
         dbg_printf("[DBG][WRITE] exit fail ch=%d task=%s idx=%u dma_received=%" PRIu64
                    " file_bytes=%" PRIu64 " sectors=%" PRIu64 "\n",
@@ -3233,6 +3367,7 @@ int execute_ddr_pattern_store_with_result(const ParsedArgs *args, GlobalOptions 
     }
 
     printf("ddr_pattern_store_done channel=%d mode=%s task=%s file_index=%u bytes=%" PRIu64
+           " metadata_size_saturated=%u"
            " ddr_cpu=0x%08" PRIx64 " ddr_offset=0x%08" PRIx64
            " ddr_dma=0x%08" PRIx64
            " start_lba=0x%08" PRIx64 " sectors=%" PRIu64
@@ -3244,6 +3379,7 @@ int execute_ddr_pattern_store_with_result(const ParsedArgs *args, GlobalOptions 
            args->task_no,
            (unsigned)effective_file_index,
            size_bytes,
+           size_bytes > UINT32_MAX ? 1u : 0u,
            cfg->ddr_cpu_base,
            ddr_offset,
            ddr_hw_addr,

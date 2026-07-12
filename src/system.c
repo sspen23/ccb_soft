@@ -118,6 +118,10 @@ typedef struct {
     size_t output_used;
     char echo_line[2048];
     size_t echo_line_used;
+    bool final_result_seen;
+    bool final_data_persisted;
+    bool final_integrity_ok;
+    bool final_status_success;
     PlannedFile planned_file;
     bool has_planned_file;
     char task_id[12];
@@ -1052,12 +1056,16 @@ static int env_u32_allow_zero(const char *name, uint32_t max_value, uint32_t *ou
 
 static uint64_t system_wall_time_us(void)
 {
-    struct timeval tv;
-
-    if (gettimeofday(&tv, NULL) != 0) {
+    struct timespec ts;
+#ifdef CLOCK_MONOTONIC_RAW
+    if (clock_gettime(CLOCK_MONOTONIC_RAW, &ts) != 0 &&
+        clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+#else
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+#endif
         return 0u;
     }
-    return (uint64_t)tv.tv_sec * 1000000ull + (uint64_t)tv.tv_usec;
+    return (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)ts.tv_nsec / 1000ull;
 }
 
 static uint32_t network_limit_mb_s(void)
@@ -1356,6 +1364,14 @@ static bool worker_output_has_important_token(const char *text)
 {
     static const char *tokens[] = {
         "storage_worker_done",
+        "storage_pipeline_config",
+        "storage_pipeline",
+        "storage_dma_idle_done",
+        "storage_ready",
+        "pcie_link_status",
+        "storage_result",
+        "storage_result_perf",
+        "storage_result_diag",
         "storage_transfer_done",
         "storage_transfer_failed",
         "storage_ring_warning",
@@ -1382,11 +1398,29 @@ static bool worker_output_has_important_token(const char *text)
 
 static void echo_worker_line(Task *task, const char *line)
 {
+    uint64_t parsed = 0u;
+
     if (!task || !line) {
         return;
     }
-    if (system_env_flag_enabled("SRC_REAL_ECHO_WORKER_OUTPUT")) {
+    if (strncmp(line, "storage_result ", 15u) == 0) {
+        task->final_result_seen = true;
+        task->final_status_success = strstr(line, "status=success") != NULL;
+        if (parse_token_u64(line, "data_persisted=", &parsed) == 0) {
+            task->final_data_persisted = parsed != 0u;
+        }
+        if (parse_token_u64(line, "integrity_ok=", &parsed) == 0) {
+            task->final_integrity_ok = parsed != 0u;
+        }
+    }
+    if (worker_output_has_important_token(line)) {
         system_write_stdout_line(line);
+        return;
+    }
+    if (getenv("SRC_REAL_ECHO_WORKER_OUTPUT") != NULL) {
+        if (system_env_flag_enabled("SRC_REAL_ECHO_WORKER_OUTPUT")) {
+            system_write_stdout_line(line);
+        }
         return;
     }
     if (task == &transfer_task &&
@@ -1400,9 +1434,6 @@ static void echo_worker_line(Task *task, const char *line)
          dbg_category_enabled("STORAGE"))) {
         system_write_stdout_line(line);
         return;
-    }
-    if (worker_output_has_important_token(line)) {
-        system_write_stdout_line(line);
     }
 }
 
@@ -1591,6 +1622,10 @@ static int start_storage_worker(const PlannedFile *planned, const char *task_id,
     task->output[0] = '\0';
     task->echo_line_used = 0u;
     task->echo_line[0] = '\0';
+    task->final_result_seen = false;
+    task->final_data_persisted = false;
+    task->final_integrity_ok = false;
+    task->final_status_success = false;
     task->planned_file = *planned;
     task->has_planned_file = true;
     memset(task->task_id, 0, sizeof(task->task_id));
@@ -1764,7 +1799,9 @@ static void finalize_storage_task(Task *task, int exit_code)
     }
 
     planned = task->planned_file;
-    if (exit_code != 0) {
+    if (exit_code != 0 ||
+        (task->final_result_seen &&
+         (!task->final_status_success || !task->final_integrity_ok))) {
         (void)parse_token_u64(task->output, "data_persisted=", &data_persisted);
         (void)parse_token_u64(task->output, "integrity_ok=", &integrity_ok);
         (void)parse_token_u64(task->output, "dma_stop_recovered=", &dma_stop_recovered);
@@ -1777,7 +1814,7 @@ static void finalize_storage_task(Task *task, int exit_code)
                   task->task_id,
                   planned.channel_id,
                   planned.file_index,
-                  exit_code,
+                  exit_code != 0 ? exit_code : 1,
                   task->output);
         dbg_printf("[DBG][STORAGE] worker failed task=%s ch=%d idx=%d exit=%d"
                    " data_persisted=%" PRIu64 " integrity_ok=%" PRIu64
@@ -1785,7 +1822,7 @@ static void finalize_storage_task(Task *task, int exit_code)
                    task->task_id,
                    planned.channel_id,
                    planned.file_index,
-                   exit_code,
+                   exit_code != 0 ? exit_code : 1,
                    data_persisted,
                    integrity_ok,
                    dma_stop_recovered,

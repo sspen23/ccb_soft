@@ -242,15 +242,21 @@ int metadata_resolve_file_index(const FileEntry *table,
 
 void print_entry(int ch, int slot, const FileEntry *e) {
     char task[12];
+    uint64_t effective_size;
     /* task_no in metadata may not be null-terminated, so copy into local buffer. */
     task_string(e, task, sizeof(task));
-    printf("channel=%d slot=%d task=%s type=%u file_index=%u size=%u start_lba=0x%08" PRIx64 " sectors=%u valid=%u\n",
+    effective_size = e->sector_count != 0u
+                         ? (uint64_t)e->sector_count * 512u
+                         : (uint64_t)e->file_size_bytes;
+    printf("channel=%d slot=%d task=%s type=%u file_index=%u size=%" PRIu64
+           " metadata_size_saturated=%u start_lba=0x%08" PRIx64 " sectors=%u valid=%u\n",
            ch,
            slot,
            task,
            (unsigned)e->file_type,
            (unsigned)e->file_index,
-           (unsigned)e->file_size_bytes,
+           effective_size,
+           e->file_size_bytes == UINT32_MAX ? 1u : 0u,
            e->start_lba,
            (unsigned)e->sector_count,
            (unsigned)e->valid);

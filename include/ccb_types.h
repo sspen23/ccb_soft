@@ -104,6 +104,8 @@ typedef struct {
     uint8_t valid;
 } __attribute__((packed)) FileEntry;
 
+_Static_assert(sizeof(FileEntry) == 32u, "FileEntry disk format must remain 32 bytes");
+
 /* Per-channel static hardware topology and address map. */
 typedef struct {
     int id;
@@ -223,8 +225,11 @@ typedef struct {
     uint64_t nvme_cmd_bytes_total;
     uint64_t nvme_write_bytes_done;
     uint64_t nvme_cmd_latency_total_us;
+    uint64_t nvme_latency_sample_count;
     uint64_t nvme_cmd_latency_min_us;
     uint64_t nvme_cmd_latency_max_us;
+    uint64_t nvme_first_submit_us;
+    uint64_t nvme_last_completion_us;
     uint32_t nvme_active_qd_max;
     uint32_t nvme_active_qd_current;
     uint64_t nvme_active_qd_integral_us;

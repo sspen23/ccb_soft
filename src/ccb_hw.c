@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <signal.h>
 #include <sched.h>
+#include <time.h>
 
 /*
  * Hardware access layer:
@@ -154,11 +155,16 @@ static inline void reg_write32(const MappedRegion *r, uint32_t off, uint32_t val
 }
 
 static uint64_t wall_time_us(void) {
-    struct timeval tv;
-    if (gettimeofday(&tv, NULL) != 0) {
+    struct timespec ts;
+#ifdef CLOCK_MONOTONIC_RAW
+    if (clock_gettime(CLOCK_MONOTONIC_RAW, &ts) != 0 &&
+        clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+#else
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+#endif
         return 0u;
     }
-    return ((uint64_t)tv.tv_sec * 1000000ull) + (uint64_t)tv.tv_usec;
+    return ((uint64_t)ts.tv_sec * 1000000ull) + (uint64_t)ts.tv_nsec / 1000ull;
 }
 
 static int hw_storage_log_at_least_debug(void)
@@ -166,6 +172,12 @@ static int hw_storage_log_at_least_debug(void)
     const char *level = getenv("SRC_REAL_LOG_LEVEL");
 
     return level && (strcmp(level, "debug") == 0 || strcmp(level, "trace") == 0);
+}
+
+static int hw_storage_log_trace(void)
+{
+    const char *level = getenv("SRC_REAL_LOG_LEVEL");
+    return level && strcmp(level, "trace") == 0;
 }
 
 static uint32_t elapsed_us_since(uint64_t start_us) {
@@ -661,10 +673,8 @@ static void nvme_record_submit_stall(ChannelRuntime *rt, uint64_t submit_us) {
     if (!rt || submit_us <= NVME_SUBMIT_STALL_US) {
         return;
     }
-    rt->nvme_submit_stall_count++;
-    if (submit_us > rt->nvme_submit_stall_max_us) {
-        rt->nvme_submit_stall_max_us = submit_us;
-    }
+    (void)__atomic_add_fetch(&rt->nvme_submit_stall_count, 1u, __ATOMIC_RELAXED);
+    atomic_update_max_u64(&rt->nvme_submit_stall_max_us, submit_us);
 }
 
 static void nvme_poll_pause(ChannelRuntime *rt, uint64_t start_us) {
@@ -1005,8 +1015,12 @@ static void nvme_update_active_qd(ChannelRuntime *rt, uint32_t new_qd, uint64_t 
 
     if (last_us != 0u && now_us >= last_us) {
         uint64_t elapsed_us = now_us - last_us;
-        rt->nvme_active_qd_integral_us += elapsed_us * old_qd;
-        rt->nvme_active_qd_observed_us += elapsed_us;
+        (void)__atomic_add_fetch(&rt->nvme_active_qd_integral_us,
+                                 elapsed_us * old_qd,
+                                 __ATOMIC_RELAXED);
+        (void)__atomic_add_fetch(&rt->nvme_active_qd_observed_us,
+                                 elapsed_us,
+                                 __ATOMIC_RELAXED);
     }
     rt->nvme_active_qd_last_update_us = now_us;
     __atomic_store_n(&rt->nvme_active_qd_current, new_qd, __ATOMIC_RELEASE);
@@ -1049,7 +1063,7 @@ static void nvme_print_active_qd_stats(const ChannelRuntime *rt,
     double avg = 0.0;
     uint32_t min_qd;
 
-    if (!rt) {
+    if (!rt || !hw_storage_log_trace()) {
         return;
     }
     if (rt->nvme_active_qd_event_samples != 0u) {
@@ -1077,7 +1091,6 @@ static void nvme_print_active_qd_stats(const ChannelRuntime *rt,
            rt->nvme_cq_empty_polls,
            rt->nvme_refill_count,
            rt->nvme_completion_count);
-    fflush(stdout);
 }
 
 static int nvme_submit_command_async(ChannelRuntime *rt,
@@ -1155,6 +1168,16 @@ static int nvme_submit_command_async(ChannelRuntime *rt,
         rt->nvme_submit_pending_wait_us += elapsed_us_since(pending_start_us);
         rt->nvme_submit_total_us += submit_us;
         nvme_record_submit_stall(rt, submit_us);
+    }
+    {
+        uint64_t zero = 0u;
+        uint64_t submitted_us = wall_time_us();
+        (void)__atomic_compare_exchange_n(&rt->nvme_first_submit_us,
+                                          &zero,
+                                          submitted_us,
+                                          false,
+                                          __ATOMIC_RELEASE,
+                                          __ATOMIC_RELAXED);
     }
     return 0;
 }
@@ -1265,6 +1288,16 @@ static int nvme_submit_write_fast(ChannelRuntime *rt,
         }
     }
     nvme_record_submit_stall(rt, elapsed_us_since(submit_start_us));
+    {
+        uint64_t zero = 0u;
+        uint64_t submitted_us = wall_time_us();
+        (void)__atomic_compare_exchange_n(&rt->nvme_first_submit_us,
+                                          &zero,
+                                          submitted_us,
+                                          false,
+                                          __ATOMIC_RELEASE,
+                                          __ATOMIC_RELAXED);
+    }
     return 0;
 }
 
@@ -1418,8 +1451,10 @@ static void nvme_record_write_completion(ChannelRuntime *rt,
     (void)__atomic_add_fetch(&rt->nvme_cmd_count, 1u, __ATOMIC_RELAXED);
     (void)__atomic_add_fetch(&rt->nvme_cmd_bytes_total, pending->bytes, __ATOMIC_RELAXED);
     (void)__atomic_add_fetch(&rt->nvme_write_bytes_done, pending->bytes, __ATOMIC_RELEASE);
+    __atomic_store_n(&rt->nvme_last_completion_us, completion_us, __ATOMIC_RELEASE);
     if (pending->submit_us != 0u) {
         (void)__atomic_add_fetch(&rt->nvme_cmd_latency_total_us, latency_us, __ATOMIC_RELAXED);
+        (void)__atomic_add_fetch(&rt->nvme_latency_sample_count, 1u, __ATOMIC_RELAXED);
         atomic_update_min_u64(&rt->nvme_cmd_latency_min_us, latency_us);
         atomic_update_max_u64(&rt->nvme_cmd_latency_max_us, latency_us);
     }

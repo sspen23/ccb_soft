@@ -1091,7 +1091,13 @@ SRC_REAL_WRITER_BACKLOG_MODE=1
 `ring_full_count > 0` means the upstream stream overran the DDR ring. The
 worker can still drain data already in DDR, but final `integrity_ok` will be
 0 with `integrity_risk=ddr_ring_full_no_aurora_backpressure`; stop responses
-must be treated as failed or warning, not clean success.
+must fail even when `data_persisted=1` reports that partial data reached SSD.
+
+Performance durations use `CLOCK_MONOTONIC_RAW` with a `CLOCK_MONOTONIC`
+fallback. `nvme_active_mib_s` covers writer-active NVMe time, while
+`nvme_wall_mib_s` covers the first successful submit through the last
+completion. Summary mode emits at most one `storage_pipeline` line per channel
+and window, using `window_ms`, `rx_mib_s`, and `nvme_complete_mib_s`.
 
 Stop command handling:
   If workers are still running, `0x21=0xFF` requests stop, waits for drain and
