@@ -26,7 +26,7 @@ SRCS := \
 	src/ccb_commands.c \
 	src/ccb_tcp_transfer.c
 
-.PHONY: all clean
+.PHONY: all clean mock-bd-test
 
 all: $(TARGET)
 
@@ -35,3 +35,8 @@ $(TARGET): $(SRCS)
 
 clean:
 	rm -f $(TARGET) $(TARGET).exe
+
+mock-bd-test:
+	$(CC) $(CFLAGS) -Wformat=2 -ffunction-sections -fdata-sections -Iinclude \
+		tests/mock_bd_ring_test.c src/ccb_hw.c -Wl,--gc-sections -o /tmp/mock_bd_ring_test
+	/tmp/mock_bd_ring_test

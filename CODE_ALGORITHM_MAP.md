@@ -174,7 +174,7 @@ while continuous or not enough bytes:
   `HwCnt` 概念。
 - `slot_busy[slot]`：该 DDR slot 已完成 DMA、但仍在队列或 NVMe writer 中。
 - `slot_state[slot]`：诊断用状态机，取值为
-  `FREE -> DMA_OWNED -> DMA_DONE_READY -> NVME_BUSY -> FREE/DMA_OWNED`。
+  `DMA_WRITABLE -> DMA_COMPLETED_UNHARVESTED -> READY_FOR_NVME -> NVME_BUSY -> REQUEUE_PENDING -> DMA_WRITABLE/FREE`。
   它不改变默认调度，只用于 `storage_pipeline` 和最终统计判断数据是在等
   writer、还是 writer 在等 DMA。
 
@@ -337,8 +337,9 @@ storage_pipeline channel=... sec=5
 设置失败只打印 warning，不中断任务。`SRC_REAL_WRITER_BACKLOG_MODE=1` 保持
 ready queue 有积压时 writer 处于连续 drain 状态；默认 0 保持 legacy 回退。
 
-`ring_full_count > 0` 表示 DDR ring 曾被填满。由于 Aurora RX-only simplex 无
-反压，最终 `integrity_ok=0`，`integrity_risk=ddr_ring_full_no_aurora_backpressure`。
+`ring_full_count > 0` 现在表示真实 DMA BD writable 数量曾降到0。由于 Aurora
+RX-only simplex 无反压，最终 `integrity_ok=0`，
+`integrity_risk=dma_bd_exhausted_no_upstream_backpressure`。
 即使已有 DDR 数据可以 drain 并落盘，也不能把该文件当作无风险完整数据。
 
 成功时 worker 输出：
@@ -414,7 +415,7 @@ storage_worker_done task=... channel=... file_index=...
 | `max_ddr_busy_slots` | 本次任务同时处于待写/正在写 NVMe 状态的最大 DDR slot 数 |
 | `max_ddr_buffered_bytes` | 本次任务的最大实际排队/写盘字节数 |
 | `integrity_ok` | 未发生 ring full、未检测到 tail incomplete、DMA stop 成功且 DMA/file 字节数相等时为1 |
-| `integrity_risk` | `none`、`ddr_ring_full_no_aurora_backpressure`、`tail_descriptor_incomplete`、`dma_file_byte_mismatch`或`dma_stop_recovery_failed` |
+| `integrity_risk` | `none`、`dma_bd_exhausted_no_upstream_backpressure`、`slot_ownership_invariant_failed`、`tail_descriptor_incomplete`、`dma_file_byte_mismatch`或`dma_stop_recovery_failed` |
 | `data_persisted` | NVMe 数据、metadata 和文件数据库记录均已保留时为1；该值不代表任务控制成功 |
 | `dma_stop_result` | `0`为任务级full reset成功，`-1`为reset失败；`1`保留给兼容旧日志的恢复状态 |
 | `dma_rxsof_count`/`dma_rxeof_count` | 已完成 BD 中累计的 AXI DMA RXSOF/RXEOF 数量 |
@@ -686,3 +687,31 @@ flash1。未挂载时只有该同步命令返回失败，不影响 daemon、存�
 8. 父进程默认只缓存worker尾部输出；需要把worker内部日志写入`tee`文件时，设置
    `SRC_REAL_DEBUG=WRITE,DMA,STORAGE`或`SRC_REAL_DEBUG=NET,TCP`，程序会转发对应
    storage/network worker输出。
+
+## 12. DMA 接收优先状态机
+
+每个 slot 只能处于以下一个状态：
+
+```text
+DMA_WRITABLE
+  -- BD Completed --> DMA_COMPLETED_UNHARVESTED
+  -- harvest --> READY_FOR_NVME
+  -- writer pop --> NVME_BUSY
+  -- NVMe complete --> REQUEUE_PENDING
+  -- clear status + barrier + TAILDESC + DMASR/DMACR check --> DMA_WRITABLE
+```
+
+停止 drain 时，不再采集的 slot 从 `NVME_BUSY` 转到 `FREE`。每次
+`DmaBdSnapshot` 都验证六类状态之和等于 `total_slots`。对于软件状态为
+`DMA_WRITABLE` 的 slot，必须读取真实 BD status；带 `DESC_STS_CMPLT` 的 BD
+计入 `completed_unharvested`，不能计入 writable。
+
+producer 负责 harvest、状态转换和 ready queue 入队，默认使用 SCHED_RR，且
+同通道优先级高于 writer。连续完成的 BD 按通道 batch 上限 harvest；只要本轮
+有完成项就不 sleep。水位与故障判断只使用 `DmaBdSnapshot.dma_writable`。
+
+窗口日志 `storage_receive` 输出真实 writable/unharvested/ready/NVMe/requeue
+数量、CURDESC、TAILDESC、DMASR 和 occupied estimate。最终
+`storage_result_receive` 锁存第一次接收失败的位置和原因。`dma_writable=0`、
+DMA error/halt、descriptor error、ownership 不守恒均使 worker 非零退出，后续
+slot 回收不能恢复成功。

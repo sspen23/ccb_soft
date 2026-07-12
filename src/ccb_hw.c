@@ -38,7 +38,7 @@
 #define NVME_CMD_KIB_DEFAULT 256u
 #define NVME_CMD_KIB_HIGH_DEFAULT 1024u
 #define NVME_CMD_KIB_MAX 4096u
-#define NVME_QD_DEFAULT 4u
+#define NVME_QD_DEFAULT 8u
 #define NVME_QD_HIGH_DEFAULT 8u
 #define NVME_QD_SAFETY_MAX 32u
 #define NVME_PENDING_CAPACITY 32u
@@ -2832,7 +2832,7 @@ static int dma_reset_full(ChannelRuntime *rt, const char *tag) {
     return 0;
 }
 
-int dma_init_s2mm_ring(ChannelRuntime *rt, uint32_t dma_desc_bytes) {
+int dma_prepare_s2mm_ring(ChannelRuntime *rt, uint32_t dma_desc_bytes) {
     uint32_t desc_count = (uint32_t)(rt->dma_ring_bytes / (uint64_t)dma_desc_bytes);
     uint32_t desc_capacity = (uint32_t)(rt->cfg->desc_cpu_size / sizeof(DmaSgDesc));
     /*
@@ -2872,10 +2872,46 @@ int dma_init_s2mm_ring(ChannelRuntime *rt, uint32_t dma_desc_bytes) {
         for (i = 0; i < rt->dma_desc_count; ++i) {
             uint32_t next = (i + 1u) % rt->dma_desc_count;
             memset(&desc[i], 0, sizeof(DmaSgDesc));
-            desc[i].next_desc = (uint32_t)(rt->cfg->desc_dma_base + (uint64_t)(next * sizeof(DmaSgDesc)));
-            desc[i].buffer_addr = (uint32_t)(rt->cfg->ddr_hw_base + (uint64_t)i * dma_desc_bytes);
+            {
+                uint64_t next_addr = rt->cfg->desc_dma_base +
+                                     (uint64_t)next * sizeof(DmaSgDesc);
+                uint64_t buffer_addr = rt->cfg->ddr_hw_base +
+                                       (uint64_t)i * dma_desc_bytes;
+                desc[i].next_desc = (uint32_t)next_addr;
+                desc[i].next_desc_msb = (uint32_t)(next_addr >> 32u);
+                desc[i].buffer_addr = (uint32_t)buffer_addr;
+                desc[i].buffer_addr_msb = (uint32_t)(buffer_addr >> 32u);
+            }
             desc[i].control = dma_desc_bytes;
             desc[i].status = 0u;
+        }
+        __sync_synchronize();
+        for (i = 0; i < rt->dma_desc_count; ++i) {
+            uint32_t next = (i + 1u) % rt->dma_desc_count;
+            uint64_t expected_next = rt->cfg->desc_dma_base +
+                                     (uint64_t)next * sizeof(DmaSgDesc);
+            uint64_t expected_buffer = rt->cfg->ddr_hw_base +
+                                       (uint64_t)i * dma_desc_bytes;
+            uint64_t buffer_end = expected_buffer + dma_desc_bytes;
+
+            if (desc[i].next_desc != (uint32_t)expected_next ||
+                desc[i].next_desc_msb != (uint32_t)(expected_next >> 32u) ||
+                desc[i].buffer_addr != (uint32_t)expected_buffer ||
+                desc[i].buffer_addr_msb != (uint32_t)(expected_buffer >> 32u) ||
+                desc[i].control != dma_desc_bytes || desc[i].status != 0u ||
+                expected_buffer < rt->cfg->ddr_hw_base ||
+                buffer_end > rt->cfg->ddr_hw_base + rt->dma_ring_bytes) {
+                fprintf(stderr,
+                        "DMA descriptor init validation failed channel=%d slot=%u"
+                        " next=0x%08x buffer=0x%08x control=0x%08x status=0x%08x\n",
+                        rt->cfg->id,
+                        (unsigned)i,
+                        desc[i].next_desc,
+                        desc[i].buffer_addr,
+                        desc[i].control,
+                        desc[i].status);
+                return -1;
+            }
         }
     }
 
@@ -2888,15 +2924,52 @@ int dma_init_s2mm_ring(ChannelRuntime *rt, uint32_t dma_desc_bytes) {
     reg_write32(&rt->dma, S2MM_DMASR, DMA_IRQ_STATUS_MASK);
 
     reg_write32(&rt->dma, S2MM_CURDESC, (uint32_t)rt->cfg->desc_dma_base);
-    reg_write32(&rt->dma, S2MM_CURDESC_MSB, 0u);
+    reg_write32(&rt->dma, S2MM_CURDESC_MSB, (uint32_t)(rt->cfg->desc_dma_base >> 32u));
+    return 0;
+}
+
+int dma_start_s2mm_ring(ChannelRuntime *rt)
+{
+    if (!rt || rt->dma_desc_count == 0u) return -1;
+    if (rt->gopt.dry_run) return 0;
     reg_write32(&rt->dma, S2MM_DMACR, DMA_CR_RS_BIT | 0x1000u);
     reg_write32(&rt->dma,
                 S2MM_TAILDESC,
                 (uint32_t)(rt->cfg->desc_dma_base + (uint64_t)((rt->dma_desc_count - 1u) * sizeof(DmaSgDesc))));
-    reg_write32(&rt->dma, S2MM_TAILDESC_MSB, 0u);
+    reg_write32(&rt->dma,
+                S2MM_TAILDESC_MSB,
+                (uint32_t)((rt->cfg->desc_dma_base +
+                            (uint64_t)(rt->dma_desc_count - 1u) * sizeof(DmaSgDesc)) >> 32u));
+    __sync_synchronize();
+    if (wait_reg_bits(&rt->dma,
+                      S2MM_DMASR,
+                      DMA_SR_HALT_BIT,
+                      0u,
+                      rt->gopt.timeout_us) != 0) {
+        fprintf(stderr, "DMA start did not leave halted state channel=%d\n", rt->cfg->id);
+        return -1;
+    }
+    {
+        uint32_t cr = reg_read32(&rt->dma, S2MM_DMACR);
+        uint32_t sr = reg_read32(&rt->dma, S2MM_DMASR);
+        uint32_t cur = reg_read32(&rt->dma, S2MM_CURDESC);
+        uint32_t tail = reg_read32(&rt->dma, S2MM_TAILDESC);
+        printf("storage_dma_started channel=%d s2mm_dmacr=0x%08x"
+               " s2mm_dmasr=0x%08x curdesc=0x%08x taildesc=0x%08x\n",
+               rt->cfg->id, cr, sr, cur, tail);
+        if ((cr & DMA_CR_RS_BIT) == 0u || (sr & DMA_ERROR_MASK_S2MM) != 0u) {
+            return -1;
+        }
+    }
     __atomic_store_n(&rt->dma_hw_desc_count, rt->dma_desc_count, __ATOMIC_RELEASE);
     rt->next_harvest_bd = 0u;
     return 0;
+}
+
+int dma_init_s2mm_ring(ChannelRuntime *rt, uint32_t dma_desc_bytes)
+{
+    if (dma_prepare_s2mm_ring(rt, dma_desc_bytes) != 0) return -1;
+    return dma_start_s2mm_ring(rt);
 }
 
 int dma_harvest_one(ChannelRuntime *rt, uint32_t *slot, uint32_t *actual_bytes) {
@@ -2935,6 +3008,8 @@ int dma_harvest_one(ChannelRuntime *rt, uint32_t *slot, uint32_t *actual_bytes) 
             return 0;
         }
         if ((st & DESC_STS_ERROR_MASK) != 0u) {
+            rt->dma_last_completed_bd = idx;
+            rt->dma_last_completed_status = st;
             fprintf(stderr,
                     "DMA S2MM descriptor error on channel %d: slot=%u status=0x%08x\n",
                     rt->cfg->id,
@@ -2970,9 +3045,9 @@ int dma_harvest_one(ChannelRuntime *rt, uint32_t *slot, uint32_t *actual_bytes) 
     return 1;
 }
 
-void dma_requeue_one(ChannelRuntime *rt, uint32_t slot) {
+int dma_requeue_one(ChannelRuntime *rt, uint32_t slot) {
     if (!rt || rt->gopt.dry_run || slot >= rt->dma_desc_count) {
-        return;
+        return (rt && rt->gopt.dry_run && slot < rt->dma_desc_count) ? 0 : -1;
     }
 
     {
@@ -2982,6 +3057,25 @@ void dma_requeue_one(ChannelRuntime *rt, uint32_t slot) {
         /* PG021 Tail Pointer Mode: clear completion before moving TAILDESC. */
         desc[slot].status = 0u;
         __sync_synchronize();
+        reg_write32(&rt->dma,
+                    S2MM_TAILDESC,
+                    (uint32_t)(rt->cfg->desc_dma_base + (uint64_t)(slot * sizeof(DmaSgDesc))));
+        reg_write32(&rt->dma,
+                    S2MM_TAILDESC_MSB,
+                    (uint32_t)((rt->cfg->desc_dma_base +
+                                (uint64_t)slot * sizeof(DmaSgDesc)) >> 32u));
+        __sync_synchronize();
+        {
+            uint32_t sr = reg_read32(&rt->dma, S2MM_DMASR);
+            uint32_t cr = reg_read32(&rt->dma, S2MM_DMACR);
+            if ((sr & (DMA_ERROR_MASK_S2MM | DMA_SR_HALT_BIT)) != 0u ||
+                (cr & DMA_CR_RS_BIT) == 0u) {
+                fprintf(stderr,
+                        "DMA requeue failed channel=%d slot=%u dmacr=0x%08x dmasr=0x%08x\n",
+                        rt->cfg->id, (unsigned)slot, cr, sr);
+                return -1;
+            }
+        }
         hw_owned = __atomic_add_fetch(&rt->dma_hw_desc_count, 1u, __ATOMIC_ACQ_REL);
         if (hw_owned > rt->dma_desc_count) {
             fprintf(stderr,
@@ -2990,11 +3084,83 @@ void dma_requeue_one(ChannelRuntime *rt, uint32_t slot) {
                     (unsigned)hw_owned,
                     (unsigned)rt->dma_desc_count);
             __atomic_store_n(&rt->dma_hw_desc_count, rt->dma_desc_count, __ATOMIC_RELEASE);
+            return -1;
         }
-        reg_write32(&rt->dma,
-                    S2MM_TAILDESC,
-                    (uint32_t)(rt->cfg->desc_dma_base + (uint64_t)(slot * sizeof(DmaSgDesc))));
     }
+    return 0;
+}
+
+static uint32_t dma_desc_address_to_index(const ChannelRuntime *rt, uint64_t address)
+{
+    uint64_t offset;
+
+    if (!rt || address < rt->cfg->desc_dma_base) {
+        return UINT32_MAX;
+    }
+    offset = address - rt->cfg->desc_dma_base;
+    if ((offset % sizeof(DmaSgDesc)) != 0u ||
+        offset / sizeof(DmaSgDesc) >= rt->dma_desc_count) {
+        return UINT32_MAX;
+    }
+    return (uint32_t)(offset / sizeof(DmaSgDesc));
+}
+
+int dma_get_bd_snapshot(ChannelRuntime *rt,
+                        const uint8_t *software_slot_state,
+                        DmaBdSnapshot *out)
+{
+    volatile const DmaSgDesc *desc;
+    uint32_t i;
+    uint64_t curdesc;
+    uint64_t taildesc;
+
+    if (!rt || !out || rt->dma_desc_count == 0u) {
+        return -1;
+    }
+    memset(out, 0, sizeof(*out));
+    out->total_slots = rt->dma_desc_count;
+    out->curdesc_index = UINT32_MAX;
+    out->taildesc_index = UINT32_MAX;
+    if (!rt->gopt.dry_run) {
+        out->s2mm_dmasr = reg_read32(&rt->dma, S2MM_DMASR);
+        out->s2mm_dmacr = reg_read32(&rt->dma, S2MM_DMACR);
+        curdesc = (uint64_t)reg_read32(&rt->dma, S2MM_CURDESC) |
+                  ((uint64_t)reg_read32(&rt->dma, S2MM_CURDESC_MSB) << 32u);
+        taildesc = (uint64_t)reg_read32(&rt->dma, S2MM_TAILDESC) |
+                   ((uint64_t)reg_read32(&rt->dma, S2MM_TAILDESC_MSB) << 32u);
+        out->curdesc_index = dma_desc_address_to_index(rt, curdesc);
+        out->taildesc_index = dma_desc_address_to_index(rt, taildesc);
+    }
+    __sync_synchronize();
+    desc = (volatile const DmaSgDesc *)(const void *)rt->desc.virt;
+    for (i = 0u; i < rt->dma_desc_count; ++i) {
+        uint8_t state = software_slot_state ? software_slot_state[i]
+                                            : STORAGE_SLOT_DMA_WRITABLE;
+        if (state == STORAGE_SLOT_DMA_WRITABLE) {
+            uint32_t status = rt->gopt.dry_run ? 0u : desc[i].status;
+            if ((status & DESC_STS_CMPLT) != 0u) {
+                ++out->completed_unharvested;
+            } else {
+                ++out->dma_writable;
+            }
+        } else if (state == STORAGE_SLOT_DMA_COMPLETED_UNHARVESTED) {
+            ++out->completed_unharvested;
+        } else if (state == STORAGE_SLOT_READY_FOR_NVME) {
+            ++out->ready_slots;
+        } else if (state == STORAGE_SLOT_NVME_BUSY) {
+            ++out->nvme_busy_slots;
+        } else if (state == STORAGE_SLOT_REQUEUE_PENDING) {
+            ++out->requeue_pending;
+        } else if (state == STORAGE_SLOT_FREE) {
+            ++out->free_slots;
+        } else {
+            return -1;
+        }
+    }
+    out->occupied_bytes_est =
+        (uint64_t)(out->completed_unharvested + out->ready_slots +
+                   out->nvme_busy_slots + out->requeue_pending) * rt->dma_desc_bytes;
+    return 0;
 }
 
 bool dma_s2mm_tail_incomplete(const ChannelRuntime *rt) {

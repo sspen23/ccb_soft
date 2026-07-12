@@ -72,6 +72,7 @@
 #define DDR_PATTERN_STORE_ARG "ddr-pattern-store"
 #define SSD_LBA_WRAP_TEST_ARG "ssd-lba-wrap-test"
 #define SSD_CONTINUOUS_PATTERN_TEST_ARG "ssd-continuous-pattern-test"
+#define DMA_RX_BENCHMARK_ARG "dma-rx-benchmark"
 #define NETWORK_WORKER_ARG "--network-worker"
 #define NETWORK_SEND_ARG "network-send"
 #define STORAGE_TASK_COUNT NUM_CHANNELS
@@ -114,6 +115,7 @@ typedef struct {
     TaskState state;
     char name[32];
     int output_fd;
+    int control_fd;
     char output[PROCESS_OUTPUT_BUF];
     size_t output_used;
     char echo_line[2048];
@@ -122,6 +124,9 @@ typedef struct {
     bool final_data_persisted;
     bool final_integrity_ok;
     bool final_status_success;
+    bool final_receive_seen;
+    bool split_mismatch_reported;
+    uint64_t final_dma_received_bytes;
     PlannedFile planned_file;
     bool has_planned_file;
     char task_id[12];
@@ -141,9 +146,9 @@ typedef struct {
 } LastTaskContext;
 
 Task storage_tasks[STORAGE_TASK_COUNT] = {
-    {.state = IDLE, .name = "storage0", .output_fd = -1, .timeout_seconds = 0},
-    {.state = IDLE, .name = "storage1", .output_fd = -1, .timeout_seconds = 0},
-    {.state = IDLE, .name = "storage2", .output_fd = -1, .timeout_seconds = 0},
+    {.state = IDLE, .name = "storage0", .output_fd = -1, .control_fd = -1, .timeout_seconds = 0},
+    {.state = IDLE, .name = "storage1", .output_fd = -1, .control_fd = -1, .timeout_seconds = 0},
+    {.state = IDLE, .name = "storage2", .output_fd = -1, .control_fd = -1, .timeout_seconds = 0},
 };
 Task transfer_task = {.state = IDLE, .name = "transfer", .output_fd = -1, .timeout_seconds = TASK_TIMEOUT};
 LastTaskContext g_last_task = {0};
@@ -293,6 +298,11 @@ static bool storage_task_is_ready(const Task *task)
     return task && task->state == RUNNING && strstr(task->output, "storage_ready") != NULL;
 }
 
+static bool storage_task_is_started(const Task *task)
+{
+    return task && task->state == RUNNING && strstr(task->output, "storage_started") != NULL;
+}
+
 static int storage_state_summary(void)
 {
     if (storage_any_running()) {
@@ -316,6 +326,10 @@ static void stop_all_storage_tasks(void)
                 close(storage_tasks[i].output_fd);
                 storage_tasks[i].output_fd = -1;
             }
+            if (storage_tasks[i].control_fd >= 0) {
+                close(storage_tasks[i].control_fd);
+                storage_tasks[i].control_fd = -1;
+            }
             storage_tasks[i].state = ERROR;
             storage_tasks[i].has_planned_file = false;
         }
@@ -329,6 +343,10 @@ static int request_storage_stop_all(void)
 
     for (i = 0; i < STORAGE_TASK_COUNT; ++i) {
         if (storage_tasks[i].state == RUNNING) {
+            if (storage_tasks[i].control_fd >= 0) {
+                close(storage_tasks[i].control_fd);
+                storage_tasks[i].control_fd = -1;
+            }
             if (kill(storage_tasks[i].pid, SIGTERM) == 0) {
                 ++requested;
                 LOG_INFO("STORAGE", "Stop requested: name=%s pid=%d task=%s",
@@ -1368,10 +1386,16 @@ static bool worker_output_has_important_token(const char *text)
         "storage_pipeline",
         "storage_dma_idle_done",
         "storage_ready",
+        "storage_started",
+        "storage_receive",
+        "dma_bd_low",
+        "dma_bd_exhausted",
+        "storage_receive_failed",
         "pcie_link_status",
         "storage_result",
         "storage_result_perf",
         "storage_result_diag",
+        "storage_result_receive",
         "storage_transfer_done",
         "storage_transfer_failed",
         "storage_ring_warning",
@@ -1411,6 +1435,31 @@ static void echo_worker_line(Task *task, const char *line)
         }
         if (parse_token_u64(line, "integrity_ok=", &parsed) == 0) {
             task->final_integrity_ok = parsed != 0u;
+        }
+    }
+    if (strncmp(line, "storage_result_receive ", 23u) == 0) {
+        task->final_receive_seen =
+            parse_token_u64(line, "dma_received_bytes=", &task->final_dma_received_bytes) == 0;
+        if (storage_tasks[0].final_receive_seen && storage_tasks[1].final_receive_seen &&
+            strcmp(storage_tasks[0].task_id, storage_tasks[1].task_id) == 0 &&
+            storage_tasks[0].final_dma_received_bytes != storage_tasks[1].final_dma_received_bytes) {
+            uint64_t a = storage_tasks[0].final_dma_received_bytes;
+            uint64_t b = storage_tasks[1].final_dma_received_bytes;
+            storage_tasks[0].final_integrity_ok = false;
+            storage_tasks[1].final_integrity_ok = false;
+            storage_tasks[0].final_status_success = false;
+            storage_tasks[1].final_status_success = false;
+            if (!storage_tasks[0].split_mismatch_reported) {
+                storage_tasks[0].split_mismatch_reported = true;
+                storage_tasks[1].split_mismatch_reported = true;
+                system_emit_line("storage_split_channel_check task=%s status=failed"
+                                 " reason=split_channel_byte_mismatch ch0_bytes=%" PRIu64
+                                 " ch1_bytes=%" PRIu64 " delta_bytes=%" PRId64
+                                 " ratio=%.9f",
+                                 storage_tasks[0].task_id, a, b,
+                                 (int64_t)a - (int64_t)b,
+                                 b != 0u ? (double)a / (double)b : 0.0);
+            }
         }
     }
     if (worker_output_has_important_token(line)) {
@@ -1488,6 +1537,7 @@ static void poll_task_output(Task *task)
 static int start_storage_worker(const PlannedFile *planned, const char *task_id, time_t overpass_time)
 {
     int pipefd[2];
+    int control_pipe[2];
     pid_t pid;
     char channel_str[16];
     char size_str[32];
@@ -1585,28 +1635,41 @@ static int start_storage_worker(const PlannedFile *planned, const char *task_id,
         dbg_printf("[DBG][STORAGE] pipe failed errno=%d\n", errno);
         return -1;
     }
+    if (pipe(control_pipe) != 0) {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        LOG_ERROR("STORAGE", "control pipe failed: errno=%d", errno);
+        return -1;
+    }
 
     pid = fork();
     if (pid < 0) {
         close(pipefd[0]);
         close(pipefd[1]);
+        close(control_pipe[0]);
+        close(control_pipe[1]);
         LOG_ERROR("STORAGE", "fork failed: errno=%d", errno);
         dbg_printf("[DBG][STORAGE] fork failed errno=%d\n", errno);
         return -1;
     }
     if (pid == 0) {
         const char *meta_dir = get_storage_meta_dir();
+        char start_fd[16];
         setenv("CCB_PROCESS_META_DIR", meta_dir, 1);
+        snprintf(start_fd, sizeof(start_fd), "%d", control_pipe[0]);
+        setenv("SRC_REAL_START_FD", start_fd, 1);
         dup2(pipefd[1], STDOUT_FILENO);
         dup2(pipefd[1], STDERR_FILENO);
         close(pipefd[0]);
         close(pipefd[1]);
+        close(control_pipe[1]);
         execvp(program, (char *const *)argv);
         perror("execvp");
         _exit(127);
     }
 
     close(pipefd[1]);
+    close(control_pipe[0]);
     {
         int flags = fcntl(pipefd[0], F_GETFL, 0);
         if (flags >= 0) {
@@ -1618,6 +1681,7 @@ static int start_storage_worker(const PlannedFile *planned, const char *task_id,
     task->start_time = time(NULL);
     task->state = RUNNING;
     task->output_fd = pipefd[0];
+    task->control_fd = control_pipe[1];
     task->output_used = 0u;
     task->output[0] = '\0';
     task->echo_line_used = 0u;
@@ -1626,6 +1690,9 @@ static int start_storage_worker(const PlannedFile *planned, const char *task_id,
     task->final_data_persisted = false;
     task->final_integrity_ok = false;
     task->final_status_success = false;
+    task->final_receive_seen = false;
+    task->split_mismatch_reported = false;
+    task->final_dma_received_bytes = 0u;
     task->planned_file = *planned;
     task->has_planned_file = true;
     memset(task->task_id, 0, sizeof(task->task_id));
@@ -1753,6 +1820,42 @@ static int wait_storage_workers_ready(const PlannedFile *planned, int planned_co
     return -1;
 }
 
+static int start_storage_workers_barrier(const char *task_id)
+{
+    uint64_t start_us = system_wall_time_us();
+    uint32_t waited_us = 0u;
+    uint32_t timeout_us = env_u32_or_default("SRC_REAL_STORAGE_START_TIMEOUT_US", 5000000u);
+    size_t i;
+    int target_count = 0;
+
+    for (i = 0u; i < STORAGE_TASK_COUNT; ++i) {
+        Task *task = &storage_tasks[i];
+        if (task->state != RUNNING || task->control_fd < 0 ||
+            (task_id && strcmp(task->task_id, task_id) != 0)) continue;
+        if (write(task->control_fd, &start_us, sizeof(start_us)) != (ssize_t)sizeof(start_us)) {
+            return -1;
+        }
+        close(task->control_fd);
+        task->control_fd = -1;
+        ++target_count;
+    }
+    if (target_count == 0) return -1;
+    while (waited_us < timeout_us) {
+        int started = 0;
+        for (i = 0u; i < STORAGE_TASK_COUNT; ++i) {
+            Task *task = &storage_tasks[i];
+            if (task->state != RUNNING ||
+                (task_id && strcmp(task->task_id, task_id) != 0)) continue;
+            poll_task_output(task);
+            if (storage_task_is_started(task)) ++started;
+        }
+        if (started == target_count) return 0;
+        usleep(1000u);
+        waited_us += 1000u;
+    }
+    return -1;
+}
+
 static void finalize_storage_task(Task *task, int exit_code)
 {
     PlannedFile planned;
@@ -1801,7 +1904,8 @@ static void finalize_storage_task(Task *task, int exit_code)
     planned = task->planned_file;
     if (exit_code != 0 ||
         (task->final_result_seen &&
-         (!task->final_status_success || !task->final_integrity_ok))) {
+         (!task->final_status_success || !task->final_integrity_ok ||
+          !task->final_data_persisted))) {
         (void)parse_token_u64(task->output, "data_persisted=", &data_persisted);
         (void)parse_token_u64(task->output, "integrity_ok=", &integrity_ok);
         (void)parse_token_u64(task->output, "dma_stop_recovered=", &dma_stop_recovered);
@@ -3776,24 +3880,28 @@ void handle_frame(uint8_t *f)
                          storage_state);
 
         if (acq_cmd->switch_flag == SWITCH_ON) {
-            LOG_INFO("CAPTURE",
-                     "Start capture command acknowledged immediately: task=%s storage_state=%d",
-                     g_last_task.valid ? g_last_task.task_id : "",
-                     storage_state);
-            result = ACK_SUCCESS;
-            dbg_printf("[DBG][PROTO] 0x21 start ACK success immediate storage_state=%d\n",
-                       storage_state);
+            if (!g_last_task.valid ||
+                start_storage_workers_barrier(g_last_task.task_id) != 0) {
+                result = ACK_FAILED;
+                failure_type = FAIL_TYPE_LOW | FAIL_TYPE_HIGH_I | FAIL_TYPE_HIGH_Q;
+                (void)request_storage_stop_all();
+            } else {
+                result = ACK_SUCCESS;
+            }
             proto_send_acq_ack(result, acq_type, failure_type);
-            system_emit_line("serial_cmd_ack cmd=0x%02X action=start task_no=%s ack_status=0x%02X result_code=0x%02X worker_state=%d storage_state=%d reason=start_ack_immediate",
+            system_emit_line("serial_cmd_ack cmd=0x%02X action=start task_no=%s ack_status=0x%02X result_code=0x%02X worker_state=%d storage_state=%d reason=%s",
                              cmd,
                              g_last_task.valid ? g_last_task.task_id : "",
                              result,
                              result,
-                             RUNNING,
-                             storage_state_summary());
-            system_emit_line("serial_cmd_result cmd=start task=%s status=success storage_state=%d reason=start_ack_immediate",
+                             result == ACK_SUCCESS ? RUNNING : ERROR,
+                             storage_state_summary(),
+                             result == ACK_SUCCESS ? "all_workers_started" : "start_barrier_failed");
+            system_emit_line("serial_cmd_result cmd=start task=%s status=%s storage_state=%d reason=%s",
                              g_last_task.valid ? g_last_task.task_id : "",
-                             storage_state_summary());
+                             result == ACK_SUCCESS ? "success" : "failed",
+                             storage_state_summary(),
+                             result == ACK_SUCCESS ? "all_workers_started" : "start_barrier_failed");
         } else if (acq_cmd->switch_flag == SWITCH_OFF) {
             if (!g_last_task.valid || acq_type == 0u) {
                 LOG_WARN("CAPTURE", "Stop rejected: no valid 0x11 task context");
@@ -4302,6 +4410,22 @@ static int run_ssd_continuous_pattern_test_main(int argc, char **argv)
     return (rc == 0) ? 0 : 1;
 }
 
+static int run_dma_rx_benchmark_main(int argc, char **argv)
+{
+    GlobalOptions gopt;
+    ParsedArgs args;
+    CommandType cmd;
+
+    if (parse_global_options(&argc, &argv, &gopt) != 0 || argc < 1 ||
+        parse_command_type(argv[0], &cmd) != 0 || cmd != CMD_DMA_RX_BENCHMARK ||
+        parse_subcommand_args(argc, argv, &args) != 0 ||
+        !args.has_channel || args.channel_all || !args.has_duration_sec || !args.has_source) {
+        usage();
+        return 2;
+    }
+    return execute_dma_rx_benchmark(&args, gopt) == 0 ? 0 : 1;
+}
+
 int main(int argc, char **argv)
 {
     uint8_t byte;
@@ -4333,6 +4457,9 @@ int main(int argc, char **argv)
     if (argc > 1 && strcmp(argv[1], SSD_CONTINUOUS_PATTERN_TEST_ARG) == 0) {
         dbg_printf("[DBG][MAIN] entering ssd-continuous-pattern-test mode\n");
         return run_ssd_continuous_pattern_test_main(argc, argv);
+    }
+    if (argc > 1 && strcmp(argv[1], DMA_RX_BENCHMARK_ARG) == 0) {
+        return run_dma_rx_benchmark_main(argc, argv);
     }
     if (argc > 1 && strcmp(argv[1], NETWORK_WORKER_ARG) == 0) {
         dbg_verbose_printf("[DBG][MAIN] entering network worker mode\n");

@@ -223,8 +223,9 @@ NVMe 不是走 Linux block 设备，而是直接访问自定义 NVMe host core �
 - `SRC_REAL_PIPELINE_MODE=threaded`、`SRC_REAL_CH0_FAST_PIPELINE=1`、
   `SRC_REAL_CH1_FAST_PIPELINE=1`、`SRC_REAL_CH2_FAST_PIPELINE=1` 当前用于显式标记
   pipeline测试配置；legacy回退路径保持可用。
-- `SRC_REAL_READY_QUEUE_DEPTH` 默认使用通道slot数量，仅作为日志配置项；
-  `SRC_REAL_HARVEST_BATCH_MAX` 默认1，用于标记计划中的harvest batch测试配置。
+- `SRC_REAL_READY_QUEUE_DEPTH` 默认使用通道slot数量；harvest batch 已实际控制
+  producer 连续收割循环，ch0/ch1/ch2 默认分别为32/32/4，原有
+  `SRC_REAL_HARVEST_BATCH_MAX` 继续作为全局 fallback。
 - 最终`storage_worker_done`会输出`nvme_max_dts_bytes`、`nvme_cmd_size_bytes`、
   `nvme_active_qd_max`、`nvme_active_qd_avg`、`ready_q_max`、`writer_idle_ms`、
   `writer_active_ms`和DMA harvest batch统计，用于判断实际并发深度、command size
@@ -1088,9 +1089,9 @@ SRC_REAL_WRITER_BACKLOG_MODE=1
   while ready queue has backlog. It does not change NVMe command size, QD, or
   DDR slot ownership. Set `0` for legacy-compatible behavior.
 
-`ring_full_count > 0` means the upstream stream overran the DDR ring. The
+`ring_full_count > 0` means the real DMA BD writable count reached zero. The
 worker can still drain data already in DDR, but final `integrity_ok` will be
-0 with `integrity_risk=ddr_ring_full_no_aurora_backpressure`; stop responses
+0 with `integrity_risk=dma_bd_exhausted_no_upstream_backpressure`; stop responses
 must fail even when `data_persisted=1` reports that partial data reached SSD.
 
 Performance durations use `CLOCK_MONOTONIC_RAW` with a `CLOCK_MONOTONIC`
@@ -1255,3 +1256,48 @@ so keep it off during normal capture tests.
 - Metadata keeps the legacy 32-bit file-size field for format compatibility. Files larger than
   4GiB use `UINT32_MAX` in that field, while SQLite and the UART protocol retain the exact
   64-bit byte count; the 32-bit sector count limits one file to roughly 2TiB.
+
+## DMA-first receive pipeline
+
+Storage uses six explicit slot ownership states: `DMA_WRITABLE`,
+`DMA_COMPLETED_UNHARVESTED`, `READY_FOR_NVME`, `NVME_BUSY`,
+`REQUEUE_PENDING`, and `FREE`. A hardware snapshot walks every BD and checks
+the descriptor completion bit before counting a nominally DMA-writable slot.
+The six state counts must always add up to the configured slot count.
+
+`dma_writable == 0` is a terminal receive-integrity failure because the Aurora
+RX-only path has no upstream backpressure. Releasing a slot later does not
+clear this failure. The final result uses
+`dma_bd_exhausted_no_upstream_backpressure` and the worker exits nonzero.
+
+The default scheduling policy is `SCHED_RR`, with producer/writer priorities
+70/60 on ch0 and ch1, and 30/20 on ch2. If RT scheduling is unavailable the
+worker logs the effective fallback. Relevant variables are:
+
+- `SRC_REAL_PRODUCER_RT_POLICY=rr|fifo|other`
+- `SRC_REAL_WRITER_RT_POLICY=rr|fifo|other`
+- `SRC_REAL_CH{0,1,2}_PRODUCER_RT_PRIO`
+- `SRC_REAL_CH{0,1,2}_WRITER_RT_PRIO`
+- `SRC_REAL_CH{0,1,2}_HARVEST_BATCH_MAX` (defaults: 32, 32, 4)
+- `SRC_REAL_HARVEST_BATCH_MAX` (global compatibility fallback)
+- `SRC_REAL_CH{0,1,2}_DMA_POLL_SLEEP_US` (defaults: 0, 0, 50)
+- `SRC_REAL_DMA_BD_LOW_WATERMARK`
+- `SRC_REAL_STRICT_END_TO_END=0|1`
+- `SRC_REAL_EXPECTED_BYTES_CH{0,1,2}`
+
+The serial frame format is unchanged. Command `0x11` now performs PRESTART;
+workers initialize NVMe, queues, and a halted BD ring, then report
+`storage_ready`. Command `0x21 START` releases all selected workers through
+independent control pipes and waits for `storage_started`. This is a software
+barrier (`start_gate_mode=software_barrier`), not a zero-skew FPGA gate.
+
+Receive-only diagnosis, with no NVMe writer:
+
+```sh
+sudo ./src_real_app dma-rx-benchmark --channel 0 --duration-sec 30 --source transfer
+```
+
+No FPGA source-byte counter address exists in the current address map, so logs
+report `source_counter_available=0`. Strict mode requires an expected byte
+count until FPGA exposes a stable per-channel 64-bit accepted-byte counter,
+snapshot/clear control, and overflow indication.

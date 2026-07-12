@@ -23,6 +23,7 @@ int execute_write_with_result(const ParsedArgs *args, GlobalOptions gopt, WriteR
 int execute_ddr_pattern_store_with_result(const ParsedArgs *args, GlobalOptions gopt, WriteResult *result);
 int execute_ssd_lba_wrap_test(const ParsedArgs *args, GlobalOptions gopt);
 int execute_ssd_continuous_pattern_test(const ParsedArgs *args, GlobalOptions gopt);
+int execute_dma_rx_benchmark(const ParsedArgs *args, GlobalOptions gopt);
 void storage_write_reset_stop(void);
 void storage_write_request_stop(void);
 

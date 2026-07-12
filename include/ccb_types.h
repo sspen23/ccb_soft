@@ -76,7 +76,8 @@ typedef enum {
     CMD_NETWORK_SEND = 5,
     CMD_DDR_PATTERN_STORE = 6,
     CMD_SSD_LBA_WRAP_TEST = 7,
-    CMD_SSD_CONTINUOUS_PATTERN_TEST = 8
+    CMD_SSD_CONTINUOUS_PATTERN_TEST = 8,
+    CMD_DMA_RX_BENCHMARK = 9
 } CommandType;
 
 /* AXI DMA SG descriptor format (must be exactly 64 bytes). */
@@ -175,6 +176,9 @@ typedef struct {
     bool has_ddr_offset;
     uint64_t ddr_offset;
 
+    bool has_duration_sec;
+    uint32_t duration_sec;
+
     bool has_channel;
     int channel_id;
     bool channel_all;
@@ -192,6 +196,30 @@ typedef enum {
     NVME_FEED_MODE_LEGACY = 0,
     NVME_FEED_MODE_TIGHT = 1
 } NvmeFeedMode;
+
+typedef enum {
+    STORAGE_SLOT_DMA_WRITABLE = 0,
+    STORAGE_SLOT_DMA_COMPLETED_UNHARVESTED = 1,
+    STORAGE_SLOT_READY_FOR_NVME = 2,
+    STORAGE_SLOT_NVME_BUSY = 3,
+    STORAGE_SLOT_REQUEUE_PENDING = 4,
+    STORAGE_SLOT_FREE = 5
+} StorageSlotState;
+
+typedef struct {
+    uint32_t total_slots;
+    uint32_t dma_writable;
+    uint32_t completed_unharvested;
+    uint32_t ready_slots;
+    uint32_t nvme_busy_slots;
+    uint32_t requeue_pending;
+    uint32_t free_slots;
+    uint32_t curdesc_index;
+    uint32_t taildesc_index;
+    uint32_t s2mm_dmasr;
+    uint32_t s2mm_dmacr;
+    uint64_t occupied_bytes_est;
+} DmaBdSnapshot;
 
 /* Runtime context for one channel during command execution. */
 typedef struct {

@@ -95,8 +95,13 @@ typedef struct {
 
 /* Initialize and harvest AXI DMA S2MM SG ring buffers. */
 int dma_init_s2mm_ring(ChannelRuntime *rt, uint32_t dma_desc_bytes);
+int dma_prepare_s2mm_ring(ChannelRuntime *rt, uint32_t dma_desc_bytes);
+int dma_start_s2mm_ring(ChannelRuntime *rt);
 int dma_harvest_one(ChannelRuntime *rt, uint32_t *slot, uint32_t *actual_bytes);
-void dma_requeue_one(ChannelRuntime *rt, uint32_t slot);
+int dma_requeue_one(ChannelRuntime *rt, uint32_t slot);
+int dma_get_bd_snapshot(ChannelRuntime *rt,
+                        const uint8_t *software_slot_state,
+                        DmaBdSnapshot *out);
 bool dma_s2mm_tail_incomplete(const ChannelRuntime *rt);
 DmaStopResult dma_stop_s2mm(ChannelRuntime *rt, DmaStopReport *report);
 

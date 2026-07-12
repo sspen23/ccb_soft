@@ -147,6 +147,8 @@ void usage(void) {
             "--ssd-lba 0x... [--size <bytes>]  # destructive ch2 test at LBA and LBA+0x100000\n"
             "  ccb_nvme_tool [--dry-run] [--skip-link-check] [--timeout-us N] ssd-continuous-pattern-test "
             "--ssd-lba 0x... [--size <bytes>]  # destructive ch2 continuous SSD write/read test\n"
+            "  ccb_nvme_tool [--dry-run] [--skip-link-check] dma-rx-benchmark --channel 0|1|2"
+            " --duration-sec N --source transfer|test\n"
             "  ccb_nvme_tool [--dry-run] [--skip-link-check] [--timeout-us N] network-send --task-no <id> --file-index <n> --proto-file-type <0|1|2|3>\n"
             "  ccb_nvme_tool [--dry-run] [--skip-link-check] [--timeout-us N] read --channel 0|1|2 "
             "[--task-no <id> --file-index <n> | --ssd-lba 0x... --size <bytes>]\n"
@@ -238,6 +240,10 @@ int parse_command_type(const char *s, CommandType *type) {
         *type = CMD_SSD_CONTINUOUS_PATTERN_TEST;
         return 0;
     }
+    if (strcmp(s, "dma-rx-benchmark") == 0) {
+        *type = CMD_DMA_RX_BENCHMARK;
+        return 0;
+    }
     return -1;
 }
 
@@ -254,6 +260,7 @@ int parse_subcommand_args(int argc, char **argv, ParsedArgs *out) {
         {"ddr-offset", required_argument, 0, 'O'},
         {"proto-file-type", required_argument, 0, 'p'},
         {"calibration-type", required_argument, 0, 'C'},
+        {"duration-sec", required_argument, 0, 'd'},
         {0, 0, 0, 0},
     };
 
@@ -262,7 +269,7 @@ int parse_subcommand_args(int argc, char **argv, ParsedArgs *out) {
     optind = 1;
 
     /* Long options are the public CLI contract for all subcommands. */
-    while ((c = getopt_long(argc, argv, "c:s:T:i:l:S:b:O:p:C:", long_opts, 0)) != -1) {
+    while ((c = getopt_long(argc, argv, "c:s:T:i:l:S:b:O:p:C:d:", long_opts, 0)) != -1) {
         switch (c) {
         case 'c':
             out->has_channel = true;
@@ -370,6 +377,19 @@ int parse_subcommand_args(int argc, char **argv, ParsedArgs *out) {
             }
             out->has_calibration_type = true;
             out->calibration_type = (uint32_t)v;
+            break;
+        }
+        case 'd': {
+            char *end = NULL;
+            unsigned long v;
+            errno = 0;
+            v = strtoul(optarg, &end, 0);
+            if (errno != 0 || end == optarg || *end != '\0' || v == 0u || v > 86400u) {
+                fprintf(stderr, "Invalid --duration-sec value: %s\n", optarg);
+                return -1;
+            }
+            out->has_duration_sec = true;
+            out->duration_sec = (uint32_t)v;
             break;
         }
         default:
