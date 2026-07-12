@@ -59,6 +59,8 @@ int nvme_cross_slot_engine_add(NvmeCrossSlotEngine *engine, const NvmeWriteSlotR
 int nvme_cross_slot_engine_step(NvmeCrossSlotEngine *engine, uint32_t budget_us,
                                 NvmeWriteSlotDoneCb done_cb, void *opaque);
 uint32_t nvme_cross_slot_engine_active(const NvmeCrossSlotEngine *engine);
+uint32_t nvme_cross_slot_engine_capacity(const NvmeCrossSlotEngine *engine);
+bool nvme_cross_slot_engine_can_accept(const NvmeCrossSlotEngine *engine);
 
 int nvme_write_slots_qd(ChannelRuntime *rt,
                         const NvmeWriteSlotReq *reqs,

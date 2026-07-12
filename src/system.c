@@ -120,6 +120,7 @@ typedef struct {
     int event_fd;
     StorageWorkerEvent worker_event;
     StorageWorkerEvent first_fatal;
+    WriteResult final_result;
     uint32_t worker_phase;
     bool ready_seen;
     bool armed_seen;
@@ -1587,7 +1588,12 @@ static void poll_storage_events(Task *task)
         else if (event.type == STORAGE_WORKER_RUNNING) task->running_seen = true;
         else if (event.type == STORAGE_WORKER_DRAINED) task->drained_seen = true;
         else if (event.type == STORAGE_WORKER_FINAL_RESULT) {
+            if (task->final_result_seen) {
+                task->fatal_seen = true;
+                continue;
+            }
             task->final_result_seen = true;
+            task->final_result = event.result;
             task->final_data_persisted = event.result.data_persisted;
             task->final_integrity_ok = event.result.integrity_ok;
             task->final_status_success = event.result.data_persisted && event.result.integrity_ok;
@@ -2020,6 +2026,35 @@ static void finalize_storage_task(Task *task, int exit_code)
     }
 
     planned = task->planned_file;
+    if (!task->final_result_seen) {
+        task->state = ERROR;
+        task->has_planned_file = false;
+        (void)task_update_status(task->task_id, TASK_FAILED);
+        (void)request_storage_stop_all();
+        return;
+    }
+    {
+        const WriteResult *r = &task->final_result;
+        bool ok = exit_code == 0 && r->data_persisted && r->receive_integrity_ok &&
+                  r->storage_integrity_ok && r->integrity_ok &&
+                  r->dma_received_bytes == r->nvme_completed_bytes &&
+                  r->nvme_completed_bytes == r->file_bytes;
+        if (!ok) {
+            task->state = ERROR;
+            task->has_planned_file = false;
+            (void)task_update_status(task->task_id, TASK_FAILED);
+            (void)request_storage_stop_all();
+            return;
+        }
+        planned.start_lba = r->start_lba;
+        planned.sector_count = r->sector_count;
+        planned.file_index = (int)r->file_index;
+        task->state = IDLE;
+        task->has_planned_file = false;
+        return;
+    }
+
+    /* Legacy stdout parser retained below for source history only; unreachable. */
     if (exit_code != 0 ||
         (task->final_result_seen &&
          (!task->final_status_success || !task->final_integrity_ok ||
@@ -4289,7 +4324,10 @@ static int run_storage_worker_main(int argc, char **argv)
                (unsigned)args.file_index,
                gopt.dry_run ? 1u : 0u);
     rc = execute_write_with_result(&args, gopt, &result);
-    if ((rc == 0 || result.data_persisted) &&
+    if (rc == 0 && result.data_persisted && result.receive_integrity_ok &&
+        result.storage_integrity_ok && result.integrity_ok &&
+        result.dma_received_bytes == result.nvme_completed_bytes &&
+        result.nvme_completed_bytes == result.file_bytes &&
         record_storage_result_to_db(&args, &result) != 0) {
         (void)task_update_status(args.task_no, TASK_FAILED);
         rc = -1;

@@ -2158,6 +2158,7 @@ struct NvmeCrossSlotEngine {
     NvmeWriteSlotReq reqs[NVME_PENDING_CAPACITY];
     bool active[NVME_PENDING_CAPACITY];
     uint32_t active_count;
+    uint32_t max_active;
     uint32_t global_inflight;
     uint32_t rr_index;
 };
@@ -2170,6 +2171,7 @@ NvmeCrossSlotEngine *nvme_cross_slot_engine_create(ChannelRuntime *rt)
     if (e) {
         uint32_t i;
         e->rt = rt;
+        e->max_active = rt->cfg && rt->cfg->id == LOW_SPEED_CHANNEL_ID ? 1u : 4u;
         for (i = 0u; i < NVME_PENDING_CAPACITY; ++i) e->contexts[i].slot = UINT32_MAX;
     }
     return e;
@@ -2180,11 +2182,16 @@ void nvme_cross_slot_engine_destroy(NvmeCrossSlotEngine *engine)
 
 uint32_t nvme_cross_slot_engine_active(const NvmeCrossSlotEngine *engine)
 { return engine ? engine->active_count : 0u; }
+uint32_t nvme_cross_slot_engine_capacity(const NvmeCrossSlotEngine *engine)
+{ return engine ? engine->max_active : 0u; }
+bool nvme_cross_slot_engine_can_accept(const NvmeCrossSlotEngine *engine)
+{ return engine && engine->active_count < engine->max_active; }
 
 int nvme_cross_slot_engine_add(NvmeCrossSlotEngine *e, const NvmeWriteSlotReq *req)
 {
     uint32_t i;
     if (!e || !req || req->sectors == 0u || req->bytes == 0u) return -1;
+    if (!nvme_cross_slot_engine_can_accept(e)) return 1;
     for (i = 0u; i < NVME_PENDING_CAPACITY; ++i) {
         if (e->active[i] && e->reqs[i].slot == req->slot) return -1;
         if (!e->active[i]) {

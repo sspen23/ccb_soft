@@ -1999,8 +1999,9 @@ static void *storage_nvme_cross_slot_writer_thread(void *arg) {
         NvmeWriteSlotReq req;
         int pop_rc;
 
-        pop_rc = storage_queue_pop(q, &item,
-                                   nvme_cross_slot_engine_active(engine) == 0u);
+        pop_rc = nvme_cross_slot_engine_can_accept(engine)
+                     ? storage_queue_pop(q, &item, nvme_cross_slot_engine_active(engine) == 0u)
+                     : 0;
         if (pop_rc < 0) {
             storage_mark_writer_error(q);
             break;
