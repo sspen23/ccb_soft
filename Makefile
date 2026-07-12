@@ -23,10 +23,13 @@ SRCS := \
 	src/ccb_config.c \
 	src/ccb_hw.c \
 	src/ccb_metadata.c \
+	src/ccb_storage_ipc.c \
+	src/ccb_storage_diag.c \
+	src/ccb_storage_pipeline.c \
 	src/ccb_commands.c \
 	src/ccb_tcp_transfer.c
 
-.PHONY: all clean mock-bd-test
+.PHONY: all clean mock-bd-test storage-host-tests
 
 all: $(TARGET)
 
@@ -40,3 +43,17 @@ mock-bd-test:
 	$(CC) $(CFLAGS) -Wformat=2 -ffunction-sections -fdata-sections -Iinclude \
 		tests/mock_bd_ring_test.c src/ccb_hw.c -Wl,--gc-sections -o /tmp/mock_bd_ring_test
 	/tmp/mock_bd_ring_test
+
+storage-host-tests:
+	$(CC) $(CFLAGS) -Wformat=2 -Iinclude tests/mock_storage_ipc_test.c \
+		src/ccb_storage_ipc.c -o /tmp/mock_storage_ipc_test
+	/tmp/mock_storage_ipc_test
+	$(CC) $(CFLAGS) -Wformat=2 -Iinclude tests/mock_storage_pipeline_test.c \
+		src/ccb_storage_pipeline.c -lpthread -o /tmp/mock_storage_pipeline_test
+	/tmp/mock_storage_pipeline_test
+	$(CC) $(CFLAGS) -Wformat=2 -Iinclude tests/mock_storage_diag_test.c \
+		src/ccb_storage_diag.c -latomic -o /tmp/mock_storage_diag_test
+	/tmp/mock_storage_diag_test
+	$(CC) $(CFLAGS) -Wformat=2 -ffunction-sections -fdata-sections -Iinclude \
+		tests/mock_dma_harvest_batch_test.c src/ccb_hw.c -Wl,--gc-sections -o /tmp/mock_dma_harvest_batch_test
+	/tmp/mock_dma_harvest_batch_test

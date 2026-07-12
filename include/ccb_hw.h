@@ -51,6 +51,14 @@ typedef struct {
 } NvmeWriteSlotReq;
 
 typedef int (*NvmeWriteSlotDoneCb)(void *opaque, const NvmeWriteSlotReq *req);
+typedef struct NvmeCrossSlotEngine NvmeCrossSlotEngine;
+
+NvmeCrossSlotEngine *nvme_cross_slot_engine_create(ChannelRuntime *rt);
+void nvme_cross_slot_engine_destroy(NvmeCrossSlotEngine *engine);
+int nvme_cross_slot_engine_add(NvmeCrossSlotEngine *engine, const NvmeWriteSlotReq *req);
+int nvme_cross_slot_engine_step(NvmeCrossSlotEngine *engine, uint32_t budget_us,
+                                NvmeWriteSlotDoneCb done_cb, void *opaque);
+uint32_t nvme_cross_slot_engine_active(const NvmeCrossSlotEngine *engine);
 
 int nvme_write_slots_qd(ChannelRuntime *rt,
                         const NvmeWriteSlotReq *reqs,
@@ -97,6 +105,13 @@ typedef struct {
 int dma_init_s2mm_ring(ChannelRuntime *rt, uint32_t dma_desc_bytes);
 int dma_prepare_s2mm_ring(ChannelRuntime *rt, uint32_t dma_desc_bytes);
 int dma_start_s2mm_ring(ChannelRuntime *rt);
+typedef struct {
+    uint32_t slot;
+    uint32_t actual_bytes;
+    uint32_t descriptor_status;
+} DmaHarvestItem;
+int dma_harvest_batch(ChannelRuntime *rt, DmaHarvestItem *items,
+                      uint32_t max_items, uint32_t budget_us, uint32_t *out_count);
 int dma_harvest_one(ChannelRuntime *rt, uint32_t *slot, uint32_t *actual_bytes);
 int dma_requeue_one(ChannelRuntime *rt, uint32_t slot);
 int dma_get_bd_snapshot(ChannelRuntime *rt,

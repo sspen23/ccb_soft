@@ -2151,6 +2151,111 @@ static int nvme_find_next_submit_context(NvmeSlotWriteContext *contexts,
     return -1;
 }
 
+struct NvmeCrossSlotEngine {
+    ChannelRuntime *rt;
+    NvmePendingCmd pending[NVME_PENDING_CAPACITY];
+    NvmeSlotWriteContext contexts[NVME_PENDING_CAPACITY];
+    NvmeWriteSlotReq reqs[NVME_PENDING_CAPACITY];
+    bool active[NVME_PENDING_CAPACITY];
+    uint32_t active_count;
+    uint32_t global_inflight;
+    uint32_t rr_index;
+};
+
+NvmeCrossSlotEngine *nvme_cross_slot_engine_create(ChannelRuntime *rt)
+{
+    NvmeCrossSlotEngine *e;
+    if (!rt || rt->nvme_qd_effective == 0u || rt->nvme_qd_effective > NVME_PENDING_CAPACITY) return NULL;
+    e = calloc(1u, sizeof(*e));
+    if (e) {
+        uint32_t i;
+        e->rt = rt;
+        for (i = 0u; i < NVME_PENDING_CAPACITY; ++i) e->contexts[i].slot = UINT32_MAX;
+    }
+    return e;
+}
+
+void nvme_cross_slot_engine_destroy(NvmeCrossSlotEngine *engine)
+{ free(engine); }
+
+uint32_t nvme_cross_slot_engine_active(const NvmeCrossSlotEngine *engine)
+{ return engine ? engine->active_count : 0u; }
+
+int nvme_cross_slot_engine_add(NvmeCrossSlotEngine *e, const NvmeWriteSlotReq *req)
+{
+    uint32_t i;
+    if (!e || !req || req->sectors == 0u || req->bytes == 0u) return -1;
+    for (i = 0u; i < NVME_PENDING_CAPACITY; ++i) {
+        if (e->active[i] && e->reqs[i].slot == req->slot) return -1;
+        if (!e->active[i]) {
+            e->active[i] = true; e->reqs[i] = *req;
+            memset(&e->contexts[i], 0, sizeof(e->contexts[i]));
+            e->contexts[i].slot = req->slot; e->contexts[i].base_lba = req->start_lba;
+            e->contexts[i].base_ddr_addr = req->hw_addr; e->contexts[i].total_sectors = req->sectors;
+            e->contexts[i].total_bytes = req->bytes; ++e->active_count; return 0;
+        }
+    }
+    return 1;
+}
+
+int nvme_cross_slot_engine_step(NvmeCrossSlotEngine *e, uint32_t budget_us,
+                                NvmeWriteSlotDoneCb done_cb, void *opaque)
+{
+    uint64_t start_us;
+    uint64_t command_limit;
+    uint32_t qd;
+    if (!e || !e->rt) return -1;
+    qd = e->rt->nvme_qd_effective;
+    command_limit = e->rt->nvme_cmd_sectors ? e->rt->nvme_cmd_sectors : 512u;
+    start_us = wall_time_us();
+    while (e->active_count > 0u) {
+        uint32_t i, pops = 0u;
+        bool progress = false;
+        while (pops < e->rt->nvme_cq_pop_batch && e->global_inflight > 0u) {
+            NvmeCompletion cpl; int prc = nvme_try_poll_cq(e->rt, &cpl);
+            if (prc < 0 || (prc > 0 && nvme_handle_multi_write_completion(e->rt, e->pending,
+                    NVME_PENDING_CAPACITY, e->contexts, NVME_PENDING_CAPACITY,
+                    &e->global_inflight, &cpl) != 0)) return -1;
+            if (prc == 0) break;
+            progress = true;
+            ++pops;
+        }
+        for (i = 0u; i < NVME_PENDING_CAPACITY; ++i) {
+            NvmeSlotWriteContext *ctx = &e->contexts[i];
+            if (e->active[i] && ctx->next_submit_sector == ctx->total_sectors &&
+                ctx->completed_cmds == ctx->submitted_cmds && ctx->inflight_cmds == 0u) {
+                if (ctx->failed_cmds != 0u || (done_cb && done_cb(opaque, &e->reqs[i]) != 0)) return -1;
+                e->active[i] = false; e->contexts[i].slot = UINT32_MAX;
+                --e->active_count; progress = true;
+            }
+        }
+        while (e->global_inflight < qd) {
+            bool done[NVME_PENDING_CAPACITY];
+            int index;
+            NvmeSlotWriteContext *ctx; NvmePendingCmd *p; uint64_t remaining; uint32_t sectors; uint16_t cid; int src;
+            for (i = 0u; i < NVME_PENDING_CAPACITY; ++i) done[i] = !e->active[i];
+            index = nvme_find_next_submit_context(e->contexts, done,
+                                                   NVME_PENDING_CAPACITY, &e->rr_index);
+            if (index < 0) break;
+            ctx = &e->contexts[index]; p = nvme_find_free_pending(e->pending, NVME_PENDING_CAPACITY);
+            if (!p || nvme_alloc_cid(e->rt, e->pending, NVME_PENDING_CAPACITY, &cid) != 0) return -1;
+            remaining = ctx->total_sectors - ctx->next_submit_sector;
+            sectors = (uint32_t)(remaining > command_limit ? command_limit : remaining);
+            memset(p, 0, sizeof(*p)); p->valid = true; p->cid = cid; p->slot = ctx->slot;
+            p->slot_offset = ctx->next_submit_sector * NVME_SECTOR_BYTES;
+            p->lba = ctx->base_lba + ctx->next_submit_sector; p->ddr_addr = ctx->base_ddr_addr + p->slot_offset;
+            p->sectors = sectors; p->bytes = sectors * NVME_SECTOR_BYTES;
+            src = nvme_submit_write_async(e->rt, cid, p->lba, sectors, p->ddr_addr);
+            if (src == 1) { p->valid = false; break; }
+            if (src != 0) { p->valid = false; return -1; }
+            ctx->next_submit_sector += sectors; ++ctx->submitted_cmds; ++ctx->inflight_cmds;
+            ++e->global_inflight; progress = true;
+        }
+        if (!progress || (budget_us != 0u && wall_time_us() - start_us >= budget_us)) break;
+    }
+    return 0;
+}
+
 int nvme_write_slots_qd(ChannelRuntime *rt,
                         const NvmeWriteSlotReq *reqs,
                         uint32_t req_count,
@@ -2972,77 +3077,59 @@ int dma_init_s2mm_ring(ChannelRuntime *rt, uint32_t dma_desc_bytes)
     return dma_start_s2mm_ring(rt);
 }
 
-int dma_harvest_one(ChannelRuntime *rt, uint32_t *slot, uint32_t *actual_bytes) {
+int dma_harvest_batch(ChannelRuntime *rt, DmaHarvestItem *items,
+                      uint32_t max_items, uint32_t budget_us, uint32_t *out_count)
+{
+    uint32_t count = 0u;
+    uint64_t start_us = 0u;
+    if (!rt || !items || !out_count || max_items == 0u) return -1;
+    *out_count = 0u;
+    if (budget_us != 0u) start_us = wall_time_us();
     if (rt->gopt.dry_run) {
-        /* Dry-run simulates continuous completion of descriptors in order. */
-        *slot = rt->next_harvest_bd;
-        *actual_bytes = rt->dma_desc_bytes;
-        rt->next_harvest_bd = (rt->next_harvest_bd + 1u) % rt->dma_desc_count;
-        return 1;
-    }
-
-    /* No descriptor is currently owned by hardware; wait for writer requeue. */
-    if (__atomic_load_n(&rt->dma_hw_desc_count, __ATOMIC_ACQUIRE) == 0u) {
+        for (; count < max_items; ++count) {
+            items[count].slot = rt->next_harvest_bd;
+            items[count].actual_bytes = rt->dma_desc_bytes;
+            items[count].descriptor_status = 0u;
+            rt->next_harvest_bd = (rt->next_harvest_bd + 1u) % rt->dma_desc_count;
+        }
+        *out_count = count;
         return 0;
     }
-
-    {
-        uint32_t dsr = reg_read32(&rt->dma, S2MM_DMASR);
-        /* Any DMA error/halt is fatal for current command. */
-        if (dsr & DMA_ERROR_MASK_S2MM) {
-            fprintf(stderr, "DMA S2MM error on channel %d: dmasr=0x%08x\n", rt->cfg->id, dsr);
-            return -1;
+    while (count < max_items) {
+        volatile DmaSgDesc *desc;
+        uint32_t idx, st, dsr;
+        if (__atomic_load_n(&rt->dma_hw_desc_count, __ATOMIC_ACQUIRE) == 0u) break;
+        dsr = reg_read32(&rt->dma, S2MM_DMASR);
+        if ((dsr & DMA_ERROR_MASK_S2MM) != 0u || (dsr & DMA_SR_HALT_BIT) != 0u) {
+            *out_count = count; return -1;
         }
-        if ((dsr & DMA_SR_HALT_BIT) != 0u) {
-            fprintf(stderr, "DMA halted on channel %d: dmasr=0x%08x\n", rt->cfg->id, dsr);
-            return -1;
-        }
-    }
-
-    {
-        volatile DmaSgDesc *desc = (volatile DmaSgDesc *)(void *)rt->desc.virt;
-        uint32_t idx = rt->next_harvest_bd;
-        uint32_t st = desc[idx].status;
-        /* Descriptor not complete yet, caller should poll again. */
-        if ((st & DESC_STS_CMPLT) == 0u) {
-            return 0;
-        }
-        if ((st & DESC_STS_ERROR_MASK) != 0u) {
-            rt->dma_last_completed_bd = idx;
-            rt->dma_last_completed_status = st;
-            fprintf(stderr,
-                    "DMA S2MM descriptor error on channel %d: slot=%u status=0x%08x\n",
-                    rt->cfg->id,
-                    (unsigned)idx,
-                    st);
-            return -1;
-        }
-
-        *slot = idx;
-        *actual_bytes = st & DESC_STS_LEN_MASK;
-        rt->dma_last_completed_bd = idx;
-        rt->dma_last_completed_status = st;
-        if ((st & DESC_STS_RXSOF) != 0u) {
-            ++rt->dma_rxsof_count;
-            rt->dma_rx_packet_open = true;
-        }
-        if ((st & DESC_STS_RXEOF) != 0u) {
-            ++rt->dma_rxeof_count;
-            rt->dma_rx_packet_open = false;
-        }
-        dbg_verbose_printf("[DBG][DMA] harvest ch=%d slot=%u status=0x%08x bytes=%u"
-                           " sof=%u eof=%u hw_owned_before=%u\n",
-                           rt->cfg->id,
-                           (unsigned)idx,
-                           st,
-                           (unsigned)*actual_bytes,
-                           (st & DESC_STS_RXSOF) ? 1u : 0u,
-                           (st & DESC_STS_RXEOF) ? 1u : 0u,
-                           (unsigned)__atomic_load_n(&rt->dma_hw_desc_count, __ATOMIC_RELAXED));
+        desc = (volatile DmaSgDesc *)(void *)rt->desc.virt;
+        idx = rt->next_harvest_bd; st = desc[idx].status;
+        if ((st & DESC_STS_CMPLT) == 0u) break;
+        rt->dma_last_completed_bd = idx; rt->dma_last_completed_status = st;
+        if ((st & DESC_STS_ERROR_MASK) != 0u) { *out_count = count; return -1; }
+        items[count].slot = idx;
+        items[count].actual_bytes = st & DESC_STS_LEN_MASK;
+        items[count].descriptor_status = st;
+        if ((st & DESC_STS_RXSOF) != 0u) { ++rt->dma_rxsof_count; rt->dma_rx_packet_open = true; }
+        if ((st & DESC_STS_RXEOF) != 0u) { ++rt->dma_rxeof_count; rt->dma_rx_packet_open = false; }
         (void)__atomic_sub_fetch(&rt->dma_hw_desc_count, 1u, __ATOMIC_ACQ_REL);
-        rt->next_harvest_bd = (rt->next_harvest_bd + 1u) % rt->dma_desc_count;
+        rt->next_harvest_bd = (idx + 1u) % rt->dma_desc_count;
+        ++count;
+        if (budget_us != 0u && wall_time_us() - start_us >= budget_us) break;
     }
-    return 1;
+    *out_count = count;
+    return 0;
+}
+
+int dma_harvest_one(ChannelRuntime *rt, uint32_t *slot, uint32_t *actual_bytes) {
+    DmaHarvestItem item;
+    uint32_t count = 0u;
+    int rc;
+    if (!slot || !actual_bytes) return -1;
+    rc = dma_harvest_batch(rt, &item, 1u, 0u, &count);
+    if (count != 0u) { *slot = item.slot; *actual_bytes = item.actual_bytes; }
+    return rc != 0 ? -1 : (count != 0u ? 1 : 0);
 }
 
 int dma_requeue_one(ChannelRuntime *rt, uint32_t slot) {

@@ -204,8 +204,10 @@ while queue not done:
 
 重要约束：descriptor 只有在对应 DDR slot 已写入 NVMe 后才归还给 DMA。这样可以避免 DMA 覆盖尚未落盘的数据。
 
-默认仍走 single-slot legacy writer。`SRC_REAL_NVME_CROSS_SLOT_QD=1` 才启用
-跨 slot 全局 QD writer。`SRC_REAL_PIPELINE_MODE` 和
+V2 默认 ch0/ch1 走 cross-slot writer（QD=8、batch=4），ch2 保持 single-slot；
+`SRC_REAL_NVME_CROSS_SLOT_QD_CHx`/`SRC_REAL_NVME_CROSS_SLOT_BATCH_CHx` 可覆盖，
+旧 `SRC_REAL_NVME_CROSS_SLOT_QD`/`SRC_REAL_NVME_CROSS_SLOT_BATCH` 继续兼容。
+`SRC_REAL_PIPELINE_MODE` 和
 `SRC_REAL_CHx_FAST_PIPELINE` 当前作为测试配置日志输出，保留 legacy 回退。
 
 日志等级和周期统计：
@@ -706,8 +708,9 @@ DMA_WRITABLE
 `DMA_WRITABLE` 的 slot，必须读取真实 BD status；带 `DESC_STS_CMPLT` 的 BD
 计入 `completed_unharvested`，不能计入 writable。
 
-producer 负责 harvest、状态转换和 ready queue 入队，默认使用 SCHED_RR，且
-同通道优先级高于 writer。连续完成的 BD 按通道 batch 上限 harvest；只要本轮
+producer 负责 harvest、状态转换和 ready queue 入队，默认 producer/writer 都是
+SCHED_RR/60，RUN 前保持 SCHED_OTHER，producer 不会被自动提升到 writer 之上。
+连续完成的 BD 按通道 batch 上限 harvest；只要本轮
 有完成项就不 sleep。水位与故障判断只使用 `DmaBdSnapshot.dma_writable`。
 
 窗口日志 `storage_receive` 输出真实 writable/unharvested/ready/NVMe/requeue
