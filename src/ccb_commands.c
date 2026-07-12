@@ -4,6 +4,7 @@
 #include "ccb_hw.h"
 #include "ccb_metadata.h"
 #include "ccb_storage_ipc.h"
+#include "ccb_storage_pipeline.h"
 #include "debug_uart.h"
 
 #include <stdio.h>
@@ -37,6 +38,7 @@
 #define STORAGE_DESC_STS_RXSOF (1u << 27)
 #define STORAGE_DESC_STS_RXEOF (1u << 26)
 static volatile sig_atomic_t g_storage_stop_requested = 0;
+static bool g_storage_control_stop_latched = false;
 
 typedef struct {
     uint32_t slot;
@@ -82,6 +84,7 @@ typedef struct {
     PendingDdrSlot *items;
     bool *slot_busy;
     uint8_t *slot_state;
+    StorageSlotCounts slot_counts;
     uint32_t capacity;
     uint32_t head;
     uint32_t tail;
@@ -289,7 +292,11 @@ static bool storage_control_stop_requested(void)
 {
     StorageControlMessage msg;
     int fd = storage_env_fd("SRC_REAL_STORAGE_CONTROL_FD");
-    return fd >= 0 && storage_ipc_read_control(fd, &msg) == 0 && msg.type == STORAGE_CTRL_STOP;
+    if (g_storage_control_stop_latched) return true;
+    if (fd >= 0 && storage_ipc_read_control(fd, &msg) == 0 && msg.type == STORAGE_CTRL_STOP) {
+        g_storage_control_stop_latched = true;
+    }
+    return g_storage_control_stop_latched;
 }
 
 static void storage_emit_line(const char *fmt, ...)
@@ -988,6 +995,37 @@ static void storage_print_slot_fingerprint(const ChannelRuntime *rt,
     fflush(stdout);
 }
 
+static uint32_t *storage_local_count_for_state(StorageSlotCounts *c, StorageSlotState state)
+{
+    switch (state) {
+    case STORAGE_SLOT_DMA_WRITABLE: return &c->dma_writable;
+    case STORAGE_SLOT_DMA_COMPLETED_UNHARVESTED: return &c->completed_unharvested;
+    case STORAGE_SLOT_READY_FOR_NVME: return &c->ready;
+    case STORAGE_SLOT_NVME_BUSY: return &c->nvme_busy;
+    case STORAGE_SLOT_REQUEUE_PENDING: return &c->requeue_pending;
+    case STORAGE_SLOT_FREE: return &c->free_count;
+    default: return NULL;
+    }
+}
+
+static int storage_local_slot_transition_locked(StorageWriteQueue *q, uint32_t slot,
+                                                StorageSlotState expected, StorageSlotState next)
+{
+    uint32_t *from, *to;
+    StorageSlotCounts *c;
+    if (!q || slot >= q->capacity || q->slot_state[slot] != expected) goto bad;
+    c = &q->slot_counts;
+    from = storage_local_count_for_state(c, expected); to = storage_local_count_for_state(c, next);
+    if (!from || !to || *from == 0u) goto bad;
+    --*from; ++*to; q->slot_state[slot] = (uint8_t)next;
+    if (c->total != c->dma_writable + c->completed_unharvested + c->ready +
+                    c->nvme_busy + c->requeue_pending + c->free_count) goto bad;
+    return 0;
+bad:
+    if (q) q->error = true;
+    return -1;
+}
+
 static int storage_queue_init(StorageWriteQueue *q,
                               ChannelRuntime *rt,
                               uint32_t file_index,
@@ -1014,6 +1052,8 @@ static int storage_queue_init(StorageWriteQueue *q,
     memset(q->slot_state, STORAGE_SLOT_DMA_WRITABLE, rt->dma_desc_count);
     q->rt = rt;
     q->capacity = rt->dma_desc_count;
+    q->slot_counts.total = q->capacity;
+    q->slot_counts.dma_writable = q->capacity;
     q->file_index = file_index;
     q->metadata_slot = metadata_slot;
     q->task_no = task_no;
@@ -1107,19 +1147,25 @@ static int storage_queue_push(StorageWriteQueue *q,
     q->items[q->tail].start_lba = start_lba;
     q->items[q->tail].sectors = sectors;
     q->items[q->tail].hw_addr = hw_addr;
-    if (q->slot_state) {
-        q->slot_state[slot] = STORAGE_SLOT_READY_FOR_NVME;
-    }
+    if (storage_local_slot_transition_locked(q, slot, STORAGE_SLOT_DMA_WRITABLE,
+                                             STORAGE_SLOT_DMA_COMPLETED_UNHARVESTED) != 0 ||
+        storage_local_slot_transition_locked(q, slot, STORAGE_SLOT_DMA_COMPLETED_UNHARVESTED,
+                                             STORAGE_SLOT_READY_FOR_NVME) != 0) goto bad;
     q->tail = (q->tail + 1u) % q->capacity;
     ++q->count;
     storage_queue_record_depth_locked(q);
     pthread_cond_signal(&q->not_empty);
     pthread_mutex_unlock(&q->lock);
     return 0;
+bad:
+    q->error = true;
+    pthread_cond_broadcast(&q->not_empty);
+    pthread_mutex_unlock(&q->lock);
+    return -1;
 }
 
 /* Producer never waits for writer capacity: validate the complete harvest first. */
-static int storage_queue_push_batch(StorageWriteQueue *q, const PendingDdrSlot *items,
+static int storage_local_queue_push_batch(StorageWriteQueue *q, const PendingDdrSlot *items,
                                     uint32_t item_count)
 {
     uint32_t i, j;
@@ -1132,14 +1178,16 @@ static int storage_queue_push_batch(StorageWriteQueue *q, const PendingDdrSlot *
     }
     for (i = 0u; i < item_count; ++i) {
         uint32_t slot = items[i].slot;
-        q->slot_state[slot] = STORAGE_SLOT_DMA_COMPLETED_UNHARVESTED;
+        if (storage_local_slot_transition_locked(q, slot, STORAGE_SLOT_DMA_WRITABLE,
+                                                 STORAGE_SLOT_DMA_COMPLETED_UNHARVESTED) != 0) goto bad;
         q->items[q->tail] = items[i];
         q->tail = (q->tail + 1u) % q->capacity;
         ++q->count;
         q->slot_busy[slot] = true;
         ++q->busy_count;
         q->buffered_bytes += items[i].bytes;
-        q->slot_state[slot] = STORAGE_SLOT_READY_FOR_NVME;
+        if (storage_local_slot_transition_locked(q, slot, STORAGE_SLOT_DMA_COMPLETED_UNHARVESTED,
+                                                 STORAGE_SLOT_READY_FOR_NVME) != 0) goto bad;
     }
     if (q->busy_count > q->max_busy_count) q->max_busy_count = q->busy_count;
     if (q->buffered_bytes > q->max_buffered_bytes) q->max_buffered_bytes = q->buffered_bytes;
@@ -1764,9 +1812,9 @@ static int storage_complete_slot(StorageWriteQueue *q, const PendingDdrSlot *ite
         q->buffered_bytes = 0u;
     }
     should_requeue = !q->producer_done;
-    if (q->slot_state) {
-        q->slot_state[item->slot] = should_requeue ? STORAGE_SLOT_REQUEUE_PENDING
-                                                   : STORAGE_SLOT_FREE;
+    if (storage_local_slot_transition_locked(q, item->slot, STORAGE_SLOT_NVME_BUSY,
+                                             should_requeue ? STORAGE_SLOT_REQUEUE_PENDING : STORAGE_SLOT_FREE) != 0) {
+        pthread_mutex_unlock(&q->lock); return -1;
     }
     pthread_mutex_unlock(&q->lock);
 
@@ -1776,7 +1824,10 @@ static int storage_complete_slot(StorageWriteQueue *q, const PendingDdrSlot *ite
             return -1;
         }
         pthread_mutex_lock(&q->lock);
-        q->slot_state[item->slot] = STORAGE_SLOT_DMA_WRITABLE;
+        if (storage_local_slot_transition_locked(q, item->slot, STORAGE_SLOT_REQUEUE_PENDING,
+                                                 STORAGE_SLOT_DMA_WRITABLE) != 0) {
+            pthread_mutex_unlock(&q->lock); return -1;
+        }
         pthread_mutex_unlock(&q->lock);
     }
     return 0;
@@ -1810,8 +1861,9 @@ static int storage_queue_pop(StorageWriteQueue *q, PendingDdrSlot *out, bool wai
     *out = q->items[q->head];
     q->head = (q->head + 1u) % q->capacity;
     --q->count;
-    if (q->slot_state && out->slot < q->capacity) {
-        q->slot_state[out->slot] = STORAGE_SLOT_NVME_BUSY;
+    if (storage_local_slot_transition_locked(q, out->slot, STORAGE_SLOT_READY_FOR_NVME,
+                                             STORAGE_SLOT_NVME_BUSY) != 0) {
+        pthread_mutex_unlock(&q->lock); return -1;
     }
     storage_queue_record_depth_locked(q);
     pthread_cond_signal(&q->not_full);
@@ -1976,6 +2028,7 @@ static void *storage_nvme_cross_slot_writer_thread(void *arg) {
 
 void storage_write_reset_stop(void) {
     g_storage_stop_requested = 0;
+    g_storage_control_stop_latched = false;
 }
 
 void storage_write_request_stop(void) {
@@ -2644,6 +2697,7 @@ int execute_write_with_result(const ParsedArgs *args, GlobalOptions gopt, WriteR
             uint32_t harvest_limit = harvest_batch_max_cfg == 0u ? 1u :
                                      (harvest_batch_max_cfg > 16u ? 16u : harvest_batch_max_cfg);
             int harvest_rc;
+            bool harvest_fatal;
             int h;
             uint64_t chunk_bytes;
             bool stop_requested = storage_write_stop_requested() != 0 || storage_control_stop_requested();
@@ -2676,7 +2730,8 @@ int execute_write_with_result(const ParsedArgs *args, GlobalOptions gopt, WriteR
             }
 
             harvest_rc = dma_harvest_batch(&rt, harvest_items, harvest_limit, 100u, &harvest_count);
-            h = harvest_rc != 0 ? -1 : (harvest_count != 0u ? 1 : 0);
+            harvest_fatal = harvest_rc != 0;
+            h = harvest_count != 0u ? 1 : (harvest_fatal ? -1 : 0);
             if (h < 0) {
                 if ((rt.dma_last_completed_status & 0x70000000u) != 0u) {
                     ++producer_stats.descriptor_error_count;
@@ -2877,9 +2932,17 @@ int execute_write_with_result(const ParsedArgs *args, GlobalOptions gopt, WriteR
                     next_queue_lba += pending[i].sectors;
                     storage_stats_record_dma_desc(&producer_stats, storage_wall_time_us());
                 }
-                if (storage_queue_push_batch(&write_queue, pending, harvest_count) != 0) {
+                if (storage_local_queue_push_batch(&write_queue, pending, harvest_count) != 0) {
                     storage_emit_event(STORAGE_WORKER_FATAL, &rt, -1, dma_received_bytes,
                                        "storage_queue_full_or_state_error");
+                    goto out;
+                }
+                if (harvest_fatal) {
+                    producer_stats.receive_integrity_ok = false;
+                    snprintf(producer_stats.receive_integrity_risk,
+                             sizeof(producer_stats.receive_integrity_risk), "dma_harvest_failed");
+                    storage_emit_event(STORAGE_WORKER_FATAL, &rt, -1, dma_received_bytes,
+                                       producer_stats.receive_integrity_risk);
                     goto out;
                 }
                 saw_dma_data = true;
@@ -2969,6 +3032,14 @@ int execute_write_with_result(const ParsedArgs *args, GlobalOptions gopt, WriteR
                     goto out;
                 }
                 next_queue_lba += chunk_sectors;
+                if (harvest_fatal) {
+                    producer_stats.receive_integrity_ok = false;
+                    snprintf(producer_stats.receive_integrity_risk,
+                             sizeof(producer_stats.receive_integrity_risk), "dma_harvest_failed");
+                    storage_emit_event(STORAGE_WORKER_FATAL, &rt, -1, dma_received_bytes,
+                                       producer_stats.receive_integrity_risk);
+                    goto out;
+                }
             }
             {
                 uint64_t now_us = storage_wall_time_us();
