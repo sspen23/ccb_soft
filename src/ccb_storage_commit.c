@@ -103,16 +103,25 @@ int storage_commit_run_once(StorageCommitState *state, const char *task_id,
         return rollback_failure(state, task_id, items, metadata_count, ops,
                                 transaction_open, "task_completed_update_failed");
     }
-    if (ops->flash_sync && ops->flash_sync(ops->ctx) != 0) {
-        return rollback_failure(state, task_id, items, metadata_count, ops,
-                                transaction_open, "flash_sync_failed");
-    }
     if (ops->db_commit(ops->ctx) != 0) {
         return rollback_failure(state, task_id, items, metadata_count, ops,
                                 transaction_open, "db_commit_failed");
     }
     transaction_open = false;
-    (void)transaction_open;
+    /* Flash is a post-commit side effect.  At this point the database
+     * transaction is already durable, so a flash failure must not pretend
+     * that an SQLite rollback restored the committed records.  Keep the
+     * complete primary-store result, report the side-effect failure, and
+     * let the caller retry synchronization without publishing success. */
+    if (ops->flash_sync && ops->flash_sync(ops->ctx) != 0) {
+        set_reason(state, "flash_sync_failed");
+        if (!ops->task_status_update ||
+            ops->task_status_update(ops->ctx, task_id, TASK_FAILED) != 0) {
+            set_reason(state, "task_failed_update_failed");
+        }
+        state->success = false;
+        return -1;
+    }
     state->success = true;
     set_reason(state, "none");
     return 0;

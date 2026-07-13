@@ -6,11 +6,15 @@ static uint32_t bit(uint32_t ch) { return ch < NUM_CHANNELS ? 1u << ch : 0u; }
 
 static void fail(StorageTaskSupervisor *s, uint32_t ch, const char *reason)
 {
+    const char *failure_reason = reason && reason[0] != '\0' ? reason : "worker_fatal";
+
     if (!s->first_fatal) {
         s->first_fatal = true;
         s->fatal_channel = ch;
-        snprintf(s->fatal_reason, sizeof(s->fatal_reason), "%s",
-                 reason && reason[0] != '\0' ? reason : "worker_fatal");
+        snprintf(s->fatal_reason, sizeof(s->fatal_reason), "%s", failure_reason);
+    } else if (s->secondary_reason[0] == '\0' &&
+               strcmp(s->fatal_reason, failure_reason) != 0) {
+        snprintf(s->secondary_reason, sizeof(s->secondary_reason), "%s", failure_reason);
     }
     s->result_known_failed = true;
     s->stop_requested_mask |= s->target_channel_mask & ~s->final_seen_mask;
@@ -23,6 +27,8 @@ static void fail_worker_exit_without_final(StorageTaskSupervisor *s, uint32_t ch
 
     if (s->first_fatal && (s->unavailable_mask & b) != 0u &&
         strcmp(s->fatal_reason, "event_eof_without_final") == 0) {
+        snprintf(s->secondary_reason, sizeof(s->secondary_reason), "%s",
+                 s->fatal_reason);
         snprintf(s->fatal_reason, sizeof(s->fatal_reason), "%s",
                  "worker_exit_without_final");
         s->fatal_channel = ch;
@@ -37,6 +43,17 @@ void storage_supervisor_protocol_fail(StorageTaskSupervisor *s, uint32_t ch,
                                       const char *reason)
 {
     if (s) fail(s, ch, reason && reason[0] != '\0' ? reason : "event_protocol_invalid");
+}
+void storage_supervisor_mark_unavailable(StorageTaskSupervisor *s, uint32_t ch,
+                                         const char *reason)
+{
+    uint32_t b = bit(ch);
+
+    if (!s || b == 0u || (s->target_channel_mask & b) == 0u) return;
+    s->worker_exited_mask |= b;
+    s->unavailable_mask |= b;
+    fail(s, ch, reason && reason[0] != '\0' ? reason : "worker_unavailable");
+    (void)storage_supervisor_result_status(s);
 }
 
 int storage_supervisor_handle_event_for_channel(StorageTaskSupervisor *s,
@@ -90,11 +107,12 @@ int storage_supervisor_handle_event(StorageTaskSupervisor *s, const StorageWorke
         }
         s->drained_mask |= b;
         break;
-    case STORAGE_WORKER_FATAL:
-        if ((s->final_seen_mask & b) != 0u) {
-            fail(s, e->channel, "invalid_fatal_sequence");
-            return -1;
-        }
+        case STORAGE_WORKER_FATAL:
+            if ((s->final_seen_mask & b) != 0u ||
+                (s->fatal_seen_mask & b) != 0u) {
+                fail(s, e->channel, "invalid_fatal_sequence");
+                return -1;
+            }
         s->fatal_seen_mask |= b;
         fail(s,e->channel,e->reason);
         break;

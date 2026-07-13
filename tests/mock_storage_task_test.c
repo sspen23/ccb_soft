@@ -38,13 +38,17 @@ static void test_all_exit_paths_close_fds(void)
         task.event_fd = event_pipe[0];
         task.state = RUNNING;
         task.has_planned_file = true;
+        snprintf(task.task_id, sizeof(task.task_id), "old-task");
 
         if ((i & 1u) == 0u) storage_task_close_fds(&task);
         else storage_task_reset_runtime(&task);
         assert(task.output_fd == -1);
         assert(task.control_fd == -1);
         assert(task.event_fd == -1);
-        if ((i & 1u) != 0u) assert(task.pid == -1);
+        if ((i & 1u) != 0u) {
+            assert(task.pid == -1);
+            assert(task.task_id[0] == '\0');
+        }
 
         close(output_pipe[1]);
         close(control_pipe[0]);

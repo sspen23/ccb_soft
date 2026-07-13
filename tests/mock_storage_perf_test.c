@@ -38,6 +38,9 @@ int main(void)
     assert(storage_perf_log_event(&e, "task") == 0);
     storage_ipc_make_event(&e, STORAGE_WORKER_FINAL_RESULT, 1u, 0, 9u, "final_reason");
     e.result.dma_received_bytes = e.result.nvme_completed_bytes = e.result.file_bytes = 9u;
+    e.result.nvme_media_bytes = 10u; e.result.nvme_padding_bytes = 1u;
+    snprintf(e.result.integrity_risk, sizeof(e.result.integrity_risk), "%s", "primary_reason");
+    snprintf(e.result.secondary_reason, sizeof(e.result.secondary_reason), "%s", "secondary_reason");
     assert(storage_perf_log_event(&e, "task") == 0);
     storage_ipc_make_event(&e, STORAGE_WORKER_DIAG_EVENT, 1u, 0, 0u, "diag");
     e.diag.sequence = 3u; e.diag.event_id = STORAGE_EVENT_WORKER_FATAL;
@@ -46,6 +49,8 @@ int main(void)
     while (fgets(line, sizeof(line), f)) { if (strstr(line, "storage_fatal")) break; }
     assert(strstr(line, "fatal_reason"));
     assert(fgets(line, sizeof(line), f) && strstr(line, "storage_final"));
+    assert(strstr(line, "nvme_media_bytes=10") && strstr(line, "primary_reason=primary_reason") &&
+           strstr(line, "secondary_reason=secondary_reason"));
     assert(fgets(line, sizeof(line), f) && strstr(line, "storage_diag")); fclose(f);
     storage_perf_log_close();
     setenv("SRC_REAL_PERF_LOG_FILE", "/tmp/no_such_dir/mock.log", 1);

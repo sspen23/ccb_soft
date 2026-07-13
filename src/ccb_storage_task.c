@@ -54,6 +54,10 @@ void storage_task_reset_runtime(Task *task)
     task->final_dma_received_bytes = 0u;
     memset(&task->planned_file, 0, sizeof(task->planned_file));
     task->has_planned_file = false;
+    /* Do not let a previous channel's task identifier participate in a
+     * later single-channel aggregate or stale-event diagnostic.  The task
+     * slot is fully reusable only after all runtime identity is reset. */
+    memset(task->task_id, 0, sizeof(task->task_id));
     task->overpass_time = 0;
 }
 

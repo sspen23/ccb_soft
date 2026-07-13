@@ -17,6 +17,7 @@
 #include <sys/types.h>
 #include <sys/time.h>
 #include <sys/wait.h>
+#include <poll.h>
 #ifdef __linux__
 #include <sys/mman.h>
 #endif
@@ -120,6 +121,41 @@ LastTaskContext g_last_task = {0};
 static StorageTaskSupervisor g_storage_supervisor;
 static StorageCommitState g_storage_commit_state;
 
+typedef struct {
+    bool active;
+    bool forced_reap;
+    char task_id[12];
+    uint8_t acq_type;
+    uint8_t failure_type;
+    uint64_t deadline_us;
+    int requested_workers;
+} StoragePendingStop;
+
+static StoragePendingStop g_pending_storage_stop;
+
+typedef enum {
+    STORAGE_START_PREP_READY = 1,
+    STORAGE_START_ARM_WAIT,
+    STORAGE_START_RUN_WAIT,
+    STORAGE_START_FAILED
+} StorageStartPhase;
+
+typedef struct {
+    bool active;
+    bool prepare;
+    bool failure_ack_sent;
+    StorageStartPhase phase;
+    char task_id[12];
+    uint8_t acq_type;
+    uint8_t failure_type;
+    int target_count;
+    uint64_t deadline_us;
+} StoragePendingStart;
+
+static StoragePendingStart g_pending_storage_start;
+
+#define STORAGE_START_PENDING 0xFEu
+
 static void poll_task_output(Task *task);
 static void drain_storage_events(Task *task, bool report_eof);
 static void poll_storage_events(Task *task);
@@ -128,17 +164,24 @@ static void storage_try_send_pending_stops(void);
 static void storage_finish_worker_exit(Task *task, int exit_code, int signal_number);
 static void storage_handle_worker_exit(Task *task, int status);
 static int storage_commit_supervised_results(const char *task_id);
+static void storage_service_pending_stop(void);
+static void storage_service_pending_start(void);
+static void system_emit_line(const char *fmt, ...);
 
 static void storage_supervisor_emit_aggregate(void)
 {
     uint64_t bytes[NUM_CHANNELS] = {0u};
     uint32_t i;
     const char *task_id = "";
+    const char *secondary_reason = "none";
     StorageTaskTerminal status = storage_supervisor_result_status(&g_storage_supervisor);
     if (g_storage_supervisor.aggregate_emitted || status == STORAGE_TASK_ACTIVE) return;
     for (i = 0u; i < NUM_CHANNELS; ++i) {
         bytes[i] = g_storage_supervisor.final_result[i].file_bytes;
-        if (task_id[0] == '\0' && storage_tasks[i].task_id[0] != '\0') task_id = storage_tasks[i].task_id;
+        if ((g_storage_supervisor.target_channel_mask & (1u << i)) != 0u &&
+            task_id[0] == '\0' && storage_tasks[i].task_id[0] != '\0') {
+            task_id = storage_tasks[i].task_id;
+        }
     }
     if (status == STORAGE_TASK_SUCCESS && storage_commit_supervised_results(task_id) != 0) {
         storage_supervisor_protocol_fail(&g_storage_supervisor, NUM_CHANNELS,
@@ -147,11 +190,27 @@ static void storage_supervisor_emit_aggregate(void)
     } else if (status == STORAGE_TASK_FAILED && task_id[0] != '\0') {
         (void)task_update_status(task_id, TASK_FAILED);
     }
+    if (g_storage_supervisor.secondary_reason[0] != '\0') {
+        secondary_reason = g_storage_supervisor.secondary_reason;
+    } else {
+        for (i = 0u; i < NUM_CHANNELS; ++i) {
+            if ((g_storage_supervisor.target_channel_mask & (1u << i)) != 0u &&
+                g_storage_supervisor.final_result[i].secondary_reason[0] != '\0') {
+                secondary_reason = g_storage_supervisor.final_result[i].secondary_reason;
+                break;
+            }
+        }
+    }
     printf("storage_capture_complete task=%s status=%s ch0_bytes=%" PRIu64
-           " ch1_bytes=%" PRIu64 " ch2_bytes=%" PRIu64 " integrity_ok=%u reason=%s\n",
+           " ch1_bytes=%" PRIu64 " ch2_bytes=%" PRIu64 " integrity_ok=%u"
+           " primary_reason=%s secondary_reason=%s reason=%s\n",
            task_id,
            status == STORAGE_TASK_SUCCESS ? "success" : "failed", bytes[0], bytes[1], bytes[2],
            status == STORAGE_TASK_SUCCESS ? 1u : 0u,
+           status == STORAGE_TASK_SUCCESS ? "none" :
+               (g_storage_commit_state.attempted && !g_storage_commit_state.success
+                    ? g_storage_commit_state.reason : g_storage_supervisor.fatal_reason),
+           secondary_reason,
            status == STORAGE_TASK_SUCCESS ? "none" :
                (g_storage_commit_state.attempted && !g_storage_commit_state.success
                     ? g_storage_commit_state.reason : g_storage_supervisor.fatal_reason));
@@ -295,19 +354,17 @@ static bool storage_any_running(void)
     return storage_any_state(RUNNING);
 }
 
+static bool storage_any_live_worker(void)
+{
+    size_t i;
+    for (i = 0u; i < STORAGE_TASK_COUNT; ++i)
+        if (storage_tasks[i].pid > 0) return true;
+    return false;
+}
+
 static bool storage_any_error(void)
 {
     return storage_any_state(ERROR);
-}
-
-static bool storage_task_is_ready(const Task *task)
-{
-    return task && task->state == RUNNING && task->ready_seen;
-}
-
-static bool storage_task_is_started(const Task *task)
-{
-    return task && task->state == RUNNING && task->running_seen;
 }
 
 static int storage_state_summary(void)
@@ -326,18 +383,17 @@ static void stop_all_storage_tasks(void)
     size_t i;
 
     for (i = 0; i < STORAGE_TASK_COUNT; ++i) {
-        if (storage_tasks[i].state == RUNNING) {
+        if (storage_tasks[i].pid > 0) {
             int status = 0;
             pid_t ret;
 
             (void)kill(storage_tasks[i].pid, SIGKILL);
-            do {
-                ret = waitpid(storage_tasks[i].pid, &status, 0);
-            } while (ret < 0 && errno == EINTR);
+            ret = waitpid(storage_tasks[i].pid, &status, WNOHANG);
             if (ret > 0) {
                 storage_handle_worker_exit(&storage_tasks[i], status);
-            } else {
-                storage_finish_worker_exit(&storage_tasks[i], 1, 0);
+            } else if (ret < 0 && errno != EINTR && errno != ECHILD) {
+                LOG_ERROR("STORAGE", "bounded SIGKILL reap failed pid=%d errno=%d",
+                          storage_tasks[i].pid, errno);
             }
         }
     }
@@ -352,7 +408,7 @@ static int request_storage_stop_all(void)
     uint32_t stop_mask = 0u;
 
     for (i = 0; i < STORAGE_TASK_COUNT; ++i) {
-        if (storage_tasks[i].state == RUNNING) {
+        if (storage_tasks[i].pid > 0) {
             stop_mask |= 1u << i;
             ++requested;
         }
@@ -696,17 +752,16 @@ int serial_send(uint8_t *buf, int len)
 static int storage_send_control(Task *task, StorageControlType type, uint64_t timestamp_us)
 {
     StorageControlMessage msg;
-    ssize_t written;
+
+    /* The UART loop calls this from its periodic service slice.  Keep one
+     * attempt short and let the caller's bounded retry/fallback policy make
+     * progress; never spend the whole critical-event budget parked in poll(). */
+    const uint64_t send_slice_us = 1000ull;
 
     if (!task || task->control_fd < 0) return -1;
     storage_ipc_make_control(&msg, type, timestamp_us);
-    if (type == STORAGE_CTRL_STOP) {
-        written = write(task->control_fd, &msg, sizeof(msg));
-        if (written == (ssize_t)sizeof(msg)) return 0;
-        if (written >= 0) errno = EIO;
-        return -1;
-    }
-    return storage_ipc_write_control(task->control_fd, &msg);
+    return storage_ipc_write_control_deadline(task->control_fd, &msg,
+                                              storage_ipc_monotonic_us() + send_slice_us);
 }
 
 #define STORAGE_STOP_MAX_SEND_ATTEMPTS 3u
@@ -745,7 +800,7 @@ static void storage_try_send_pending_stops(void)
         Task *task = &storage_tasks[i];
         int send_errno;
 
-        if ((pending & (1u << i)) == 0u || task->state != RUNNING ||
+        if ((pending & (1u << i)) == 0u || task->pid <= 0 ||
             task->stop_send_attempts > STORAGE_STOP_MAX_SEND_ATTEMPTS) {
             continue;
         }
@@ -862,7 +917,7 @@ static void storage_handle_worker_exit(Task *task, int status)
 
 void check_task(Task *task)
 {
-    if (task->state != RUNNING) return;
+    if (!task || task->pid <= 0) return;
 
     {
         int status;
@@ -876,11 +931,16 @@ void check_task(Task *task)
                 LOG_ERROR(task->name, "Task timeout after %ld seconds", task->timeout_seconds);
                 printf("%s timeout\n", task->name);
                 (void)kill(task->pid, SIGKILL);
-                do {
-                    ret = waitpid(task->pid, &status, 0);
-                } while (ret < 0 && errno == EINTR);
+                ret = waitpid(task->pid, &status, WNOHANG);
                 if (ret > 0) storage_handle_worker_exit(task, status);
-                else storage_finish_worker_exit(task, 1, 0);
+                else if (ret < 0 && errno != EINTR) {
+                    LOG_ERROR(task->name, "waitpid after timeout failed: pid=%d errno=%d",
+                              task->pid, errno);
+                } else {
+                    /* Keep the pid until a later poll reaps it; never block
+                     * the UART/control loop on an unbounded waitpid. */
+                    task->state = ERROR;
+                }
             }
             return;
         }
@@ -1005,9 +1065,10 @@ static int build_file_plan(const LastTaskContext *ctx, PlannedFile *files, int *
         files[n++] = (PlannedFile){2, FILE_TYPE_LOW, "LOW_SPEED", 0u, 0, 0u, 0u, 0u};
         break;
     case TASK_FILE_MODE_HIGH_ONLY:
-        files[n++] = (PlannedFile){0, FILE_TYPE_I, "HIGH_I", 0u, 0, 0u, 0u, 0u};
-        files[n++] = (PlannedFile){1, FILE_TYPE_Q, "HIGH_Q", 0u, 0, 0u, 0u, 0u};
-        break;
+        /* Product mode 0x33 would start ch0/ch1 without the ch2 envelope.
+         * Keep the protocol value for compatibility but reject it explicitly
+         * instead of silently changing the requested task. */
+        return -1;
     case TASK_FILE_MODE_ALL:
         files[n++] = (PlannedFile){2, FILE_TYPE_LOW, "LOW_SPEED", 0u, 0, 0u, 0u, 0u};
         files[n++] = (PlannedFile){0, FILE_TYPE_I, "HIGH_I", 0u, 0, 0u, 0u, 0u};
@@ -1183,70 +1244,65 @@ static void network_throttle_after_chunk(uint64_t chunk_start_us,
     }
 }
 
-static uint8_t wait_storage_workers_finished_after_stop(const char *task_id, int stop_requested)
+static uint64_t storage_parent_stop_timeout_us(void)
 {
-    uint32_t waited_ms = 0u;
-    uint32_t timeout_ms = env_u32_or_default("SRC_REAL_STORAGE_STOP_TIMEOUT_MS", 120000u);
+    const char *value = getenv("SRC_REAL_STORAGE_STOP_TIMEOUT_US");
+    char *end = NULL;
+    unsigned long long parsed;
 
-    while (1) {
-        size_t i;
+    if (value && value[0] != '\0') {
+        errno = 0;
+        parsed = strtoull(value, &end, 0);
+        if (errno == 0 && end != value && *end == '\0' && parsed > 0u)
+            return (uint64_t)parsed;
+    }
+    value = getenv("SRC_REAL_STORAGE_STOP_TIMEOUT_MS");
+    if (value && value[0] != '\0') {
+        errno = 0;
+        parsed = strtoull(value, &end, 0);
+        if (errno == 0 && end != value && *end == '\0' && parsed > 0u &&
+            parsed <= UINT64_MAX / 1000ull)
+            return (uint64_t)parsed * 1000ull;
+    }
+    return 120000ull * 1000ull;
+}
 
-        for (i = 0; i < STORAGE_TASK_COUNT; ++i) {
-            check_task(&storage_tasks[i]);
-        }
+/* STOP is serviced from the main loop rather than from the UART frame
+ * handler.  This keeps UART input and worker event draining alive while the
+ * independent DMA/NVMe/writer deadlines run in the child processes. */
+static void storage_service_pending_stop(void)
+{
+    StorageTaskTerminal terminal;
+    uint8_t result;
 
-        if (!storage_any_running()) {
-            break;
-        }
-
-        if (waited_ms >= timeout_ms) {
-            LOG_ERROR("STORAGE",
-                      "Timed out waiting for storage workers to finish after stop: task=%s timeout_ms=%u",
-                      task_id ? task_id : "",
-                      (unsigned)timeout_ms);
-            dbg_printf("[DBG][STORAGE] stop wait timeout task=%s timeout_ms=%u\n",
-                       task_id ? task_id : "",
-                       (unsigned)timeout_ms);
+    if (!g_pending_storage_stop.active) return;
+    if (storage_any_live_worker()) {
+        if (!g_pending_storage_stop.forced_reap &&
+            g_pending_storage_stop.deadline_us != 0u &&
+            storage_ipc_monotonic_us() >= g_pending_storage_stop.deadline_us) {
+            LOG_ERROR("STORAGE", "pending STOP deadline expired task=%s; forcing reap",
+                      g_pending_storage_stop.task_id);
+            g_pending_storage_stop.forced_reap = true;
             stop_all_storage_tasks();
-            return ACK_FAILED;
         }
-
-        if (dbg_verbose_enabled() && (waited_ms > 0u) && ((waited_ms % 1000u) == 0u)) {
-            for (i = 0; i < STORAGE_TASK_COUNT; ++i) {
-                if (storage_tasks[i].state == RUNNING) {
-                    dbg_printf("[DBG][STORAGE] stop wait progress task=%s waited_ms=%u name=%s pid=%d output_used=%u last_output=%s\n",
-                               task_id ? task_id : "",
-                               (unsigned)waited_ms,
-                               storage_tasks[i].name,
-                               storage_tasks[i].pid,
-                               (unsigned)storage_tasks[i].output_used,
-                               storage_tasks[i].output);
-                }
-            }
-        }
-
-        usleep(1000);
-        ++waited_ms;
+        return;
     }
 
+    terminal = storage_supervisor_result_status(&g_storage_supervisor);
     storage_supervisor_emit_aggregate();
-    if (!g_storage_supervisor.aggregate_emitted ||
-        storage_supervisor_result_status(&g_storage_supervisor) != STORAGE_TASK_SUCCESS ||
-        !g_storage_commit_state.success) {
-        LOG_ERROR("STORAGE", "One or more storage workers failed after stop: task=%s",
-                  task_id ? task_id : "");
-        dbg_printf("[DBG][STORAGE] stop wait failed task=%s\n", task_id ? task_id : "");
-        return ACK_FAILED;
-    }
-
-    LOG_INFO("STORAGE", "All storage workers finished after stop: task=%s waited_ms=%u",
-             task_id ? task_id : "",
-             (unsigned)waited_ms);
-    dbg_printf("[DBG][STORAGE] stop wait done task=%s waited_ms=%u stop_requested=%d\n",
-               task_id ? task_id : "",
-               (unsigned)waited_ms,
-               stop_requested);
-    return ACK_SUCCESS;
+    result = terminal == STORAGE_TASK_SUCCESS ? ACK_SUCCESS : ACK_FAILED;
+    proto_send_acq_ack(result,
+                       g_pending_storage_stop.acq_type,
+                       result == ACK_SUCCESS ? FAIL_TYPE_NONE : g_pending_storage_stop.failure_type);
+    system_emit_line("serial_cmd_ack cmd=0x21 action=stop task_no=%s ack_status=0x%02X"
+                     " result_code=0x%02X worker_state=%d storage_state=%d reason=%s",
+                     g_pending_storage_stop.task_id,
+                     result,
+                     result,
+                     result == ACK_SUCCESS ? IDLE : ERROR,
+                     storage_state_summary(),
+                     result == ACK_SUCCESS ? "stop_complete" : "storage_worker_failed");
+    memset(&g_pending_storage_stop, 0, sizeof(g_pending_storage_stop));
 }
 
 static int network_output_has_stop_request(const Task *task)
@@ -1411,6 +1467,12 @@ static int storage_commit_db_rollback(void *ctx)
     return file_db_rollback();
 }
 
+static int storage_commit_flash_sync(void *ctx)
+{
+    (void)ctx;
+    return sync_filelist_db_to_flash() == ACK_SUCCESS ? 0 : -1;
+}
+
 static int storage_commit_supervised_results(const char *task_id)
 {
     StorageCommitContext ctx;
@@ -1484,6 +1546,7 @@ static int storage_commit_supervised_results(const char *task_id)
     ops.task_status_update = storage_commit_status_update;
     ops.db_commit = storage_commit_db_commit;
     ops.db_rollback = storage_commit_db_rollback;
+    ops.flash_sync = storage_commit_flash_sync;
     return storage_commit_run_once(&g_storage_commit_state, task_id, items, count, &ops);
 }
 
@@ -1530,6 +1593,22 @@ static int system_env_flag_enabled(const char *name)
     return 1;
 }
 
+static bool system_text_output_enabled(void)
+{
+    const char *legacy = getenv("SRC_REAL_LEGACY_STORAGE_TEXT");
+    const char *level = getenv("SRC_REAL_CONSOLE_LOG_LEVEL");
+    return (legacy && (strcmp(legacy, "1") == 0 || strcmp(legacy, "true") == 0 ||
+                       strcmp(legacy, "yes") == 0 || strcmp(legacy, "on") == 0)) ||
+           (level && (strcmp(level, "debug") == 0 || strcmp(level, "trace") == 0));
+}
+
+static bool system_critical_line(const char *fmt)
+{
+    return fmt && (strstr(fmt, "storage_ddr_full") != NULL ||
+                   strstr(fmt, "storage_start_failed") != NULL ||
+                   strstr(fmt, "storage_capture_complete") != NULL);
+}
+
 static void system_emit_line(const char *fmt, ...)
 {
     char line[1024];
@@ -1537,7 +1616,7 @@ static void system_emit_line(const char *fmt, ...)
     int n;
     size_t len;
 
-    if (!fmt) {
+    if (!fmt || (!system_text_output_enabled() && !system_critical_line(fmt))) {
         return;
     }
     va_start(ap, fmt);
@@ -1979,7 +2058,7 @@ static int start_storage_worker(const PlannedFile *planned, const char *task_id,
     task->planned_file = *planned;
     task->has_planned_file = true;
     memset(task->task_id, 0, sizeof(task->task_id));
-    strncpy(task->task_id, task_id, sizeof(task->task_id) - 1);
+    memcpy(task->task_id, task_id, sizeof(task->task_id) - 1u);
     task->overpass_time = overpass_time;
 
     dbg_verbose_printf("[DBG][STORAGE] worker forked pid=%d task=%s ch=%d idx=%d mode=%s size=%" PRIu64 "\n",
@@ -2001,133 +2080,175 @@ static int start_storage_worker(const PlannedFile *planned, const char *task_id,
     return 0;
 }
 
-static int wait_storage_workers_ready(const PlannedFile *planned, int planned_count, const char *task_id)
+static bool storage_pending_start_target(const Task *task)
 {
-    uint32_t timeout_us = env_u32_or_default("SRC_REAL_STORAGE_PREP_TIMEOUT_US", 5000000u);
-    uint64_t deadline_us = storage_ipc_monotonic_us() + timeout_us;
-
-    if (!planned || planned_count <= 0 || !task_id) {
-        return -1;
-    }
-
-    while (storage_ipc_monotonic_us() < deadline_us) {
-        int ready_count = 0;
-        int i;
-
-        for (i = 0; i < planned_count; ++i) {
-            Task *task = storage_task_for_channel(planned[i].channel_id);
-
-            if (!task || task->state != RUNNING) {
-                dbg_printf("[DBG][STORAGE] ready wait missing worker task=%s ch=%d\n",
-                           task_id, planned[i].channel_id);
-                return -1;
-            }
-
-            check_task(task);
-            if (task->state != RUNNING) {
-                LOG_ERROR("STORAGE",
-                          "Storage worker exited before ready: pid=%d ch=%d output=%s",
-                          task->pid, planned[i].channel_id, task->output);
-                dbg_printf("[DBG][STORAGE] worker exited before ready pid=%d ch=%d output=%s\n",
-                           task->pid, planned[i].channel_id, task->output);
-                return -1;
-            }
-            if (storage_task_is_ready(task)) {
-                ++ready_count;
-                continue;
-            }
-        }
-
-        if (ready_count == planned_count) {
-            for (i = 0; i < planned_count; ++i) {
-                Task *task = storage_task_for_channel(planned[i].channel_id);
-                LOG_INFO("STORAGE",
-                         "Storage worker ready: pid=%d task=%s ch=%d idx=%d",
-                         task ? task->pid : -1,
-                         task_id,
-                         planned[i].channel_id,
-                         planned[i].file_index);
-                dbg_verbose_printf("[DBG][STORAGE] worker ready pid=%d task=%s ch=%d idx=%d waited_us=%u\n",
-                                   task ? task->pid : -1,
-                                   task_id,
-                                   planned[i].channel_id,
-                                   planned[i].file_index,
-                                   (unsigned)(timeout_us - (uint32_t)(deadline_us - storage_ipc_monotonic_us())));
-            }
-            return 0;
-        }
-
-        { struct timespec ts = {0, 1000000L}; (void)clock_nanosleep(CLOCK_MONOTONIC, 0, &ts, NULL); }
-    }
-
-    LOG_ERROR("STORAGE",
-              "Storage workers did not become ready within %u us: task=%s",
-              (unsigned)timeout_us,
-              task_id);
-    dbg_printf("[DBG][STORAGE] workers ready timeout task=%s timeout_us=%u\n",
-               task_id, (unsigned)timeout_us);
-    return -1;
+    return task && task->pid > 0 && task->has_planned_file &&
+           (g_storage_supervisor.target_channel_mask &
+            (1u << task->planned_file.channel_id)) != 0u &&
+           strcmp(task->task_id, g_pending_storage_start.task_id) == 0;
 }
 
-static int start_storage_workers_barrier(const char *task_id)
+static void storage_pending_start_fail(void)
+{
+    if (!g_pending_storage_start.active ||
+        g_pending_storage_start.phase == STORAGE_START_FAILED) return;
+    g_pending_storage_start.phase = STORAGE_START_FAILED;
+    (void)request_storage_stop_all();
+}
+
+static void storage_pending_start_send_failure(void)
+{
+    if (!g_pending_storage_start.active || g_pending_storage_start.failure_ack_sent) return;
+    g_pending_storage_start.failure_ack_sent = true;
+    if (g_pending_storage_start.prepare) {
+        proto_send_ack(CMD_TASK_INFO, ACK_FAILED);
+        (void)task_update_status(g_pending_storage_start.task_id, TASK_FAILED);
+    } else {
+        proto_send_acq_ack(ACK_FAILED, g_pending_storage_start.acq_type,
+                           g_pending_storage_start.failure_type);
+    }
+    system_emit_line("storage_start_failed task=%s phase=%s reason=start_barrier_failed",
+                     g_pending_storage_start.task_id,
+                     g_pending_storage_start.prepare ? "prepare" : "run");
+}
+
+static int storage_begin_prepare_wait(const char *task_id, uint8_t acq_type,
+                                      uint8_t failure_type)
+{
+    uint32_t timeout_us = env_u32_or_default("SRC_REAL_STORAGE_PREP_TIMEOUT_US", 5000000u);
+
+    if (!task_id || task_id[0] == '\0' || g_pending_storage_start.active) return -1;
+    memset(&g_pending_storage_start, 0, sizeof(g_pending_storage_start));
+    g_pending_storage_start.active = true;
+    g_pending_storage_start.prepare = true;
+    g_pending_storage_start.phase = STORAGE_START_PREP_READY;
+    g_pending_storage_start.acq_type = acq_type;
+    g_pending_storage_start.failure_type = failure_type;
+    snprintf(g_pending_storage_start.task_id, sizeof(g_pending_storage_start.task_id), "%s", task_id);
+    g_pending_storage_start.target_count = 0;
+    g_pending_storage_start.deadline_us = storage_ipc_monotonic_us() + timeout_us;
+    for (size_t i = 0u; i < STORAGE_TASK_COUNT; ++i) {
+        if ((g_storage_supervisor.target_channel_mask & (1u << i)) != 0u)
+            ++g_pending_storage_start.target_count;
+    }
+    if (g_pending_storage_start.target_count == 0) storage_pending_start_fail();
+    return 0;
+}
+
+static int storage_begin_run_barrier(const char *task_id, uint8_t acq_type,
+                                     uint8_t failure_type)
 {
     uint64_t start_us = storage_ipc_monotonic_us();
     uint32_t timeout_us = env_u32_or_default("SRC_REAL_STORAGE_START_TIMEOUT_US", 5000000u);
-    uint64_t deadline_us;
     size_t i;
-    int target_count = 0;
 
+    if (!task_id || task_id[0] == '\0' || g_pending_storage_start.active) return -1;
+    memset(&g_pending_storage_start, 0, sizeof(g_pending_storage_start));
+    g_pending_storage_start.active = true;
+    g_pending_storage_start.prepare = false;
+    g_pending_storage_start.phase = STORAGE_START_ARM_WAIT;
+    g_pending_storage_start.acq_type = acq_type;
+    g_pending_storage_start.failure_type = failure_type;
+    snprintf(g_pending_storage_start.task_id, sizeof(g_pending_storage_start.task_id), "%s", task_id);
+    for (i = 0u; i < STORAGE_TASK_COUNT; ++i) {
+        Task *task = &storage_tasks[i];
+        if ((g_storage_supervisor.target_channel_mask & (1u << i)) == 0u) continue;
+        ++g_pending_storage_start.target_count;
+        check_task(task);
+        if (task->state != RUNNING || task->control_fd < 0 ||
+            storage_send_control(task, STORAGE_CTRL_ARM, start_us) != 0) {
+            storage_pending_start_fail();
+            break;
+        }
+    }
+    if (g_pending_storage_start.target_count == 0)
+        storage_pending_start_fail();
+    g_pending_storage_start.deadline_us = storage_ipc_monotonic_us() + timeout_us;
+    return 0;
+}
+
+/* Progress START/prepare one bounded slice.  check_task() drains all worker
+ * pipes, so the UART loop remains responsive while the child-side deadlines
+ * continue to run. */
+static void storage_service_pending_start(void)
+{
+    uint32_t ready = 0u;
+    uint32_t armed = 0u;
+    uint32_t running = 0u;
+    size_t i;
+
+    if (!g_pending_storage_start.active) return;
     for (i = 0u; i < STORAGE_TASK_COUNT; ++i) {
         Task *task = &storage_tasks[i];
         if ((g_storage_supervisor.target_channel_mask & (1u << i)) == 0u ||
-            (task_id && strcmp(task->task_id, task_id) != 0)) continue;
+            strcmp(task->task_id, g_pending_storage_start.task_id) != 0) continue;
         check_task(task);
-        if (task->state != RUNNING || task->control_fd < 0) return -1;
-        if (storage_send_control(task, STORAGE_CTRL_ARM, start_us) != 0) {
-            return -1;
-        }
-        ++target_count;
-    }
-    if (target_count == 0) return -1;
-    deadline_us = storage_ipc_monotonic_us() + timeout_us;
-    while (storage_ipc_monotonic_us() < deadline_us) {
-        int armed = 0;
-        for (i = 0u; i < STORAGE_TASK_COUNT; ++i) {
-            Task *task = &storage_tasks[i];
-            if ((g_storage_supervisor.target_channel_mask & (1u << i)) == 0u ||
-                (task_id && strcmp(task->task_id, task_id) != 0)) continue;
-            check_task(task);
-            if (task->state != RUNNING) return -1;
+        if (storage_pending_start_target(task)) {
+            if (task->fatal_seen && g_pending_storage_start.phase != STORAGE_START_FAILED) {
+                storage_pending_start_fail();
+            }
+            if (task->ready_seen) ++ready;
             if (task->armed_seen) ++armed;
+            if (task->running_seen) ++running;
+        } else if (g_pending_storage_start.phase != STORAGE_START_FAILED) {
+            storage_pending_start_fail();
         }
-        if (armed == target_count) break;
-        { struct timespec ts = {0, 1000000L}; (void)clock_nanosleep(CLOCK_MONOTONIC, 0, &ts, NULL); }
     }
-    if (storage_ipc_monotonic_us() >= deadline_us) return -1;
-    start_us = storage_ipc_monotonic_us();
-    for (i = 0u; i < STORAGE_TASK_COUNT; ++i) {
-        Task *task = &storage_tasks[i];
-        if ((g_storage_supervisor.target_channel_mask & (1u << i)) == 0u ||
-            (task_id && strcmp(task->task_id, task_id) != 0)) continue;
-        check_task(task);
-        if (task->state != RUNNING ||
-            storage_send_control(task, STORAGE_CTRL_RUN, start_us) != 0) return -1;
+    if (g_pending_storage_start.phase != STORAGE_START_FAILED &&
+        storage_ipc_monotonic_us() >= g_pending_storage_start.deadline_us) {
+        storage_pending_start_fail();
     }
-    deadline_us = storage_ipc_monotonic_us() + timeout_us;
-    while (storage_ipc_monotonic_us() < deadline_us) {
-        int started = 0;
+    if (g_pending_storage_start.phase == STORAGE_START_PREP_READY &&
+        ready == (uint32_t)g_pending_storage_start.target_count) {
+        if (task_update_status(g_pending_storage_start.task_id, TASK_RUNNING) != 0) {
+            storage_pending_start_fail();
+        } else {
+            proto_send_ack(CMD_TASK_INFO, ACK_SUCCESS);
+            system_emit_line("serial_cmd_ack cmd=0x11 action=prestart task_no=%s ack_status=0x%02X result_code=0x%02X worker_state=%d storage_state=%d reason=storage_prepared",
+                             g_pending_storage_start.task_id, ACK_SUCCESS, ACK_SUCCESS,
+                             RUNNING, storage_state_summary());
+            memset(&g_pending_storage_start, 0, sizeof(g_pending_storage_start));
+            return;
+        }
+    }
+    if (g_pending_storage_start.phase == STORAGE_START_ARM_WAIT &&
+        armed == (uint32_t)g_pending_storage_start.target_count) {
+        uint64_t run_timestamp = storage_ipc_monotonic_us();
+        bool failed = false;
         for (i = 0u; i < STORAGE_TASK_COUNT; ++i) {
             Task *task = &storage_tasks[i];
-            if ((g_storage_supervisor.target_channel_mask & (1u << i)) == 0u ||
-                (task_id && strcmp(task->task_id, task_id) != 0)) continue;
-            check_task(task);
-            if (task->state != RUNNING) return -1;
-            if (storage_task_is_started(task)) ++started;
+            if ((g_storage_supervisor.target_channel_mask & (1u << i)) == 0u) continue;
+            if (task->state != RUNNING || storage_send_control(task, STORAGE_CTRL_RUN,
+                                                               run_timestamp) != 0) {
+                failed = true;
+                break;
+            }
         }
-        if (started == target_count) return 0;
-        { struct timespec ts = {0, 1000000L}; (void)clock_nanosleep(CLOCK_MONOTONIC, 0, &ts, NULL); }
+        if (failed) {
+            storage_pending_start_fail();
+        } else {
+            g_pending_storage_start.phase = STORAGE_START_RUN_WAIT;
+            g_pending_storage_start.deadline_us = storage_ipc_monotonic_us() +
+                env_u32_or_default("SRC_REAL_STORAGE_START_TIMEOUT_US", 5000000u);
+        }
     }
-    return -1;
+    if (g_pending_storage_start.phase == STORAGE_START_RUN_WAIT &&
+        running == (uint32_t)g_pending_storage_start.target_count) {
+        proto_send_acq_ack(ACK_SUCCESS, g_pending_storage_start.acq_type, FAIL_TYPE_NONE);
+        system_emit_line("serial_cmd_ack cmd=0x21 action=start task_no=%s ack_status=0x%02X result_code=0x%02X worker_state=%d storage_state=%d reason=all_workers_started",
+                         g_pending_storage_start.task_id, ACK_SUCCESS, ACK_SUCCESS,
+                         RUNNING, storage_state_summary());
+        memset(&g_pending_storage_start, 0, sizeof(g_pending_storage_start));
+        return;
+    }
+    if (g_pending_storage_start.phase == STORAGE_START_FAILED) {
+        (void)request_storage_stop_all();
+        if (!storage_any_live_worker()) {
+            storage_pending_start_send_failure();
+            storage_supervisor_emit_aggregate();
+            memset(&g_pending_storage_start, 0, sizeof(g_pending_storage_start));
+        }
+    }
 }
 
 static void finalize_storage_task(Task *task, int exit_code)
@@ -2256,7 +2377,7 @@ static int start_network_worker(const FileRecord *rec)
     transfer_task.echo_line[0] = '\0';
     transfer_task.has_planned_file = false;
     memset(transfer_task.task_id, 0, sizeof(transfer_task.task_id));
-    strncpy(transfer_task.task_id, rec->task_id, sizeof(transfer_task.task_id) - 1);
+    memcpy(transfer_task.task_id, rec->task_id, sizeof(transfer_task.task_id) - 1u);
     transfer_task.overpass_time = rec->overpass_time;
     transfer_task.timeout_seconds = network_task_timeout_seconds();
 
@@ -2305,14 +2426,15 @@ static int record_storage_result_to_db(const ParsedArgs *args, const WriteResult
     strncpy(rec.task_id, args->task_no, sizeof(rec.task_id) - 1);
     rec.overpass_time = overpass;
     rec.file_index = (int)result->file_index;
-    strncpy(rec.file_type, file_type_name_from_proto(args->proto_file_type), sizeof(rec.file_type) - 1);
+    snprintf(rec.file_type, sizeof(rec.file_type), "%s",
+             file_type_name_from_proto(args->proto_file_type));
     rec.channel_id = result->channel_id;
     rec.proto_file_type_code = (int)args->proto_file_type;
     rec.calibration_type = args->has_calibration_type ? (int)args->calibration_type : 0;
     rec.start_sector = result->start_lba;
     rec.sector_count = result->sector_count;
     rec.file_size = result->size_bytes;
-    strncpy(rec.filename, filename, sizeof(rec.filename) - 1);
+    snprintf(rec.filename, sizeof(rec.filename), "%s", filename);
 
     if (file_db_begin() != 0) {
         return -1;
@@ -3395,11 +3517,11 @@ static uint8_t start_storage_for_last_task(uint8_t *failure_type)
         dbg_printf("[DBG][CAPTURE] prepare rejected: no valid 0x11\n");
         return ACK_INVALID_PARAM;
     }
-    if (storage_any_running()) {
+    if (storage_any_running() || storage_any_live_worker() || g_pending_storage_stop.active) {
         if (failure_type) {
             *failure_type = failure_type_from_acq_type(acq_type);
         }
-        LOG_WARN("CAPTURE", "Storage prepare rejected: worker already running");
+        LOG_WARN("CAPTURE", "Storage prepare rejected: worker still live");
         return ACK_RETRYING;
     }
     for (i = 0; i < (int)STORAGE_TASK_COUNT; ++i) {
@@ -3418,7 +3540,13 @@ static uint8_t start_storage_for_last_task(uint8_t *failure_type)
         (void)task_update_status(g_last_task.task_id, TASK_FAILED);
         return ACK_INVALID_PARAM;
     }
-    { uint32_t mask = 0u; for (i = 0; i < planned_count; ++i) mask |= 1u << planned[i].channel_id; storage_supervisor_init(&g_storage_supervisor, mask); storage_commit_state_reset(&g_storage_commit_state); }
+    { uint32_t mask = 0u; char count_text[16];
+      for (i = 0; i < planned_count; ++i) mask |= 1u << planned[i].channel_id;
+      storage_supervisor_init(&g_storage_supervisor, mask);
+      storage_commit_state_reset(&g_storage_commit_state);
+      (void)snprintf(count_text, sizeof(count_text), "%d", planned_count);
+      (void)setenv("SRC_REAL_SUPERVISED_CHANNEL_COUNT", count_text, 1);
+    }
     for (i = 0; i < planned_count; ++i) {
         if (!find_channel(planned[i].channel_id)) {
             if (failure_type) {
@@ -3455,36 +3583,40 @@ static uint8_t start_storage_for_last_task(uint8_t *failure_type)
         dbg_printf("[DBG][CAPTURE] launch storage task=%s ch=%d idx=%d size=%" PRIu64 "\n",
                    g_last_task.task_id, planned[i].channel_id, planned[i].file_index, planned[i].size_bytes);
         if (start_storage_worker(&planned[i], g_last_task.task_id, g_last_task.overpass_time) != 0) {
+            int missing;
             if (failure_type) {
                 *failure_type = failure_type_from_acq_type(acq_type);
             }
-            {
-                int stopped = request_storage_stop_all();
-                (void)wait_storage_workers_finished_after_stop(g_last_task.task_id, stopped);
-            }
-            (void)task_update_status(g_last_task.task_id, TASK_FAILED);
             dbg_printf("[DBG][CAPTURE] start_storage_worker failed task=%s ch=%d\n",
                        g_last_task.task_id, planned[i].channel_id);
+            for (missing = i; missing < planned_count; ++missing) {
+                storage_supervisor_mark_unavailable(&g_storage_supervisor,
+                                                    (uint32_t)planned[missing].channel_id,
+                                                    "fork_exec_failed");
+            }
+            if (storage_begin_prepare_wait(g_last_task.task_id, acq_type,
+                                           failure_type ? *failure_type : FAIL_TYPE_NONE) == 0) {
+                storage_pending_start_fail();
+                return STORAGE_START_PENDING;
+            }
+            (void)request_storage_stop_all();
+            (void)task_update_status(g_last_task.task_id, TASK_FAILED);
             return ACK_FAILED;
         }
     }
-    if (wait_storage_workers_ready(planned, planned_count, g_last_task.task_id) != 0) {
-        if (failure_type) {
-            *failure_type = failure_type_from_acq_type(acq_type);
-        }
-        {
-            int stopped = request_storage_stop_all();
-            (void)wait_storage_workers_finished_after_stop(g_last_task.task_id, stopped);
-        }
+    /* Preparation is acknowledged only after the main-loop state machine has
+     * observed READY from every child.  Do not sleep here: UART input and
+     * worker event pipes must continue to be serviced while children wait on
+     * their ARM/RUN gates. */
+    if (storage_begin_prepare_wait(g_last_task.task_id, acq_type,
+                                   failure_type ? *failure_type : FAIL_TYPE_NONE) != 0) {
+        (void)request_storage_stop_all();
         (void)task_update_status(g_last_task.task_id, TASK_FAILED);
-        dbg_printf("[DBG][CAPTURE] storage ready wait failed task=%s count=%d\n",
-                   g_last_task.task_id, planned_count);
         return ACK_FAILED;
     }
-    dbg_printf("[DBG][CAPTURE] all storage workers ready task=%s count=%d\n",
+    dbg_printf("[DBG][CAPTURE] storage workers launched; waiting asynchronously for READY task=%s count=%d\n",
                g_last_task.task_id, planned_count);
-    (void)task_update_status(g_last_task.task_id, TASK_RUNNING);
-    return ACK_SUCCESS;
+    return STORAGE_START_PENDING;
 }
 
 static uint8_t clamp_u8_int(int value)
@@ -3877,7 +4009,9 @@ void handle_frame(uint8_t *f)
                              RUNNING, storage_state_summary());
             break;
         }
-        if (storage_any_running() || transfer_task.state == RUNNING) {
+        if (storage_any_running() || storage_any_live_worker() ||
+            g_pending_storage_start.active || g_pending_storage_stop.active ||
+            transfer_task.state == RUNNING) {
             LOG_WARN("SYSTEM", "Reject 0x11 while worker is running: storage_state=%d transfer_state=%d",
                      storage_state_summary(),
                      transfer_task.state);
@@ -3900,7 +4034,7 @@ void handle_frame(uint8_t *f)
 
             g_last_task.valid = true;
             memset(g_last_task.task_id, 0, sizeof(g_last_task.task_id));
-            strncpy(g_last_task.task_id, task_id, sizeof(g_last_task.task_id) - 1);
+            snprintf(g_last_task.task_id, sizeof(g_last_task.task_id), "%s", task_id);
             g_last_task.overpass_time = overpass_timestamp;
             g_last_task.task_file_mode = task_cmd->task_file_mode;
             g_last_task.usb_transfer_enable = task_cmd->usb_transfer_enable;
@@ -3918,12 +4052,17 @@ void handle_frame(uint8_t *f)
                 system_emit_line("serial_cmd_ack cmd=0x%02X action=prestart task_no=%s ack_status=0x%02X result_code=0x%02X worker_state=%d storage_state=%d reason=storage_prepared",
                                  cmd, task_id, ACK_SUCCESS, ACK_SUCCESS,
                                  RUNNING, storage_state_summary());
+            } else if (prep_result == STORAGE_START_PENDING) {
+                dbg_printf("[DBG][PROTO] 0x11 accepted; PREP ACK deferred until all workers READY task=%s\n",
+                           task_id);
             } else {
                 LOG_ERROR("SYSTEM",
                           "TASK CONFIG OK but storage prepare failed: task=%s file_mode=0x%02X result=0x%02X failure=0x%02X",
                           task_id, task_cmd->task_file_mode, prep_result, prep_failure_type);
                 dbg_printf("[DBG][PROTO] 0x11 ACK fail task=%s prep_result=0x%02X failure=0x%02X\n",
                            task_id, prep_result, prep_failure_type);
+                system_emit_line("storage_start_failed task=%s phase=prepare reason=storage_prepare_failed"
+                                 " result_code=0x%02X", task_id, prep_result);
                 proto_send_ack(cmd, prep_result);
                 system_emit_line("serial_cmd_ack cmd=0x%02X action=prestart task_no=%s ack_status=0x%02X result_code=0x%02X worker_state=%d storage_state=%d reason=storage_prepare_failed",
                                  cmd, task_id, prep_result, prep_result,
@@ -3962,13 +4101,29 @@ void handle_frame(uint8_t *f)
                          storage_state);
 
         if (acq_cmd->switch_flag == SWITCH_ON) {
+            if (g_pending_storage_start.active || g_pending_storage_stop.active) {
+                /* Do not consume a second START while PREP/START is being
+                 * progressed by the main loop. */
+                proto_send_acq_ack(ACK_RETRYING, acq_type,
+                                   FAIL_TYPE_LOW | FAIL_TYPE_HIGH_I | FAIL_TYPE_HIGH_Q);
+                system_emit_line("serial_cmd_ack cmd=0x%02X action=start task_no=%s ack_status=0x%02X result_code=0x%02X worker_state=%d storage_state=%d reason=busy",
+                                 cmd, g_last_task.valid ? g_last_task.task_id : "",
+                                 ACK_RETRYING, ACK_RETRYING, RUNNING, storage_state_summary());
+                return;
+            }
             if (!g_last_task.valid ||
-                start_storage_workers_barrier(g_last_task.task_id) != 0) {
+                storage_begin_run_barrier(g_last_task.task_id, acq_type,
+                                          FAIL_TYPE_LOW | FAIL_TYPE_HIGH_I |
+                                          FAIL_TYPE_HIGH_Q) != 0) {
                 result = ACK_FAILED;
                 failure_type = FAIL_TYPE_LOW | FAIL_TYPE_HIGH_I | FAIL_TYPE_HIGH_Q;
                 (void)request_storage_stop_all();
+                system_emit_line("storage_start_failed task=%s phase=run_barrier reason=start_barrier_failed",
+                                 g_last_task.valid ? g_last_task.task_id : "");
             } else {
-                result = ACK_SUCCESS;
+                /* The RUN ACK is emitted by storage_service_pending_start once
+                 * every worker has reported STRUCTURED RUNNING. */
+                return;
             }
             proto_send_acq_ack(result, acq_type, failure_type);
             system_emit_line("serial_cmd_ack cmd=0x%02X action=start task_no=%s ack_status=0x%02X result_code=0x%02X worker_state=%d storage_state=%d reason=%s",
@@ -3991,10 +4146,22 @@ void handle_frame(uint8_t *f)
                 dbg_printf("[DBG][PROTO] 0x21 stop rejected result=0x%02X\n", result);
                 system_emit_line("serial_cmd_result cmd=stop task=%s status=failed storage_done=0 data_persisted=0 integrity_ok=0 reason=no_valid_task",
                                  g_last_task.valid ? g_last_task.task_id : "");
+            } else if (g_pending_storage_stop.active) {
+                /* STOP is idempotent while the first stop is draining.  The
+                 * original ACK is emitted by storage_service_pending_stop. */
+                LOG_INFO("CAPTURE", "Duplicate STOP ignored while task=%s is draining",
+                         g_pending_storage_stop.task_id);
+                break;
             } else {
+                if (g_pending_storage_start.active) {
+                    /* A manual STOP supersedes a still-pending PREP/START
+                     * barrier; its deferred 0x11 failure ACK is completed by
+                     * the same bounded worker reap. */
+                    storage_pending_start_fail();
+                }
                 int stopped = request_storage_stop_all();
                 LOG_INFO("CAPTURE",
-                         "Stop capture command accepted, waiting for DB update: task=%s storage_state=%d stop_requested=%d",
+                         "Stop capture command accepted: task=%s storage_state=%d stop_requested=%d",
                          g_last_task.task_id,
                          storage_state,
                          stopped);
@@ -4002,19 +4169,18 @@ void handle_frame(uint8_t *f)
                            g_last_task.task_id,
                            storage_state,
                            stopped);
-                result = wait_storage_workers_finished_after_stop(g_last_task.task_id, stopped);
-                dbg_printf("[DBG][PROTO] 0x21 stop ACK result=0x%02X storage_state=%d stop_requested=%d\n",
-                           result,
-                           storage_state_summary(),
-                           stopped);
-                system_emit_line("serial_cmd_result cmd=stop task=%s status=%s storage_done=%u result_code=0x%02X storage_state=%d stop_requested=%d reason=%s",
-                                 g_last_task.task_id,
-                                 result == ACK_SUCCESS ? "success" : "failed",
-                                 result == ACK_SUCCESS ? 1u : 0u,
-                                 result,
-                                 storage_state_summary(),
-                                 stopped,
-                                 result == ACK_SUCCESS ? "drain_complete" : "storage_worker_failed");
+                memset(&g_pending_storage_stop, 0, sizeof(g_pending_storage_stop));
+                g_pending_storage_stop.active = true;
+                snprintf(g_pending_storage_stop.task_id,
+                         sizeof(g_pending_storage_stop.task_id), "%s", g_last_task.task_id);
+                g_pending_storage_stop.acq_type = acq_type;
+                g_pending_storage_stop.failure_type = failure_type;
+                g_pending_storage_stop.requested_workers = stopped;
+                g_pending_storage_stop.deadline_us = storage_ipc_monotonic_us() +
+                    storage_parent_stop_timeout_us();
+                /* The binary STOP ACK is deferred until all worker terminals
+                 * are observed.  No text ACK is emitted here. */
+                return;
             }
             proto_send_acq_ack(result, acq_type, failure_type);
             system_emit_line("serial_cmd_ack cmd=0x%02X action=stop task_no=%s ack_status=0x%02X result_code=0x%02X worker_state=%d storage_state=%d reason=%s",
@@ -4187,13 +4353,29 @@ static void install_storage_worker_signal_handlers(void)
     (void)sigaction(SIGINT, &sa, NULL);
 }
 
-static int run_storage_worker_main(int argc, char **argv)
+static int storage_worker_event_fd(void)
+{
+    const char *text = getenv("SRC_REAL_STORAGE_EVENT_FD");
+    char *end = NULL;
+    long value;
+
+    if (!text || text[0] == '\0') return -1;
+    errno = 0;
+    value = strtol(text, &end, 10);
+    if (errno != 0 || end == text || *end != '\0' || value < 0 || value > INT_MAX)
+        return -1;
+    return (int)value;
+}
+
+static int run_storage_worker_main(int argc, char **argv, bool supervised)
 {
     GlobalOptions gopt;
     ParsedArgs args;
     CommandType cmd;
     int rc;
     bool final_sent = false;
+    bool event_channel_present = false;
+    bool fatal_delivery_ok = true;
     WriteResult result;
 
     memset(&result, 0, sizeof(result));
@@ -4237,29 +4419,52 @@ static int run_storage_worker_main(int argc, char **argv)
                args.task_no,
                (unsigned)args.file_index,
                gopt.dry_run ? 1u : 0u);
-    rc = execute_write_with_result_mode(&args, gopt, &result, STORAGE_WRITE_SUPERVISED);
+    rc = execute_write_with_result_mode(&args, gopt, &result,
+                                        supervised ? STORAGE_WRITE_SUPERVISED
+                                                   : STORAGE_WRITE_STANDALONE);
     {
         StorageWorkerEvent event;
-        const char *fd_text = getenv("SRC_REAL_STORAGE_EVENT_FD");
-        int event_fd = fd_text ? atoi(fd_text) : -1;
-        if (event_fd >= 0) {
-            if (rc != 0) {
-                storage_ipc_make_event(&event, STORAGE_WORKER_FATAL, (uint32_t)args.channel_id,
-                                       rc, result.dma_received_bytes,
-                                       result.integrity_risk[0] ? result.integrity_risk : "worker_failed");
-                (void)storage_ipc_write_event_deadline(event_fd, &event,
-                                                       storage_ipc_monotonic_us() + 1000000ull);
-            } else {
+        int event_fd = storage_worker_event_fd();
+        if (supervised && event_fd >= 0) {
+            event_channel_present = true;
+            if (rc == 0) {
                 storage_ipc_make_event(&event, STORAGE_WORKER_DRAINED, (uint32_t)args.channel_id,
                                        0, result.dma_received_bytes, "drained");
-                (void)storage_ipc_write_event_deadline(event_fd, &event,
-                                                       storage_ipc_monotonic_us() + 1000000ull);
+                if (storage_ipc_write_event_deadline(
+                        event_fd, &event,
+                        storage_ipc_monotonic_us() + 1000000ull) != 0) {
+                    rc = -1;
+                    (void)snprintf(result.integrity_risk, sizeof(result.integrity_risk),
+                                   "%s", "drained_event_send_failed");
+                    result.integrity_ok = false;
+                }
             }
-            storage_ipc_make_event(&event, STORAGE_WORKER_FINAL_RESULT, (uint32_t)args.channel_id,
-                                   rc, result.dma_received_bytes, rc == 0 ? "final" : "failed");
-            event.result = result;
-            final_sent = storage_ipc_write_event_deadline(event_fd, &event,
-                                                           storage_ipc_monotonic_us() + 1000000ull) == 0;
+            if (rc != 0) {
+                if (!storage_write_fatal_event_sent()) {
+                    storage_ipc_make_event(&event, STORAGE_WORKER_FATAL, (uint32_t)args.channel_id,
+                                           rc, result.dma_received_bytes,
+                                           result.integrity_risk[0] ? result.integrity_risk : "worker_failed");
+                    fatal_delivery_ok = storage_ipc_write_event_deadline(
+                        event_fd, &event,
+                        storage_ipc_monotonic_us() + 1000000ull) == 0;
+                } else {
+                    fatal_delivery_ok = true;
+                }
+            }
+            /* A failed FINAL is meaningful only after a delivered FATAL.  If
+             * the critical FATAL pipe write itself failed, leave the pipe
+             * without FINAL and exit non-zero; the supervisor will classify
+             * the EOF explicitly instead of accepting an uncaused failure. */
+            if (rc == 0 || fatal_delivery_ok) {
+                storage_ipc_make_event(&event, STORAGE_WORKER_FINAL_RESULT,
+                                       (uint32_t)args.channel_id, rc,
+                                       result.dma_received_bytes,
+                                       rc == 0 ? "final" : "failed");
+                event.result = result;
+                final_sent = storage_ipc_write_event_deadline(
+                    event_fd, &event,
+                    storage_ipc_monotonic_us() + 1000000ull) == 0;
+            }
         }
     }
     if (final_sent) storage_write_flush_deferred_diag();
@@ -4282,7 +4487,10 @@ static int run_storage_worker_main(int argc, char **argv)
                (unsigned)result.file_index,
                result.data_persisted ? 1u : 0u);
     logger_close();
-    return (rc == 0) ? 0 : 1;
+    /* Standalone storage-write has no supervisor event pipe and retains its
+     * local commit/return contract.  A supervised worker, however, must not
+     * report success when its structured FINAL could not be delivered. */
+    return (rc == 0 && (!supervised || (event_channel_present && final_sent))) ? 0 : 1;
 }
 
 static void handle_network_worker_signal(int signo)
@@ -4527,11 +4735,11 @@ int main(int argc, char **argv)
 
     if (argc > 1 && strcmp(argv[1], STORAGE_WORKER_ARG) == 0) {
         dbg_verbose_printf("[DBG][MAIN] entering storage worker mode\n");
-        return run_storage_worker_main(argc - 1, argv + 1);
+        return run_storage_worker_main(argc - 1, argv + 1, true);
     }
     if (argc > 1 && strcmp(argv[1], STORAGE_WRITE_ARG) == 0) {
         dbg_printf("[DBG][MAIN] entering standalone storage-write mode\n");
-        return run_storage_worker_main(argc, argv);
+        return run_storage_worker_main(argc, argv, false);
     }
     if (argc > 1 && strcmp(argv[1], DDR_PATTERN_STORE_ARG) == 0) {
         dbg_printf("[DBG][MAIN] entering ddr-pattern-store mode\n");
@@ -4620,11 +4828,13 @@ int main(int argc, char **argv)
     dbg_printf("[DBG][MAIN] protocol ready, waiting on uart1\n");
 
     while (1) {
-        int bytes_read = read(serial_fd, &byte, 1);
-        if (bytes_read > 0) {
-            proto_input(byte);
-        } else {
-            usleep(200);
+        struct pollfd serial_poll = { .fd = serial_fd, .events = POLLIN, .revents = 0 };
+        int poll_rc = poll(&serial_poll, 1u, 1);
+        if (poll_rc > 0 && (serial_poll.revents & POLLIN) != 0) {
+            int bytes_read = read(serial_fd, &byte, 1);
+            if (bytes_read > 0) proto_input(byte);
+        } else if (poll_rc < 0 && errno != EINTR) {
+            dbg_printf("[DBG][MAIN] UART poll failed errno=%d\n", errno);
         }
         {
             size_t i;
@@ -4632,6 +4842,8 @@ int main(int argc, char **argv)
                 check_task(&storage_tasks[i]);
             }
         }
+        storage_service_pending_start();
+        storage_service_pending_stop();
         check_task(&transfer_task);
     }
 

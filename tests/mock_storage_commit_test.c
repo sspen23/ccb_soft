@@ -8,8 +8,9 @@
 typedef struct {
     int begin_calls, duplicate_calls, metadata_calls, metadata_rollback_calls;
     int insert_calls, count_calls, total_calls, status_calls, commit_calls, rollback_calls;
+    int flash_calls;
     int fail_metadata_call, fail_insert_call;
-    int fail_commit, fail_metadata_rollback, duplicate, fail_completed_status;
+    int fail_commit, fail_flash, fail_metadata_rollback, duplicate, fail_completed_status;
     int inserted, base_count;
     TaskStatus last_status;
 } Mock;
@@ -31,6 +32,7 @@ static int status(void *p, const char *task, TaskStatus value)
 { Mock *m = p; (void)task; m->status_calls++; m->last_status = value; return value == TASK_COMPLETED && m->fail_completed_status ? -1 : 0; }
 static int commit(void *p) { Mock *m = p; m->commit_calls++; return m->fail_commit ? -1 : 0; }
 static int rollback(void *p) { Mock *m = p; m->rollback_calls++; m->inserted = 0; return 0; }
+static int flash(void *p) { Mock *m = p; m->flash_calls++; return m->fail_flash ? -1 : 0; }
 
 static StorageCommitOps ops(Mock *m)
 {
@@ -40,7 +42,7 @@ static StorageCommitOps ops(Mock *m)
     value.metadata_write = metadata_write_mock; value.metadata_rollback = metadata_rollback_mock;
     value.record_insert = insert; value.record_count = count;
     value.task_total_update = total; value.task_status_update = status;
-    value.db_commit = commit; value.db_rollback = rollback;
+    value.db_commit = commit; value.db_rollback = rollback; value.flash_sync = flash;
     return value;
 }
 
@@ -70,6 +72,7 @@ static void test_all_success_and_once(void)
     assert(storage_commit_run_once(&state, "task1", items, NUM_CHANNELS, &value) == 0);
     assert(state.success && strcmp(state.reason, "none") == 0);
     assert(m.metadata_calls == 3 && m.insert_calls == 3 && m.commit_calls == 1);
+    assert(m.flash_calls == 1);
     assert(m.last_status == TASK_COMPLETED);
     assert(storage_commit_run_once(&state, "task1", items, NUM_CHANNELS, &value) == 0);
     assert(m.commit_calls == 1);
@@ -102,6 +105,11 @@ static void test_failures(void)
     memset(&m, 0, sizeof(m)); m.fail_completed_status = 1;
     assert(run(&m, &state, items) != 0); assert(strcmp(state.reason, "task_completed_update_failed") == 0);
     assert(m.last_status == TASK_FAILED && m.status_calls == 2);
+
+    memset(&m, 0, sizeof(m)); m.fail_flash = 1;
+    assert(run(&m, &state, items) != 0); assert(strcmp(state.reason, "flash_sync_failed") == 0);
+    assert(m.commit_calls == 1 && m.rollback_calls == 0 && m.metadata_rollback_calls == 0);
+    assert(m.last_status == TASK_FAILED);
 }
 
 static void test_modes(void)

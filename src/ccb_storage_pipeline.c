@@ -93,11 +93,18 @@ static uint32_t *storage_count_for_state(StorageSlotCounts *c, StorageSlotState 
 int storage_pipeline_counts_valid(const StoragePipeline *p)
 {
     const StorageSlotCounts *c;
+    uint64_t sum;
     if (!p) return 0;
     c = &p->counts;
-    return c->total == p->capacity &&
-           c->total == c->dma_writable + c->completed_unharvested + c->ready +
-                       c->nvme_busy + c->requeue_pending + c->free_count;
+    sum = (uint64_t)c->dma_writable + c->completed_unharvested + c->ready +
+          c->nvme_busy + c->requeue_pending + c->free_count;
+    return p->count <= p->capacity &&
+           c->dma_writable <= c->total &&
+           c->completed_unharvested <= c->total &&
+           c->ready <= c->total && c->nvme_busy <= c->total &&
+           c->requeue_pending <= c->total && c->free_count <= c->total &&
+           c->total == p->capacity &&
+           (uint64_t)c->total == sum;
 }
 
 uint32_t storage_harvest_limit_for_remaining(uint64_t remaining_bytes,
@@ -106,7 +113,8 @@ uint32_t storage_harvest_limit_for_remaining(uint64_t remaining_bytes,
 {
     uint64_t needed;
     if (remaining_bytes == 0u || dma_desc_bytes == 0u || max_batch == 0u) return 0u;
-    needed = (remaining_bytes + dma_desc_bytes - 1u) / dma_desc_bytes;
+    needed = remaining_bytes / dma_desc_bytes;
+    if ((remaining_bytes % dma_desc_bytes) != 0u) ++needed;
     return needed < max_batch ? (uint32_t)needed : max_batch;
 }
 
@@ -168,7 +176,7 @@ int storage_queue_push_batch(StoragePipeline *p, const StoragePipelineItem *item
     uint32_t i, j, tail;
     if (!p || !items || item_count == 0u) return -1;
     pthread_mutex_lock(&p->lock);
-    if (p->error || !storage_pipeline_counts_valid(p) ||
+    if (p->error || p->count > p->capacity || !storage_pipeline_counts_valid(p) ||
         item_count > p->capacity - p->count || item_count > p->counts.completed_unharvested) goto bad;
     for (i = 0u; i < item_count; ++i) {
         uint64_t expected_sectors;
@@ -176,7 +184,8 @@ int storage_queue_push_batch(StoragePipeline *p, const StoragePipelineItem *item
             items[i].slot >= p->capacity ||
             p->states[items[i].slot] != STORAGE_SLOT_DMA_COMPLETED_UNHARVESTED)
             goto bad;
-        expected_sectors = (items[i].bytes + 511u) / 512u;
+        expected_sectors = items[i].bytes / 512u;
+        if ((items[i].bytes % 512u) != 0u) ++expected_sectors;
         if (items[i].sectors != expected_sectors) goto bad;
         for (j = 0u; j < i; ++j) if (items[j].slot == items[i].slot) goto bad;
     }

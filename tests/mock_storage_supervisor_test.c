@@ -76,6 +76,23 @@ static void test_worker_exit_without_final(void)
     assert(storage_supervisor_result_status(&s) == STORAGE_TASK_FAILED);
 }
 
+static void test_unavailable_worker_aggregates(void)
+{
+    StorageTaskSupervisor s;
+    StorageWorkerEvent value;
+
+    storage_supervisor_init(&s, 7u);
+    storage_supervisor_mark_unavailable(&s, 1u, "fork_exec_failed");
+    assert((s.unavailable_mask & (1u << 1u)) != 0u);
+    assert_reason(&s, "fork_exec_failed");
+    value = event(STORAGE_WORKER_FINAL_RESULT, 0u);
+    assert(handle_final(&s, &value) == 0);
+    value = event(STORAGE_WORKER_FINAL_RESULT, 2u);
+    assert(handle_final(&s, &value) == 0);
+    assert(s.aggregate_ready);
+    assert(storage_supervisor_result_status(&s) == STORAGE_TASK_FAILED);
+}
+
 static void test_stop_send_state(void)
 {
     StorageTaskSupervisor s;
@@ -114,6 +131,16 @@ static void test_invalid_sequences(void)
     assert(storage_supervisor_handle_event(&s, &value) == 0);
     assert(storage_supervisor_handle_event(&s, &value) != 0);
     assert_reason(&s, "invalid_ready_sequence");
+
+    storage_supervisor_init(&s, 1u);
+    value = event(STORAGE_WORKER_FATAL, 0u);
+    snprintf(value.reason, sizeof(value.reason), "%s", "primary_reason");
+    assert(storage_supervisor_handle_event(&s, &value) == 0);
+    value = event(STORAGE_WORKER_FATAL, 0u);
+    snprintf(value.reason, sizeof(value.reason), "%s", "secondary_reason");
+    assert(storage_supervisor_handle_event(&s, &value) != 0);
+    assert_reason(&s, "primary_reason");
+    assert(strcmp(s.secondary_reason, "invalid_fatal_sequence") == 0);
 
     storage_supervisor_init(&s, 1u);
     value = event(STORAGE_WORKER_ARMED, 0u);
@@ -262,9 +289,26 @@ static void test_one_channel_failure_rejects_aggregate(void)
     assert_reason(&s, "storage_integrity_failed");
 }
 
+static void test_payload_media_accounting(void)
+{
+    StorageTaskSupervisor s;
+    StorageWorkerEvent value;
+
+    storage_supervisor_init(&s, 1u);
+    value = event(STORAGE_WORKER_FINAL_RESULT, 0u);
+    value.result.dma_received_bytes = 419692512u;
+    value.result.nvme_completed_bytes = 419692512u;
+    value.result.nvme_media_bytes = 419692544u;
+    value.result.nvme_padding_bytes = 32u;
+    value.result.file_bytes = 419692512u;
+    assert(handle_final(&s, &value) == 0);
+    assert(storage_supervisor_result_status(&s) == STORAGE_TASK_SUCCESS);
+}
+
 int main(void)
 {
     test_worker_exit_without_final();
+    test_unavailable_worker_aggregates();
     test_stop_send_state();
     test_invalid_sequences();
     test_event_pipe_ownership();
@@ -272,6 +316,7 @@ int main(void)
     test_diag_after_final_is_best_effort();
     test_result_failure_reasons();
     test_one_channel_failure_rejects_aggregate();
+    test_payload_media_accounting();
     puts("mock_storage_supervisor_test: ok");
     return 0;
 }

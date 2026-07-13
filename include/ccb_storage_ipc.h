@@ -7,7 +7,7 @@
 #include <stdatomic.h>
 
 #define STORAGE_IPC_MAGIC 0x53544732u
-#define STORAGE_IPC_VERSION 1u
+#define STORAGE_IPC_VERSION 2u
 
 typedef enum {
     STORAGE_CTRL_ARM = 1,
@@ -79,6 +79,8 @@ void storage_ipc_make_event(StorageWorkerEvent *event, StorageWorkerEventType ty
                             uint32_t channel, int32_t error_code,
                             uint64_t received_bytes, const char *reason);
 int storage_ipc_write_control(int fd, const StorageControlMessage *msg);
+int storage_ipc_write_control_deadline(int fd, const StorageControlMessage *msg,
+                                       uint64_t deadline_us);
 int storage_ipc_read_control(int fd, StorageControlMessage *msg);
 int storage_ipc_write_event(int fd, const StorageWorkerEvent *event);
 int storage_ipc_try_write_perf(int fd, const StorageWorkerEvent *event,

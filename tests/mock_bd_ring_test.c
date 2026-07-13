@@ -31,6 +31,7 @@ static void init_runtime(ChannelRuntime *rt,
     rt->dma_desc_count = 4u;
     rt->dma_desc_bytes = 4096u;
     rt->dma_hw_desc_count = 4u;
+    rt->dma_requeue_enabled = true;
     dma_regs[TEST_S2MM_DMACR / 4u] = 1u;
     dma_regs[TEST_S2MM_CURDESC / 4u] = (uint32_t)cfg->desc_dma_base;
     dma_regs[TEST_S2MM_TAILDESC / 4u] =
@@ -117,6 +118,42 @@ int main(void)
     desc[0].status = TEST_DESC_CMPLT | 512u;
     dma_regs[TEST_S2MM_DMASR / 4u] = 1u;
     assert(dma_requeue_one(&rt, 0u) != 0);
+
+    init_runtime(&rt, &cfg, desc, dma_regs);
+    dma_latch_stop(&rt);
+    assert(dma_requeue_one(&rt, 0u) == -2);
+    assert(dma_requeue_after_stop_count(&rt) == 1u);
+
+    /* A non-halted DMA with an unharvested completion is not eligible for
+     * reset recovery: the reset could discard valid DDR data. */
+    init_runtime(&rt, &cfg, desc, dma_regs);
+    dma_latch_stop(&rt);
+    desc[0].status = TEST_DESC_CMPLT | 512u;
+    dma_regs[TEST_S2MM_DMASR / 4u] = 0u;
+    memset(state, STORAGE_SLOT_DMA_WRITABLE, sizeof(state));
+    memset(&stop_report, 0, sizeof(stop_report));
+    assert(dma_quiesce_s2mm_with_state(&rt, 1u, state, &stop_report) == DMA_STOP_FAILED);
+    assert(strcmp(stop_report.reason, "completed_unharvested") == 0);
+
+    /* A halted path must apply the same ownership audit before the final
+     * reset; it must not discard a completion that the producer did not
+     * harvest merely because quiesce itself reached HALTED. */
+    init_runtime(&rt, &cfg, desc, dma_regs);
+    dma_latch_stop(&rt);
+    desc[0].status = TEST_DESC_CMPLT | 512u;
+    memset(state, STORAGE_SLOT_DMA_WRITABLE, sizeof(state));
+    memset(&stop_report, 0, sizeof(stop_report));
+    assert(dma_finalize_stop_s2mm_with_state(&rt, state, &stop_report) == DMA_STOP_FAILED);
+    assert(strcmp(stop_report.reason, "completed_unharvested") == 0);
+
+    /* An open AXIS packet is likewise a conservative hard failure. */
+    init_runtime(&rt, &cfg, desc, dma_regs);
+    dma_latch_stop(&rt);
+    rt.dma_rx_packet_open = true;
+    dma_regs[TEST_S2MM_DMASR / 4u] = 0u;
+    memset(&stop_report, 0, sizeof(stop_report));
+    assert(dma_quiesce_s2mm_with_state(&rt, 1u, state, &stop_report) == DMA_STOP_FAILED);
+    assert(strcmp(stop_report.reason, "tail_descriptor_incomplete") == 0);
 
     puts("mock_bd_ring_test: ok");
     return 0;

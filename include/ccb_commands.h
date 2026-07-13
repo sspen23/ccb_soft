@@ -16,7 +16,12 @@ typedef struct {
     bool integrity_ok;
     bool dma_stop_recovered;
     uint64_t dma_received_bytes;
+    /* Payload bytes are the valid data bytes.  Media bytes include sector
+     * padding and are kept separate so integrity checks never compare a
+     * padded write with the received payload. */
     uint64_t nvme_completed_bytes;
+    uint64_t nvme_media_bytes;
+    uint64_t nvme_padding_bytes;
     uint64_t file_bytes;
     uint64_t expected_bytes;
     bool expected_available;
@@ -29,6 +34,7 @@ typedef struct {
     uint64_t writer_schedule_gap_max_us;
     uint64_t submit_stall_max_us;
     char integrity_risk[64];
+    char secondary_reason[64];
     char task_no[12];
 } WriteResult;
 
@@ -54,6 +60,8 @@ int execute_dma_rx_benchmark(const ParsedArgs *args, GlobalOptions gopt);
 void storage_write_reset_stop(void);
 void storage_write_request_stop(void);
 void storage_write_flush_deferred_diag(void);
+bool storage_write_fatal_event_sent(void);
+bool storage_cross_slot_enabled_for_channel(int channel_id);
 uint32_t storage_cross_slot_active_slots_for_channel(int channel_id);
 uint32_t storage_cross_slot_default_target_qd(int channel_id);
 

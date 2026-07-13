@@ -2,6 +2,7 @@
 
 #include <errno.h>
 #include <poll.h>
+#include <stdio.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
@@ -64,7 +65,9 @@ void storage_ipc_make_event(StorageWorkerEvent *event, StorageWorkerEventType ty
     event->timestamp_us = storage_ipc_monotonic_us();
     event->error_code = error_code;
     event->received_bytes = received_bytes;
-    if (reason) strncpy(event->reason, reason, sizeof(event->reason) - 1u);
+    if (reason) {
+        (void)snprintf(event->reason, sizeof(event->reason), "%s", reason);
+    }
 }
 
 static int storage_ipc_control_valid(const StorageControlMessage *msg)
@@ -83,6 +86,22 @@ int storage_ipc_validate_event(const StorageWorkerEvent *event)
 
 int storage_ipc_write_control(int fd, const StorageControlMessage *msg)
 { return storage_ipc_control_valid(msg) ? storage_ipc_write_full(fd, msg, sizeof(*msg)) : -1; }
+int storage_ipc_write_control_deadline(int fd, const StorageControlMessage *msg,
+                                       uint64_t deadline_us)
+{
+    struct pollfd pfd;
+    if (!storage_ipc_control_valid(msg)) { errno = EINVAL; return -1; }
+    for (;;) {
+        ssize_t n = write(fd, msg, sizeof(*msg));
+        if (n == (ssize_t)sizeof(*msg)) return 0;
+        if (n >= 0) { errno = EIO; return -1; }
+        if (errno == EINTR) continue;
+        if (errno != EAGAIN && errno != EWOULDBLOCK) return -1;
+        if (storage_ipc_monotonic_us() >= deadline_us) { errno = ETIMEDOUT; return -1; }
+        pfd.fd = fd; pfd.events = POLLOUT; pfd.revents = 0;
+        if (poll(&pfd, 1u, 1) < 0 && errno != EINTR) return -1;
+    }
+}
 int storage_ipc_read_control(int fd, StorageControlMessage *msg)
 { int rc = storage_ipc_read_full(fd, msg, sizeof(*msg)); return rc == 0 && !storage_ipc_control_valid(msg) ? -1 : rc; }
 int storage_ipc_write_event(int fd, const StorageWorkerEvent *event)

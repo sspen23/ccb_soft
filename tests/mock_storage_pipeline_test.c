@@ -48,6 +48,7 @@ int main(void)
     assert(storage_harvest_limit_for_remaining(16384u, 4096u, 4u) == 4u);
     assert(storage_harvest_limit_for_remaining(6144u, 4096u, 4u) == 2u);
     assert(storage_harvest_limit_for_remaining(1u, 4096u, 4u) == 1u);
+    assert(storage_harvest_limit_for_remaining(UINT64_MAX, UINT32_MAX, 4u) == 4u);
     assert(storage_harvest_limit_for_remaining(0u, 4096u, 4u) == 0u);
     assert(storage_pipeline_mark_completed(&p, 0u) == 0);
     assert(storage_pipeline_mark_completed(&p, 1u) == 0);

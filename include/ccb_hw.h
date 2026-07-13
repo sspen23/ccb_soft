@@ -35,11 +35,23 @@ int nvme_write_slot_qd(ChannelRuntime *rt,
                        uint64_t lba,
                        uint64_t sectors,
                        uint64_t hw_addr);
+int nvme_write_slot_qd_payload(ChannelRuntime *rt,
+                               uint32_t slot,
+                               uint64_t lba,
+                               uint64_t sectors,
+                               uint64_t payload_bytes,
+                               uint64_t hw_addr);
 int nvme_write_contiguous_tight_qd(ChannelRuntime *rt,
                                    uint64_t ddr_hw_start,
                                    uint64_t start_lba,
                                    uint64_t bytes,
                                    uint32_t qd);
+int nvme_write_contiguous_tight_qd_payload(ChannelRuntime *rt,
+                                            uint64_t ddr_hw_start,
+                                            uint64_t start_lba,
+                                            uint64_t media_bytes,
+                                            uint64_t payload_bytes,
+                                            uint32_t qd);
 
 typedef struct {
     uint32_t slot;
@@ -49,6 +61,7 @@ typedef struct {
     uint64_t bytes;
     uint64_t chunk_index;
     uint64_t file_offset;
+    uint64_t media_bytes;
 } NvmeWriteSlotReq;
 
 typedef int (*NvmeWriteSlotDoneCb)(void *opaque, const NvmeWriteSlotReq *req);
@@ -149,6 +162,8 @@ typedef struct {
     uint32_t s2mm_sr_after;
     uint32_t curdesc;
     uint32_t taildesc;
+    uint64_t curdesc_addr;
+    uint64_t taildesc_addr;
     uint32_t next_bd;
     uint32_t next_bd_status;
     uint32_t hw_owned;
@@ -156,6 +171,10 @@ typedef struct {
     uint64_t rxeof_count;
     bool rx_packet_open;
     bool reset_attempted;
+    DmaStopResult result;
+    bool safe_reset_confirmed;
+    uint32_t completed_unharvested;
+    char reason[64];
 } DmaStopReport;
 
 /* Initialize and harvest AXI DMA S2MM SG ring buffers. */
@@ -173,12 +192,20 @@ int dma_harvest_completed_batch(ChannelRuntime *rt, DmaHarvestItem *items,
                                 uint32_t max_items, uint32_t *out_count);
 int dma_harvest_one(ChannelRuntime *rt, uint32_t *slot, uint32_t *actual_bytes);
 int dma_requeue_one(ChannelRuntime *rt, uint32_t slot);
+void dma_latch_stop(ChannelRuntime *rt);
+uint64_t dma_requeue_after_stop_count(const ChannelRuntime *rt);
 int dma_get_bd_snapshot(ChannelRuntime *rt,
                         const uint8_t *software_slot_state,
                         DmaBdSnapshot *out);
 bool dma_s2mm_tail_incomplete(const ChannelRuntime *rt);
 int dma_quiesce_s2mm(ChannelRuntime *rt, uint64_t deadline_us, DmaStopReport *report);
+DmaStopResult dma_quiesce_s2mm_with_state(ChannelRuntime *rt, uint64_t deadline_us,
+                                          const uint8_t *software_slot_state,
+                                          DmaStopReport *report);
 DmaStopResult dma_finalize_stop_s2mm(ChannelRuntime *rt, DmaStopReport *report);
+DmaStopResult dma_finalize_stop_s2mm_with_state(ChannelRuntime *rt,
+                                                const uint8_t *software_slot_state,
+                                                DmaStopReport *report);
 DmaStopResult dma_stop_s2mm(ChannelRuntime *rt, DmaStopReport *report);
 
 #endif

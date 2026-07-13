@@ -15,7 +15,13 @@ static int storage_perf_open(void)
     if (enabled && strcmp(enabled, "0") == 0) { g_fd = -1; return -1; }
     path = getenv("SRC_REAL_PERF_LOG_FILE"); if (!path || !path[0]) path = "/tmp/storage_perf.log";
     g_fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
-    if (g_fd < 0 && !g_open_failure_reported) g_open_failure_reported = true;
+    if (g_fd < 0 && !g_open_failure_reported) {
+        /* A bad path must not turn every incoming event into another open(2)
+         * attempt.  Keep logging disabled until the next explicit close/reset
+         * (which is the lifecycle boundary for a new task/process). */
+        g_open_failure_reported = true;
+        g_fd = -1;
+    }
     return g_fd;
 }
 int storage_perf_log_event(const StorageWorkerEvent *e, const char *task)
@@ -61,14 +67,19 @@ int storage_perf_log_event(const StorageWorkerEvent *e, const char *task)
                      e->error_code, (unsigned long long)e->received_bytes, e->reason);
         break;
     case STORAGE_WORKER_FINAL_RESULT:
-        n = snprintf(line, sizeof(line), "storage_final task=%s channel=%u ts_us=%llu error=%d dma_bytes=%llu nvme_bytes=%llu file_bytes=%llu persisted=%u receive_integrity_ok=%u storage_integrity_ok=%u integrity_ok=%u reason=%s\n",
+        n = snprintf(line, sizeof(line), "storage_final task=%s channel=%u ts_us=%llu error=%d dma_bytes=%llu nvme_bytes=%llu nvme_media_bytes=%llu nvme_padding_bytes=%llu file_bytes=%llu persisted=%u receive_integrity_ok=%u storage_integrity_ok=%u integrity_ok=%u primary_reason=%s secondary_reason=%s reason=%s\n",
                      task ? task : "", e->channel, (unsigned long long)e->timestamp_us,
                      e->error_code, (unsigned long long)e->result.dma_received_bytes,
                      (unsigned long long)e->result.nvme_completed_bytes,
+                     (unsigned long long)e->result.nvme_media_bytes,
+                     (unsigned long long)e->result.nvme_padding_bytes,
                      (unsigned long long)e->result.file_bytes, e->result.data_persisted ? 1u : 0u,
                      e->result.receive_integrity_ok ? 1u : 0u,
                      e->result.storage_integrity_ok ? 1u : 0u,
-                     e->result.integrity_ok ? 1u : 0u, e->reason);
+                     e->result.integrity_ok ? 1u : 0u,
+                     e->result.integrity_risk[0] != '\0' ? e->result.integrity_risk : "none",
+                     e->result.secondary_reason[0] != '\0' ? e->result.secondary_reason : "none",
+                     e->reason);
         break;
     case STORAGE_WORKER_DIAG_EVENT:
         n = snprintf(line, sizeof(line), "storage_diag task=%s channel=%u ts_us=%llu sequence=%llu event_id=%u event_channel=%u flags=%u arg0=%llu arg1=%llu\n",

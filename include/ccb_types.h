@@ -216,6 +216,8 @@ typedef struct {
     uint32_t free_slots;
     uint32_t curdesc_index;
     uint32_t taildesc_index;
+    uint64_t curdesc_addr;
+    uint64_t taildesc_addr;
     uint32_t s2mm_dmasr;
     uint32_t s2mm_dmacr;
     uint64_t occupied_bytes_est;
@@ -252,6 +254,7 @@ typedef struct {
     uint64_t nvme_cmd_count;
     uint64_t nvme_cmd_bytes_total;
     uint64_t nvme_write_bytes_done;
+    uint64_t nvme_payload_bytes_done;
     uint64_t nvme_cmd_latency_total_us;
     uint64_t nvme_latency_sample_count;
     uint64_t nvme_cmd_latency_min_us;
@@ -289,6 +292,9 @@ typedef struct {
     uint64_t dma_rxsof_count;
     uint64_t dma_rxeof_count;
     bool dma_rx_packet_open;
+    bool dma_stop_latched;
+    bool dma_requeue_enabled;
+    uint64_t dma_requeue_after_stop_count;
 } ChannelRuntime;
 
 #endif

@@ -10,7 +10,7 @@ typedef struct {
     uint32_t unavailable_mask, worker_exited_mask;
     uint32_t stop_requested_mask, stop_sent_mask, stop_failed_mask;
     bool first_fatal, result_known_failed, aggregate_ready;
-    uint32_t fatal_channel; char fatal_reason[64];
+    uint32_t fatal_channel; char fatal_reason[64]; char secondary_reason[64];
     WriteResult final_result[NUM_CHANNELS];
     bool aggregate_emitted;
     StorageTaskTerminal terminal;
@@ -23,6 +23,8 @@ int storage_supervisor_handle_event_for_channel(StorageTaskSupervisor *s,
                                                 const StorageWorkerEvent *e);
 void storage_supervisor_protocol_fail(StorageTaskSupervisor *s, uint32_t channel,
                                       const char *reason);
+void storage_supervisor_mark_unavailable(StorageTaskSupervisor *s, uint32_t channel,
+                                         const char *reason);
 int storage_supervisor_handle_worker_eof(StorageTaskSupervisor *s, uint32_t channel);
 int storage_supervisor_handle_worker_exit(StorageTaskSupervisor *s, uint32_t channel, int exit_code);
 uint32_t storage_supervisor_stop_mask(const StorageTaskSupervisor *s);

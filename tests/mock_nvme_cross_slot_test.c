@@ -125,6 +125,7 @@ static NvmeCrossSlotEngine *engine(ChannelRuntime *rt, Mock *mock)
                              yield_cpu, reset_engine };
     NvmeCrossSlotConfig value = config();
     memset(rt, 0, sizeof(*rt));
+    rt->dma_desc_count = 32u;
     rt->nvme_qd_effective = 4u;
     rt->nvme_cmd_sectors = 1u;
     return nvme_cross_slot_engine_create_with_ops_config(rt, &value, &ops, mock);
@@ -154,6 +155,7 @@ static void test_multislot_out_of_order_and_budget(void)
     assert(nvme_cross_slot_engine_add(value, &b) == 0);
     assert(nvme_cross_slot_engine_step(value, 1u, done, &mock) == 0);
     assert(mock.submitted_count == 4u);
+    assert(__atomic_load_n(&rt.nvme_active_qd_max, __ATOMIC_ACQUIRE) == 4u);
     assert(mock.callbacks == 0u);
     queue_completion(&mock, mock.submitted[2], 0);
     queue_completion(&mock, mock.submitted[1], 0);
@@ -376,6 +378,58 @@ static void test_multislot_error_drains_without_callbacks(void)
     nvme_cross_slot_engine_destroy(value);
 }
 
+static void test_duplicate_active_is_fatal_even_when_full(void)
+{
+    ChannelRuntime rt;
+    Mock mock;
+    NvmeCrossSlotEngine *value;
+    NvmeWriteSlotReq a = request(12u, 1u), b = request(13u, 1u);
+    NvmeWriteSlotReq duplicate = request(12u, 1u);
+
+    memset(&mock, 0, sizeof(mock));
+    value = engine(&rt, &mock);
+    assert(value);
+    assert(nvme_cross_slot_engine_add(value, &a) == 0);
+    assert(nvme_cross_slot_engine_add(value, &b) == 0);
+    assert(nvme_cross_slot_engine_add(value, &duplicate) != 0);
+    assert(strcmp(nvme_cross_slot_engine_last_error(value),
+                  "duplicate_active_slot") == 0);
+    assert(nvme_cross_slot_engine_drain_abort(value, mock.now_us + 10u) == 0);
+    nvme_cross_slot_engine_destroy(value);
+}
+
+static void test_payload_media_validation(void)
+{
+    ChannelRuntime rt;
+    Mock mock;
+    NvmeCrossSlotEngine *value;
+    NvmeWriteSlotReq req = request(14u, 2u);
+
+    req.media_bytes = req.bytes - 1u;
+    memset(&mock, 0, sizeof(mock));
+    value = engine(&rt, &mock);
+    assert(value);
+    assert(nvme_cross_slot_engine_add(value, &req) != 0);
+    assert(strcmp(nvme_cross_slot_engine_last_error(value),
+                  "payload_media_mismatch") == 0);
+    nvme_cross_slot_engine_destroy(value);
+}
+
+static void test_slot_range_validation(void)
+{
+    ChannelRuntime rt;
+    Mock mock;
+    NvmeCrossSlotEngine *value;
+    NvmeWriteSlotReq req = request(32u, 1u);
+
+    memset(&mock, 0, sizeof(mock));
+    value = engine(&rt, &mock);
+    assert(value);
+    assert(nvme_cross_slot_engine_add(value, &req) != 0);
+    assert(strcmp(nvme_cross_slot_engine_last_error(value), "slot_range_overflow") == 0);
+    nvme_cross_slot_engine_destroy(value);
+}
+
 int main(void)
 {
     test_multislot_out_of_order_and_budget();
@@ -385,6 +439,9 @@ int main(void)
     test_no_progress_timeout();
     test_abort_reset_and_submit_failure();
     test_multislot_error_drains_without_callbacks();
+    test_duplicate_active_is_fatal_even_when_full();
+    test_payload_media_validation();
+    test_slot_range_validation();
     puts("mock_nvme_cross_slot_test: ok");
     return 0;
 }

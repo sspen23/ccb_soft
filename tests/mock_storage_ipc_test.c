@@ -48,5 +48,12 @@ int main(void)
     assert(storage_ipc_read_event(p[0], &eo) == 0 && eo.type == STORAGE_WORKER_FINAL_RESULT);
     assert(storage_ipc_read_event(p[0], &eo) == 0 && eo.type == STORAGE_WORKER_DIAG_EVENT);
     close(p[0]); close(p[1]);
+    assert(pipe(p) == 0);
+    assert(fcntl(p[1], F_SETFL, fcntl(p[1], F_GETFL, 0) | O_NONBLOCK) == 0);
+    storage_ipc_make_event(&e, STORAGE_WORKER_FATAL, 0u, -1, 0u, "fatal_full_pipe");
+    while (write(p[1], &c, sizeof(c)) > 0) { }
+    assert(storage_ipc_write_event_deadline(
+               p[1], &e, storage_ipc_monotonic_us()) != 0);
+    close(p[0]); close(p[1]);
     puts("mock_storage_ipc_test: ok"); return 0;
 }
