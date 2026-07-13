@@ -1,5 +1,12 @@
 # Storage pipeline repair plan
 
+## Verification update (2026-07-13)
+
+- Verification baseline: `a7323fa fix: minimize storage logging and preserve compatibility`.
+- Implemented phases: deterministic START/STOP and event ownership; parent-only aggregate commit; cross-slot CID abort/drain/reset; bounded DMA batch/atomic queue/O(1) counters; and nonblocking diagnostics/logging compatibility.
+- The current host suite is SQLite-free and covers IPC/event validation, supervisor sequencing and terminal aggregation, fd cleanup, commit rollback, DMA descriptor quiesce/harvest, bounded queue invariants, event-ring fatal retention, performance/DIAG serialization, and persistent cross-slot completion/abort paths.
+- Remaining verification requiring target hardware is intentionally retained in `BOARD_THREE_NVME_TEST_PLAN.md`; no Vitis build is part of host verification.
+
 ## Audit baseline and scope
 
 - Branch: `main`

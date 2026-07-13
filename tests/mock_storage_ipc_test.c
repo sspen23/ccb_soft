@@ -22,6 +22,12 @@ int main(void)
     assert(!storage_ipc_validate_event(&eo));
     close(p[1]); assert(storage_ipc_read_control(p[0], &out) == 1); close(p[0]);
     assert(pipe(p) == 0);
+    storage_ipc_make_event(&e, STORAGE_WORKER_READY, 0u, 0, 0u, "partial");
+    assert(write(p[1], &e, sizeof(e) / 2u) == (ssize_t)(sizeof(e) / 2u));
+    close(p[1]);
+    assert(storage_ipc_read_event_raw(p[0], &eo) == -1);
+    close(p[0]);
+    assert(pipe(p) == 0);
     assert(fcntl(p[1], F_SETFL, fcntl(p[1], F_GETFL, 0) | O_NONBLOCK) == 0);
     storage_ipc_make_event(&e, STORAGE_WORKER_PERF_SAMPLE, 0u, 0, 0u, "perf");
     while (write(p[1], &c, sizeof(c)) > 0) { }
