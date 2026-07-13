@@ -3,11 +3,13 @@
 
 #include <stdint.h>
 #include <stdatomic.h>
+#include <stdbool.h>
 
 typedef enum {
     STORAGE_EVENT_DMA_BD_COMPLETED = 1, STORAGE_EVENT_DMA_BD_LOW,
     STORAGE_EVENT_DMA_BD_EXHAUSTED, STORAGE_EVENT_DMA_ERROR,
     STORAGE_EVENT_DESCRIPTOR_ERROR, STORAGE_EVENT_SLOT_STATE_ERROR,
+    STORAGE_EVENT_QUEUE_FULL, STORAGE_EVENT_STOP_LATCHED,
     STORAGE_EVENT_NVME_SUBMIT_STALL, STORAGE_EVENT_NVME_CQ_STALL,
     STORAGE_EVENT_WRITER_SCHEDULE_GAP, STORAGE_EVENT_START_READY,
     STORAGE_EVENT_START_ARMED, STORAGE_EVENT_START_RUNNING,
@@ -21,7 +23,8 @@ typedef struct {
 
 typedef struct {
     StorageEventRecord *records; uint32_t capacity;
-    _Atomic uint64_t next_sequence; _Atomic uint64_t fatal_sequence;
+    _Atomic uint64_t next_sequence; _Atomic uint64_t overwrite_count;
+    _Atomic uint64_t fatal_sequence;
     StorageEventRecord fatal;
 } StorageEventRing;
 
@@ -29,5 +32,7 @@ int storage_event_ring_init(StorageEventRing *ring, uint32_t capacity);
 void storage_event_ring_destroy(StorageEventRing *ring);
 void storage_event_ring_push(StorageEventRing *ring, const StorageEventRecord *record, int fatal);
 uint32_t storage_event_ring_copy(StorageEventRing *ring, StorageEventRecord *out, uint32_t max);
+bool storage_event_ring_should_dump(bool is_error, bool stopped,
+                                    bool dump_on_error, bool dump_on_stop);
 
 #endif

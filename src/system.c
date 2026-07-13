@@ -1592,7 +1592,7 @@ static void drain_storage_events(Task *task, bool report_eof)
         int supervisor_rc;
 
         if (event.type == STORAGE_WORKER_PERF_SAMPLE || event.type == STORAGE_WORKER_FATAL ||
-            event.type == STORAGE_WORKER_FINAL_RESULT) {
+            event.type == STORAGE_WORKER_FINAL_RESULT || event.type == STORAGE_WORKER_DIAG_EVENT) {
             (void)storage_perf_log_event(&event, task->task_id);
         }
         supervisor_rc = storage_supervisor_handle_event(&g_storage_supervisor, &event);
@@ -1773,6 +1773,10 @@ static int start_storage_worker(const PlannedFile *planned, const char *task_id,
         setenv("SRC_REAL_STORAGE_CONTROL_FD", start_fd, 1);
         snprintf(event_fd, sizeof(event_fd), "%d", event_pipe[1]);
         setenv("SRC_REAL_STORAGE_EVENT_FD", event_fd, 1);
+        {
+            int flags = fcntl(event_pipe[1], F_GETFL, 0);
+            if (flags >= 0) (void)fcntl(event_pipe[1], F_SETFL, flags | O_NONBLOCK);
+        }
         dup2(pipefd[1], STDOUT_FILENO);
         dup2(pipefd[1], STDERR_FILENO);
         close(pipefd[0]);
@@ -4349,16 +4353,19 @@ static int run_storage_worker_main(int argc, char **argv)
                 storage_ipc_make_event(&event, STORAGE_WORKER_FATAL, (uint32_t)args.channel_id,
                                        rc, result.dma_received_bytes,
                                        result.integrity_risk[0] ? result.integrity_risk : "worker_failed");
-                (void)storage_ipc_write_event(event_fd, &event);
+                (void)storage_ipc_write_event_deadline(event_fd, &event,
+                                                       storage_ipc_monotonic_us() + 1000000ull);
             } else {
                 storage_ipc_make_event(&event, STORAGE_WORKER_DRAINED, (uint32_t)args.channel_id,
                                        0, result.dma_received_bytes, "drained");
-                (void)storage_ipc_write_event(event_fd, &event);
+                (void)storage_ipc_write_event_deadline(event_fd, &event,
+                                                       storage_ipc_monotonic_us() + 1000000ull);
             }
             storage_ipc_make_event(&event, STORAGE_WORKER_FINAL_RESULT, (uint32_t)args.channel_id,
                                    rc, result.dma_received_bytes, rc == 0 ? "final" : "failed");
             event.result = result;
-            (void)storage_ipc_write_event(event_fd, &event);
+            (void)storage_ipc_write_event_deadline(event_fd, &event,
+                                                   storage_ipc_monotonic_us() + 1000000ull);
         }
     }
     printf("storage_worker_result task=%s channel=%d file_index=%u rc=%d"

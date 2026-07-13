@@ -19,13 +19,20 @@ void storage_event_ring_push(StorageEventRing *ring, const StorageEventRecord *r
     uint64_t seq;
     if (!ring || !ring->records || !record) return;
     seq = atomic_fetch_add_explicit(&ring->next_sequence, 1u, memory_order_relaxed) + 1u;
+    if (seq > ring->capacity) {
+        (void)atomic_fetch_add_explicit(&ring->overwrite_count, 1u, memory_order_relaxed);
+    }
     copy = *record; copy.sequence = 0u;
     ring->records[seq % ring->capacity] = copy;
     atomic_thread_fence(memory_order_release);
     ring->records[seq % ring->capacity].sequence = seq;
-    if (fatal && atomic_load_explicit(&ring->fatal_sequence, memory_order_acquire) == 0u) {
-        ring->fatal = copy; ring->fatal.sequence = seq;
-        atomic_store_explicit(&ring->fatal_sequence, seq, memory_order_release);
+    if (fatal) {
+        if (atomic_load_explicit(&ring->fatal_sequence, memory_order_relaxed) == 0u) {
+            ring->fatal = copy;
+            ring->fatal.sequence = seq;
+            atomic_thread_fence(memory_order_release);
+            atomic_store_explicit(&ring->fatal_sequence, seq, memory_order_release);
+        }
     }
 }
 uint32_t storage_event_ring_copy(StorageEventRing *ring, StorageEventRecord *out, uint32_t max)
@@ -39,5 +46,29 @@ uint32_t storage_event_ring_copy(StorageEventRing *ring, StorageEventRecord *out
         atomic_thread_fence(memory_order_acquire);
         if (r.sequence == seq) out[n++] = r;
     }
+    if (atomic_load_explicit(&ring->fatal_sequence, memory_order_acquire) != 0u && n < max) {
+        uint32_t i;
+        bool present = false;
+        for (i = 0u; i < n; ++i) if (out[i].sequence == ring->fatal.sequence) present = true;
+        if (!present) out[n++] = ring->fatal;
+    }
+    {
+        uint32_t i;
+        for (i = 1u; i < n; ++i) {
+            StorageEventRecord value = out[i];
+            uint32_t j = i;
+            while (j > 0u && out[j - 1u].sequence > value.sequence) {
+                out[j] = out[j - 1u];
+                --j;
+            }
+            out[j] = value;
+        }
+    }
     return n;
+}
+
+bool storage_event_ring_should_dump(bool is_error, bool stopped,
+                                    bool dump_on_error, bool dump_on_stop)
+{
+    return (is_error && dump_on_error) || (stopped && dump_on_stop);
 }

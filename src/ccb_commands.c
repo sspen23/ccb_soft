@@ -38,8 +38,10 @@
 #define SSD_CONTINUOUS_PATTERN_TEST_DEFAULT_BYTES (640ull * 1024ull * 1024ull)
 #define STORAGE_DESC_STS_RXSOF (1u << 27)
 #define STORAGE_DESC_STS_RXEOF (1u << 26)
+#define STORAGE_EVENT_DEADLINE_US 1000000ull
 static volatile sig_atomic_t g_storage_stop_requested = 0;
 static bool g_storage_control_stop_latched = false;
+static _Atomic uint64_t g_storage_dropped_perf_samples;
 
 typedef struct {
     uint32_t slot;
@@ -75,6 +77,8 @@ typedef struct {
     uint64_t ready_q_nonempty_us;
     uint64_t writer_drain_loop_count;
     uint64_t writer_slots_drained;
+    uint64_t writer_schedule_gap_count;
+    uint64_t writer_schedule_gap_max_us;
     bool writer_rt_enabled;
     int writer_rt_policy;
     uint32_t writer_rt_prio;
@@ -106,6 +110,8 @@ typedef struct {
     uint64_t ready_q_nonempty_us;
     uint64_t writer_drain_loop_count;
     uint64_t writer_slots_drained;
+    uint64_t writer_schedule_gap_count;
+    uint64_t writer_schedule_gap_max_us;
     bool writer_rt_enabled;
     int writer_rt_policy;
     uint32_t writer_rt_prio;
@@ -153,6 +159,10 @@ typedef struct {
     uint32_t dma_harvest_batch_current;
     uint64_t window_nvme_cmd_count;
     uint64_t window_nvme_cq_completed;
+    uint64_t perf_next_us;
+    uint64_t perf_window_start_us;
+    uint64_t perf_window_received_bytes;
+    uint64_t perf_window_nvme_bytes;
     bool idle_printed;
     bool ring_warning_emitted;
     uint64_t last_ring_warning_us;
@@ -208,6 +218,7 @@ static void storage_trace_flush_done(const ChannelRuntime *rt,
                                      int metadata_slot,
                                      const char *task_no);
 void storage_write_request_stop(void);
+static int storage_env_flag_enabled(const char *name);
 
 static uint64_t storage_wall_time_us(void) {
     struct timespec ts;
@@ -248,29 +259,80 @@ static void storage_emit_event(StorageWorkerEventType type, const ChannelRuntime
     if (fd < 0) return;
     storage_ipc_make_event(&event, type, rt && rt->cfg ? (uint32_t)rt->cfg->id : UINT32_MAX,
                            error_code, bytes, reason);
-    (void)storage_ipc_write_event(fd, &event);
+    (void)storage_ipc_write_event_deadline(fd, &event,
+                                           storage_ipc_monotonic_us() + STORAGE_EVENT_DEADLINE_US);
 }
 
 static void storage_emit_perf_event(const ChannelRuntime *rt, const StorageProducerStats *stats,
+                                    const StorageWriteQueue *q,
                                     const DmaBdSnapshot *bd, uint64_t start_us, uint64_t end_us,
                                     uint64_t dma_delta, uint64_t nvme_delta)
 {
     StorageWorkerEvent event;
     int fd = storage_env_fd("SRC_REAL_STORAGE_EVENT_FD");
-    if (fd < 0 || !rt || !stats || !bd) return;
+    if (fd < 0 || !rt || !stats || !q || !bd) return;
     storage_ipc_make_event(&event, STORAGE_WORKER_PERF_SAMPLE, (uint32_t)rt->cfg->id,
                            0, dma_delta, "perf_sample");
     event.perf.window_start_us = start_us; event.perf.window_end_us = end_us;
     event.perf.dma_bytes_delta = dma_delta; event.perf.nvme_bytes_delta = nvme_delta;
     event.perf.dma_writable = bd->dma_writable; event.perf.completed_unharvested = bd->completed_unharvested;
     event.perf.ready_slots = bd->ready_slots; event.perf.nvme_busy_slots = bd->nvme_busy_slots;
-    event.perf.requeue_pending = bd->requeue_pending;
+    event.perf.requeue_pending = bd->requeue_pending; event.perf.free_slots = bd->free_slots;
     event.perf.active_qd = __atomic_load_n(&rt->nvme_active_qd_current, __ATOMIC_ACQUIRE);
     event.perf.active_qd_max = __atomic_load_n(&rt->nvme_active_qd_max, __ATOMIC_ACQUIRE);
     event.perf.submit_stall_count = __atomic_load_n(&rt->nvme_submit_stall_count, __ATOMIC_ACQUIRE);
     event.perf.submit_stall_max_us = __atomic_load_n(&rt->nvme_submit_stall_max_us, __ATOMIC_ACQUIRE);
+    event.perf.writer_schedule_gap_count = __atomic_load_n(&q->writer_schedule_gap_count, __ATOMIC_ACQUIRE);
+    event.perf.writer_schedule_gap_max_us = __atomic_load_n(&q->writer_schedule_gap_max_us, __ATOMIC_ACQUIRE);
+    event.perf.sq_full_wait_count = __atomic_load_n(&rt->nvme_submit_sq_full_count, __ATOMIC_ACQUIRE);
+    event.perf.sq_full_wait_max_us = __atomic_load_n(&rt->nvme_submit_stall_max_us, __ATOMIC_ACQUIRE);
+    event.perf.cq_empty_wait_count = __atomic_load_n(&rt->nvme_cq_empty_polls, __ATOMIC_ACQUIRE);
+    event.perf.cq_empty_wait_max_us = __atomic_load_n(&rt->nvme_cq_wait_total_us, __ATOMIC_ACQUIRE);
+    event.perf.dropped_perf_samples = atomic_load_explicit(&g_storage_dropped_perf_samples,
+                                                            memory_order_relaxed);
     event.perf.receive_integrity_ok = stats->receive_integrity_ok ? 1u : 0u;
-    (void)storage_ipc_write_event(fd, &event);
+    event.perf.storage_integrity_ok = (!q->error && !stats->integrity_risk_ring_full) ? 1u : 0u;
+    (void)storage_ipc_try_write_perf(fd, &event, &g_storage_dropped_perf_samples);
+}
+
+static void storage_emit_diag_event(const ChannelRuntime *rt, const StorageEventRecord *record)
+{
+    StorageWorkerEvent event;
+    int fd = storage_env_fd("SRC_REAL_STORAGE_EVENT_FD");
+
+    if (fd < 0 || !record) return;
+    storage_ipc_make_event(&event, STORAGE_WORKER_DIAG_EVENT,
+                           rt && rt->cfg ? (uint32_t)rt->cfg->id : UINT32_MAX,
+                           0, 0u, "diag_event");
+    event.diag = *record;
+    (void)storage_ipc_write_event_deadline(fd, &event,
+                                           storage_ipc_monotonic_us() + 100000ull);
+}
+
+static void storage_dump_event_ring(const StorageEventRing *ring, const ChannelRuntime *rt)
+{
+    StorageEventRecord *records;
+    uint32_t count;
+    uint32_t i;
+
+    if (!ring || ring->capacity == 0u) return;
+    records = calloc((size_t)ring->capacity + 1u, sizeof(*records));
+    if (!records) return;
+    count = storage_event_ring_copy((StorageEventRing *)ring, records, ring->capacity + 1u);
+    for (i = 0u; i < count; ++i) storage_emit_diag_event(rt, &records[i]);
+    free(records);
+}
+
+static void storage_maybe_dump_event_rings(const StorageWriteQueue *q,
+                                           const ChannelRuntime *rt,
+                                           bool is_error, bool stopped)
+{
+    bool dump_error = storage_env_flag_enabled("SRC_REAL_DUMP_EVENT_RING_ON_ERROR") != 0;
+    bool dump_stop = storage_env_flag_enabled("SRC_REAL_DUMP_EVENT_RING_ON_STOP") != 0;
+
+    if (!q || !storage_event_ring_should_dump(is_error, stopped, dump_error, dump_stop)) return;
+    storage_dump_event_ring(&q->producer_event_ring, rt);
+    storage_dump_event_ring(&q->writer_event_ring, rt);
 }
 
 static int storage_wait_start_gate(ChannelRuntime *rt, uint64_t *start_skew_us, const char **gate_mode)
@@ -409,6 +471,8 @@ static bool storage_log_enabled(StorageLogLevel need)
     return storage_log_level() >= need;
 }
 
+static uint32_t storage_env_u32_limit(const char *name, uint32_t fallback, uint32_t max_value);
+
 static uint32_t storage_pipeline_stats_ms(void)
 {
     const char *env = getenv("SRC_REAL_PIPELINE_STATS_SEC");
@@ -431,6 +495,12 @@ static uint32_t storage_pipeline_stats_ms(void)
         return STORAGE_PIPELINE_STATS_SEC_DEFAULT * 1000u;
     }
     return (uint32_t)parsed * 1000u;
+}
+
+static uint32_t storage_perf_log_interval_ms(void)
+{
+    return storage_env_u32_limit("SRC_REAL_PERF_LOG_INTERVAL_SEC", 5u,
+                                 UINT32_MAX / 1000u) * 1000u;
 }
 
 static uint32_t storage_env_u32_limit(const char *name, uint32_t fallback, uint32_t max_value)
@@ -1171,6 +1241,8 @@ static int storage_queue_push(StorageWriteQueue *q,
     }
     if (q->error || q->count == q->capacity) {
         q->error = true;
+        storage_ring_event(&q->producer_event_ring, STORAGE_EVENT_QUEUE_FULL, q->rt,
+                           q->count, q->capacity, true);
         pthread_cond_broadcast(&q->not_empty);
         pthread_mutex_unlock(&q->lock);
         return -1;
@@ -1423,6 +1495,8 @@ static int storage_capture_bd_snapshot(StorageProducerStats *stats,
                  sizeof(stats->receive_integrity_risk),
                  "slot_ownership_invariant_failed");
         stats->receive_integrity_ok = false;
+        storage_ring_event(&q->producer_event_ring, STORAGE_EVENT_SLOT_STATE_ERROR,
+                           rt, 0u, 0u, true);
         return -1;
     }
     stats->last_bd_snapshot = *out;
@@ -1454,6 +1528,8 @@ static int storage_capture_bd_snapshot(StorageProducerStats *stats,
                               rt->cfg->id, task_no, (unsigned)file_index,
                               out->dma_writable, low_threshold,
                               out->completed_unharvested, out->occupied_bytes_est);
+            storage_ring_event(&q->producer_event_ring, STORAGE_EVENT_DMA_BD_LOW, rt,
+                               out->dma_writable, out->completed_unharvested, false);
         } else if (out->dma_writable > low_threshold) {
             stats->dma_bd_low_active = false;
         }
@@ -1471,6 +1547,8 @@ static int storage_capture_bd_snapshot(StorageProducerStats *stats,
                  sizeof(stats->receive_integrity_risk),
                  "dma_error_or_halted");
         stats->receive_integrity_ok = false;
+        storage_ring_event(&q->producer_event_ring, STORAGE_EVENT_DMA_ERROR, rt,
+                           out->s2mm_dmasr, 0u, true);
     }
     if (out->dma_writable == 0u) {
         now_us = storage_wall_time_us();
@@ -1501,6 +1579,8 @@ static int storage_capture_bd_snapshot(StorageProducerStats *stats,
             }
         }
         stats->integrity_risk_ring_full = true;
+        storage_ring_event(&q->producer_event_ring, STORAGE_EVENT_DMA_BD_EXHAUSTED, rt,
+                           out->completed_unharvested, out->ready_slots, true);
         stats->receive_integrity_ok = false;
         snprintf(stats->receive_integrity_risk,
                  sizeof(stats->receive_integrity_risk),
@@ -1670,14 +1750,19 @@ static void storage_stats_print_periodic(StorageProducerStats *stats,
     uint32_t busy_slots;
     bool print_zero_stats;
     bool perf_enabled;
+    bool periodic_due;
+    bool perf_due;
     StorageQueueSnapshot snapshot;
     DmaBdSnapshot bd_snapshot;
 
     perf_enabled = storage_env_flag_enabled("SRC_REAL_PERF_LOG_ENABLE") != 0;
-    if (!stats || stats->interval_ms == 0u || now_us < stats->next_log_us ||
-        (!storage_should_print_periodic_stats((ChannelRuntime *)rt) && !perf_enabled)) {
+    if (!stats) {
         return;
     }
+    periodic_due = stats->interval_ms != 0u && now_us >= stats->next_log_us &&
+                   storage_should_print_periodic_stats((ChannelRuntime *)rt);
+    perf_due = perf_enabled && now_us >= stats->perf_next_us;
+    if (!periodic_due && !perf_due) return;
     storage_stats_finish_harvest_batch(stats);
     storage_queue_snapshot(q, &snapshot);
     pthread_mutex_lock(&q->lock);
@@ -1703,8 +1788,16 @@ static void storage_stats_print_periodic(StorageProducerStats *stats,
     busy_slots = storage_queue_busy_count(q, NULL);
     print_zero_stats = storage_env_flag_enabled("SRC_REAL_PRINT_ZERO_STATS") != 0;
 
-    if (perf_enabled) storage_emit_perf_event(rt, stats, &bd_snapshot, stats->window_start_us,
-                                               now_us, received_delta, nvme_delta);
+    if (perf_due) {
+        storage_emit_perf_event(rt, stats, q, &bd_snapshot, stats->perf_window_start_us,
+                                now_us, received_bytes - stats->perf_window_received_bytes,
+                                nvme_bytes - stats->perf_window_nvme_bytes);
+        stats->perf_window_start_us = now_us;
+        stats->perf_window_received_bytes = received_bytes;
+        stats->perf_window_nvme_bytes = nvme_bytes;
+        stats->perf_next_us = now_us + (uint64_t)storage_perf_log_interval_ms() * 1000ull;
+    }
+    if (!periodic_due) return;
 
     if (!print_zero_stats && received_delta == 0u && nvme_delta == 0u) {
         if (!stats->idle_printed && received_bytes == 0u && nvme_bytes == 0u) {
@@ -1994,27 +2087,41 @@ static void *storage_nvme_writer_thread(void *arg) {
     while (1) {
         PendingDdrSlot item;
         uint64_t wait_start_us;
+        uint64_t wait_us;
         uint64_t write_start_us;
         uint64_t write_us;
+        uint64_t submit_stalls_before;
+        uint64_t cq_empty_before;
         bool backlog_after_pop = false;
         int pop_rc;
 
         wait_start_us = storage_wall_time_us();
         pop_rc = storage_queue_pop(q, &item, true);
         if (pop_rc > 0) {
-            (void)__atomic_add_fetch(&q->writer_idle_us,
-                                     storage_elapsed_us(wait_start_us),
+            wait_us = storage_elapsed_us(wait_start_us);
+            (void)__atomic_add_fetch(&q->writer_idle_us, wait_us,
                                      __ATOMIC_RELEASE);
+            if (wait_us >= 1000u) {
+                (void)__atomic_add_fetch(&q->writer_schedule_gap_count, 1u, __ATOMIC_RELAXED);
+                if (wait_us > __atomic_load_n(&q->writer_schedule_gap_max_us, __ATOMIC_RELAXED))
+                    __atomic_store_n(&q->writer_schedule_gap_max_us, wait_us, __ATOMIC_RELAXED);
+                storage_ring_event(&q->writer_event_ring, STORAGE_EVENT_WRITER_SCHEDULE_GAP,
+                                   q->rt, wait_us, 0u, false);
+            }
         }
         if (pop_rc < 0) {
             storage_mark_writer_error(q);
             break;
         }
         if (pop_rc == 0) {
+            storage_ring_event(&q->writer_event_ring, STORAGE_EVENT_STOP_DRAINED,
+                               q->rt, 0u, 0u, false);
             break;
         }
         backlog_after_pop = storage_queue_ready_count(q) > 0u;
 
+        submit_stalls_before = __atomic_load_n(&q->rt->nvme_submit_stall_count, __ATOMIC_ACQUIRE);
+        cq_empty_before = __atomic_load_n(&q->rt->nvme_cq_empty_polls, __ATOMIC_ACQUIRE);
         write_start_us = storage_wall_time_us();
         if (flush_slot_to_nvme(q->rt,
                                &item,
@@ -2025,6 +2132,12 @@ static void *storage_nvme_writer_thread(void *arg) {
             break;
         }
         write_us = storage_elapsed_us(write_start_us);
+        if (__atomic_load_n(&q->rt->nvme_submit_stall_count, __ATOMIC_ACQUIRE) > submit_stalls_before)
+            storage_ring_event(&q->writer_event_ring, STORAGE_EVENT_NVME_SUBMIT_STALL,
+                               q->rt, write_us, 0u, false);
+        if (__atomic_load_n(&q->rt->nvme_cq_empty_polls, __ATOMIC_ACQUIRE) > cq_empty_before)
+            storage_ring_event(&q->writer_event_ring, STORAGE_EVENT_NVME_CQ_STALL,
+                               q->rt, write_us, 0u, false);
         (void)__atomic_add_fetch(&q->nvme_write_us, write_us, __ATOMIC_RELEASE);
         (void)__atomic_add_fetch(&q->writer_active_us, write_us, __ATOMIC_RELEASE);
         (void)__atomic_add_fetch(&q->writer_drain_loop_count, 1u, __ATOMIC_RELEASE);
@@ -2081,6 +2194,8 @@ static void *storage_nvme_cross_slot_writer_thread(void *arg) {
             storage_mark_writer_error(q); break;
         }
         if (pop_rc == 0 && nvme_cross_slot_engine_active(engine) == 0u) {
+            storage_ring_event(&q->writer_event_ring, STORAGE_EVENT_STOP_DRAINED,
+                               q->rt, 0u, 0u, false);
             break;
         }
     }
@@ -2450,6 +2565,7 @@ int execute_write_with_result(const ParsedArgs *args, GlobalOptions gopt, WriteR
     const char *start_gate_mode = "standalone_immediate";
 
     storage_write_reset_stop();
+    atomic_store_explicit(&g_storage_dropped_perf_samples, 0u, memory_order_relaxed);
     memset(&producer_stats, 0, sizeof(producer_stats));
     producer_stats.receive_integrity_ok = true;
     producer_stats.min_dma_writable = UINT32_MAX;
@@ -2738,6 +2854,9 @@ int execute_write_with_result(const ParsedArgs *args, GlobalOptions gopt, WriteR
     producer_stats.window_start_us = capture_start_us;
     producer_stats.next_log_us = capture_start_us +
                                  (uint64_t)producer_stats.interval_ms * 1000ull;
+    producer_stats.perf_window_start_us = capture_start_us;
+    producer_stats.perf_next_us = capture_start_us +
+                                  (uint64_t)storage_perf_log_interval_ms() * 1000ull;
     storage_emit_line("storage_started channel=%d task=%s file_index=%u"
                       " start_gate_mode=%s start_skew_us=%" PRIu64,
                       cfg->id, args->task_no, (unsigned)effective_file_index,
@@ -2776,6 +2895,8 @@ int execute_write_with_result(const ParsedArgs *args, GlobalOptions gopt, WriteR
                            cfg->id,
                            bytes_captured);
                 stop_logged = true;
+                storage_ring_event(&write_queue.producer_event_ring, STORAGE_EVENT_STOP_LATCHED,
+                                   &rt, dma_received_bytes, 0u, false);
             }
             if (stop_requested) {
                 manual_stop_seen = true;
@@ -2797,8 +2918,14 @@ int execute_write_with_result(const ParsedArgs *args, GlobalOptions gopt, WriteR
             if (h < 0) {
                 if ((rt.dma_last_completed_status & 0x70000000u) != 0u) {
                     ++producer_stats.descriptor_error_count;
+                    storage_ring_event(&write_queue.producer_event_ring,
+                                       STORAGE_EVENT_DESCRIPTOR_ERROR, &rt,
+                                       rt.dma_last_completed_status, 0u, true);
                 } else {
                     ++producer_stats.dma_error_count;
+                    storage_ring_event(&write_queue.producer_event_ring,
+                                       STORAGE_EVENT_DMA_ERROR, &rt,
+                                       rt.dma_last_completed_status, 0u, true);
                 }
                 producer_stats.receive_integrity_ok = false;
                 if (strcmp(producer_stats.receive_integrity_risk, "none") == 0) {
@@ -2841,6 +2968,10 @@ int execute_write_with_result(const ParsedArgs *args, GlobalOptions gopt, WriteR
                                             dma_received_bytes);
                 if (bd_snapshot.dma_writable == 0u) {
                     ++producer_stats.dma_no_free_slot_count;
+                    storage_ring_event(&write_queue.producer_event_ring,
+                                       STORAGE_EVENT_DMA_BD_EXHAUSTED, &rt,
+                                       bd_snapshot.completed_unharvested,
+                                       bd_snapshot.ready_slots, true);
                     storage_emit_event(STORAGE_WORKER_FATAL, &rt, -1, dma_received_bytes,
                                        "dma_bd_exhausted");
                     producer_stats.receive_integrity_ok = false;
@@ -2975,6 +3106,9 @@ int execute_write_with_result(const ParsedArgs *args, GlobalOptions gopt, WriteR
                     if (queued_bytes == 0u || queued_bytes > rt.dma_desc_bytes ||
                         (bounded && remaining == 0u)) {
                         producer_stats.receive_integrity_ok = false;
+                        storage_ring_event(&write_queue.producer_event_ring,
+                                           STORAGE_EVENT_DESCRIPTOR_ERROR, &rt,
+                                           queued_bytes, rt.dma_desc_bytes, true);
                         snprintf(producer_stats.receive_integrity_risk,
                                  sizeof(producer_stats.receive_integrity_risk), "invalid_dma_harvest_bytes");
                         goto out;
@@ -2995,6 +3129,9 @@ int execute_write_with_result(const ParsedArgs *args, GlobalOptions gopt, WriteR
                     storage_stats_record_dma_desc(&producer_stats, storage_wall_time_us());
                 }
                 if (storage_local_queue_push_batch(&write_queue, pending, harvest_count) != 0) {
+                    storage_ring_event(&write_queue.producer_event_ring,
+                                       STORAGE_EVENT_QUEUE_FULL, &rt,
+                                       harvest_count, write_queue.capacity, true);
                     storage_emit_event(STORAGE_WORKER_FATAL, &rt, -1, dma_received_bytes,
                                        "storage_queue_full_or_state_error");
                     goto out;
@@ -3157,6 +3294,7 @@ int execute_write_with_result(const ParsedArgs *args, GlobalOptions gopt, WriteR
                    cfg->id, bytes_captured);
         goto out;
     }
+    storage_maybe_dump_event_rings(&write_queue, &rt, false, manual_stop_seen);
     storage_stats_finish_harvest_batch(&producer_stats);
     storage_queue_snapshot(&write_queue, &final_queue_snapshot);
     bytes_written = write_queue.bytes_written;
@@ -3542,6 +3680,8 @@ out:
         nvme_write_us = write_queue.nvme_write_us;
     }
     if (write_queue_ready) {
+        storage_maybe_dump_event_rings(&write_queue, &rt,
+                                       rc != 0 || write_queue.error, manual_stop_seen);
         storage_queue_destroy(&write_queue);
         write_queue_ready = false;
     }
