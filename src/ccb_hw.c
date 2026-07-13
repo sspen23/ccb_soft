@@ -2189,10 +2189,22 @@ NvmeCrossSlotEngine *nvme_cross_slot_engine_create_with_ops(ChannelRuntime *rt,
     e = calloc(1u, sizeof(*e));
     if (e) {
         uint32_t i;
+        char env_name[64];
+        const char *env;
         e->rt = rt;
         e->ops = *ops;
         e->ops_opaque = opaque;
         e->max_active = rt->cfg && rt->cfg->id == LOW_SPEED_CHANNEL_ID ? 1u : 4u;
+        if (rt->cfg) {
+            snprintf(env_name, sizeof(env_name), "SRC_REAL_NVME_CROSS_SLOT_BATCH_CH%d", rt->cfg->id);
+            env = getenv(env_name);
+            if (!env || !env[0]) env = getenv("SRC_REAL_NVME_CROSS_SLOT_BATCH");
+            if (env && env[0]) {
+                char *end = NULL; unsigned long value = strtoul(env, &end, 0);
+                if (end != env && *end == '\0' && value > 0u && value <= NVME_PENDING_CAPACITY)
+                    e->max_active = (uint32_t)value;
+            }
+        }
         for (i = 0u; i < NVME_PENDING_CAPACITY; ++i) e->contexts[i].slot = UINT32_MAX;
     }
     return e;

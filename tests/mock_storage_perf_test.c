@@ -12,6 +12,10 @@ int main(void)
     storage_ipc_make_event(&e, STORAGE_WORKER_PERF_SAMPLE, 1u, 0, 42u, "sample");
     assert(storage_perf_log_event(&e, "task") == 0);
     storage_perf_log_close(); f = fopen("/tmp/mock_storage_perf.log", "r"); assert(f);
-    assert(fgets(line, sizeof(line), f) && strstr(line, "task=task") && strstr(line, "bytes=42")); fclose(f);
+    e.perf.dma_bytes_delta = 42u;
+    assert(storage_perf_log_event(&e, "task") == 0);
+    storage_perf_log_close(); f = fopen("/tmp/mock_storage_perf.log", "r"); assert(f);
+    assert(fgets(line, sizeof(line), f) && strstr(line, "task=task"));
+    assert(fgets(line, sizeof(line), f) && strstr(line, "dma_delta=42")); fclose(f);
     puts("mock_storage_perf_test: ok"); return 0;
 }

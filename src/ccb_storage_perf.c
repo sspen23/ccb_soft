@@ -20,10 +20,13 @@ int storage_perf_log_event(const StorageWorkerEvent *e, const char *task)
 {
     char line[512]; int n; int fd;
     if (!e || (fd = storage_perf_open()) < 0) return -1;
-    n = snprintf(line, sizeof(line), "storage_event task=%s channel=%u type=%u ts_us=%llu bytes=%llu rc=%d integrity=%u\n",
+    n = snprintf(line, sizeof(line), "storage_event task=%s channel=%u type=%u ts_us=%llu dma_delta=%llu nvme_delta=%llu writable=%u ready=%u busy=%u qd=%u qd_max=%u stall_max_us=%llu integrity=%u\n",
                  task ? task : "", e->channel, e->type,
-                 (unsigned long long)e->timestamp_us, (unsigned long long)e->received_bytes,
-                 e->error_code, e->result.integrity_ok ? 1u : 0u);
+                 (unsigned long long)e->timestamp_us, (unsigned long long)e->perf.dma_bytes_delta,
+                 (unsigned long long)e->perf.nvme_bytes_delta, e->perf.dma_writable,
+                 e->perf.ready_slots, e->perf.nvme_busy_slots, e->perf.active_qd,
+                 e->perf.active_qd_max, (unsigned long long)e->perf.submit_stall_max_us,
+                 e->type == STORAGE_WORKER_PERF_SAMPLE ? e->perf.receive_integrity_ok : (e->result.integrity_ok ? 1u : 0u));
     if (n <= 0 || (size_t)n >= sizeof(line)) return -1;
     return write(fd, line, (size_t)n) == n ? 0 : -1;
 }

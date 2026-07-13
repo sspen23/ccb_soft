@@ -251,6 +251,28 @@ static void storage_emit_event(StorageWorkerEventType type, const ChannelRuntime
     (void)storage_ipc_write_event(fd, &event);
 }
 
+static void storage_emit_perf_event(const ChannelRuntime *rt, const StorageProducerStats *stats,
+                                    const DmaBdSnapshot *bd, uint64_t start_us, uint64_t end_us,
+                                    uint64_t dma_delta, uint64_t nvme_delta)
+{
+    StorageWorkerEvent event;
+    int fd = storage_env_fd("SRC_REAL_STORAGE_EVENT_FD");
+    if (fd < 0 || !rt || !stats || !bd) return;
+    storage_ipc_make_event(&event, STORAGE_WORKER_PERF_SAMPLE, (uint32_t)rt->cfg->id,
+                           0, dma_delta, "perf_sample");
+    event.perf.window_start_us = start_us; event.perf.window_end_us = end_us;
+    event.perf.dma_bytes_delta = dma_delta; event.perf.nvme_bytes_delta = nvme_delta;
+    event.perf.dma_writable = bd->dma_writable; event.perf.completed_unharvested = bd->completed_unharvested;
+    event.perf.ready_slots = bd->ready_slots; event.perf.nvme_busy_slots = bd->nvme_busy_slots;
+    event.perf.requeue_pending = bd->requeue_pending;
+    event.perf.active_qd = __atomic_load_n(&rt->nvme_active_qd_current, __ATOMIC_ACQUIRE);
+    event.perf.active_qd_max = __atomic_load_n(&rt->nvme_active_qd_max, __ATOMIC_ACQUIRE);
+    event.perf.submit_stall_count = __atomic_load_n(&rt->nvme_submit_stall_count, __ATOMIC_ACQUIRE);
+    event.perf.submit_stall_max_us = __atomic_load_n(&rt->nvme_submit_stall_max_us, __ATOMIC_ACQUIRE);
+    event.perf.receive_integrity_ok = stats->receive_integrity_ok ? 1u : 0u;
+    (void)storage_ipc_write_event(fd, &event);
+}
+
 static int storage_wait_start_gate(ChannelRuntime *rt, uint64_t *start_skew_us, const char **gate_mode)
 {
     const char *value = getenv("SRC_REAL_START_FD");
@@ -1681,9 +1703,8 @@ static void storage_stats_print_periodic(StorageProducerStats *stats,
     busy_slots = storage_queue_busy_count(q, NULL);
     print_zero_stats = storage_env_flag_enabled("SRC_REAL_PRINT_ZERO_STATS") != 0;
 
-    if (perf_enabled) {
-        storage_emit_event(STORAGE_WORKER_PERF_SAMPLE, rt, 0, received_delta, "perf_sample");
-    }
+    if (perf_enabled) storage_emit_perf_event(rt, stats, &bd_snapshot, stats->window_start_us,
+                                               now_us, received_delta, nvme_delta);
 
     if (!print_zero_stats && received_delta == 0u && nvme_delta == 0u) {
         if (!stats->idle_printed && received_bytes == 0u && nvme_bytes == 0u) {

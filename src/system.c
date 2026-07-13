@@ -171,12 +171,16 @@ static void storage_supervisor_emit_aggregate(void)
 {
     uint64_t bytes[NUM_CHANNELS] = {0u};
     uint32_t i;
+    const char *task_id = "";
     StorageTaskTerminal status = storage_supervisor_result_status(&g_storage_supervisor);
     if (g_storage_supervisor.aggregate_emitted || status == STORAGE_TASK_ACTIVE) return;
-    for (i = 0u; i < NUM_CHANNELS; ++i) bytes[i] = g_storage_supervisor.final_result[i].file_bytes;
+    for (i = 0u; i < NUM_CHANNELS; ++i) {
+        bytes[i] = g_storage_supervisor.final_result[i].file_bytes;
+        if (task_id[0] == '\0' && storage_tasks[i].task_id[0] != '\0') task_id = storage_tasks[i].task_id;
+    }
     printf("storage_capture_complete task=%s status=%s ch0_bytes=%" PRIu64
            " ch1_bytes=%" PRIu64 " ch2_bytes=%" PRIu64 " integrity_ok=%u reason=%s\n",
-           g_storage_supervisor.final_result[0].task_no,
+           task_id,
            status == STORAGE_TASK_SUCCESS ? "success" : "failed", bytes[0], bytes[1], bytes[2],
            status == STORAGE_TASK_SUCCESS ? 1u : 0u,
            status == STORAGE_TASK_SUCCESS ? "none" : g_storage_supervisor.fatal_reason);
@@ -341,12 +345,12 @@ static bool storage_any_error(void)
 
 static bool storage_task_is_ready(const Task *task)
 {
-    return task && task->state == RUNNING && (task->ready_seen || strstr(task->output, "storage_ready") != NULL);
+    return task && task->state == RUNNING && task->ready_seen;
 }
 
 static bool storage_task_is_started(const Task *task)
 {
-    return task && task->state == RUNNING && (task->running_seen || strstr(task->output, "storage_started") != NULL);
+    return task && task->state == RUNNING && task->running_seen;
 }
 
 static int storage_state_summary(void)
@@ -1475,45 +1479,8 @@ static bool worker_output_has_important_token(const char *text)
 
 static void echo_worker_line(Task *task, const char *line)
 {
-    uint64_t parsed = 0u;
-
     if (!task || !line) {
         return;
-    }
-    if (strncmp(line, "storage_result ", 15u) == 0) {
-        task->final_result_seen = true;
-        task->final_status_success = strstr(line, "status=success") != NULL;
-        if (parse_token_u64(line, "data_persisted=", &parsed) == 0) {
-            task->final_data_persisted = parsed != 0u;
-        }
-        if (parse_token_u64(line, "integrity_ok=", &parsed) == 0) {
-            task->final_integrity_ok = parsed != 0u;
-        }
-    }
-    if (strncmp(line, "storage_result_receive ", 23u) == 0) {
-        task->final_receive_seen =
-            parse_token_u64(line, "dma_received_bytes=", &task->final_dma_received_bytes) == 0;
-        if (storage_tasks[0].final_receive_seen && storage_tasks[1].final_receive_seen &&
-            strcmp(storage_tasks[0].task_id, storage_tasks[1].task_id) == 0 &&
-            storage_tasks[0].final_dma_received_bytes != storage_tasks[1].final_dma_received_bytes) {
-            uint64_t a = storage_tasks[0].final_dma_received_bytes;
-            uint64_t b = storage_tasks[1].final_dma_received_bytes;
-            storage_tasks[0].final_integrity_ok = false;
-            storage_tasks[1].final_integrity_ok = false;
-            storage_tasks[0].final_status_success = false;
-            storage_tasks[1].final_status_success = false;
-            if (!storage_tasks[0].split_mismatch_reported) {
-                storage_tasks[0].split_mismatch_reported = true;
-                storage_tasks[1].split_mismatch_reported = true;
-                system_emit_line("storage_split_channel_check task=%s status=failed"
-                                 " reason=split_channel_byte_mismatch ch0_bytes=%" PRIu64
-                                 " ch1_bytes=%" PRIu64 " delta_bytes=%" PRId64
-                                 " ratio=%.9f",
-                                 storage_tasks[0].task_id, a, b,
-                                 (int64_t)a - (int64_t)b,
-                                 b != 0u ? (double)a / (double)b : 0.0);
-            }
-        }
     }
     if (worker_output_has_important_token(line)) {
         system_write_stdout_line(line);
@@ -1600,7 +1567,7 @@ static void poll_storage_events(Task *task)
         (void)storage_supervisor_handle_event(&g_storage_supervisor, &event);
         storage_supervisor_emit_aggregate();
         {
-            uint32_t stop_mask = storage_supervisor_stop_mask(&g_storage_supervisor);
+            uint32_t stop_mask = storage_supervisor_take_stop_mask(&g_storage_supervisor);
             size_t i;
             for (i = 0u; i < STORAGE_TASK_COUNT; ++i) {
                 if ((stop_mask & (1u << i)) != 0u && storage_tasks[i].state == RUNNING) {
@@ -1639,7 +1606,7 @@ static void poll_storage_events(Task *task)
             }
         }
     }
-    if (rc == 1 && task->event_fd >= 0) { (void)storage_supervisor_handle_worker_eof(&g_storage_supervisor, (uint32_t)task->planned_file.channel_id); close(task->event_fd); task->event_fd = -1; }
+    if (rc == 1 && task->event_fd >= 0) { (void)storage_supervisor_handle_worker_eof(&g_storage_supervisor, (uint32_t)task->planned_file.channel_id); storage_supervisor_emit_aggregate(); close(task->event_fd); task->event_fd = -1; }
 }
 
 static int start_storage_worker(const PlannedFile *planned, const char *task_id, time_t overpass_time)
@@ -1992,7 +1959,7 @@ static int start_storage_workers_barrier(const char *task_id)
                 (task_id && strcmp(task->task_id, task_id) != 0)) continue;
             poll_task_output(task);
             poll_storage_events(task);
-            if (task->armed_seen || (task->event_fd < 0 && storage_task_is_started(task))) ++armed;
+            if (task->armed_seen) ++armed;
         }
         if (armed == target_count) break;
         { struct timespec ts = {0, 1000000L}; (void)clock_nanosleep(CLOCK_MONOTONIC, 0, &ts, NULL); }

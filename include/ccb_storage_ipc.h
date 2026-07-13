@@ -33,6 +33,17 @@ typedef enum {
 } StorageWorkerEventType;
 
 typedef struct {
+    uint64_t window_start_us, window_end_us, dma_bytes_delta, nvme_bytes_delta;
+    uint32_t dma_writable, completed_unharvested, ready_slots, nvme_busy_slots, requeue_pending;
+    uint32_t active_qd, active_qd_max;
+    uint64_t submit_stall_count, submit_stall_max_us;
+    uint64_t writer_schedule_gap_count, writer_schedule_gap_max_us;
+    uint64_t sq_full_wait_count, sq_full_wait_max_us, cq_empty_wait_count, cq_empty_wait_max_us;
+    uint64_t dropped_perf_samples;
+    uint32_t receive_integrity_ok, storage_integrity_ok;
+} StoragePerfSample;
+
+typedef struct {
     uint32_t magic;
     uint16_t version;
     uint16_t size;
@@ -43,6 +54,7 @@ typedef struct {
     uint32_t reserved;
     uint64_t received_bytes;
     char reason[64];
+    StoragePerfSample perf;
     WriteResult result;
 } StorageWorkerEvent;
 
