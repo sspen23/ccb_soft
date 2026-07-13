@@ -27,6 +27,7 @@ SRCS := \
 	src/ccb_storage_diag.c \
 	src/ccb_storage_pipeline.c \
 	src/ccb_storage_supervisor.c \
+	src/ccb_storage_task.c \
 	src/ccb_storage_perf.c \
 	src/ccb_commands.c \
 	src/ccb_tcp_transfer.c
@@ -59,6 +60,9 @@ storage-host-tests:
 	$(CC) $(CFLAGS) -Wformat=2 -Iinclude tests/mock_storage_supervisor_test.c \
 		src/ccb_storage_supervisor.c src/ccb_storage_ipc.c -o /tmp/mock_storage_supervisor_test
 	/tmp/mock_storage_supervisor_test
+	$(CC) $(CFLAGS) -Wformat=2 -Iinclude tests/mock_storage_task_test.c \
+		src/ccb_storage_task.c -o /tmp/mock_storage_task_test
+	/tmp/mock_storage_task_test
 	$(CC) $(CFLAGS) -Wformat=2 -Iinclude tests/mock_storage_perf_test.c \
 		src/ccb_storage_perf.c src/ccb_storage_ipc.c -o /tmp/mock_storage_perf_test
 	/tmp/mock_storage_perf_test

@@ -1,6 +1,178 @@
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
+
 #include "ccb_storage_supervisor.h"
-static StorageWorkerEvent e(uint32_t t,uint32_t c){ StorageWorkerEvent x; storage_ipc_make_event(&x,t,c,0,0,"x"); x.result.data_persisted=x.result.receive_integrity_ok=x.result.storage_integrity_ok=x.result.integrity_ok=true; x.result.dma_received_bytes=x.result.nvme_completed_bytes=x.result.file_bytes=10; return x; }
-int main(void){ StorageTaskSupervisor s; StorageWorkerEvent x; storage_supervisor_init(&s,7); x=e(STORAGE_WORKER_READY,0);assert(!storage_supervisor_handle_event(&s,&x));x=e(STORAGE_WORKER_ARMED,0);assert(!storage_supervisor_handle_event(&s,&x));x=e(STORAGE_WORKER_RUNNING,0);assert(!storage_supervisor_handle_event(&s,&x));x=e(STORAGE_WORKER_FATAL,0);assert(!storage_supervisor_handle_event(&s,&x));assert(storage_supervisor_take_stop_mask(&s)==7);assert(storage_supervisor_take_stop_mask(&s)==0);assert(!storage_supervisor_is_terminal(&s));assert(storage_supervisor_handle_worker_eof(&s,0));assert(storage_supervisor_handle_worker_eof(&s,1));assert(storage_supervisor_handle_worker_eof(&s,2));assert(storage_supervisor_is_terminal(&s)); storage_supervisor_init(&s,1); x=e(STORAGE_WORKER_RUNNING,0);assert(storage_supervisor_handle_event(&s,&x));assert(!storage_supervisor_is_terminal(&s));assert(storage_supervisor_handle_worker_eof(&s,0));assert(storage_supervisor_is_terminal(&s)); storage_supervisor_init(&s,1); x=e(STORAGE_WORKER_FINAL_RESULT,0);assert(!storage_supervisor_handle_event(&s,&x));assert(storage_supervisor_handle_event(&s,&x)); storage_supervisor_init(&s,3); x=e(STORAGE_WORKER_FINAL_RESULT,0);assert(!storage_supervisor_handle_event(&s,&x));x=e(STORAGE_WORKER_FINAL_RESULT,1);x.result.file_bytes=x.result.nvme_completed_bytes=x.result.dma_received_bytes=11;assert(!storage_supervisor_handle_event(&s,&x));assert(storage_supervisor_result_status(&s)==STORAGE_TASK_FAILED); storage_supervisor_init(&s,3); x=e(STORAGE_WORKER_FINAL_RESULT,0);assert(!storage_supervisor_handle_event(&s,&x));x=e(STORAGE_WORKER_FINAL_RESULT,1);assert(!storage_supervisor_handle_event(&s,&x));assert(storage_supervisor_result_status(&s)==STORAGE_TASK_SUCCESS); puts("mock_storage_supervisor_test: ok"); }
+
+static StorageWorkerEvent event(uint32_t type, uint32_t channel)
+{
+    StorageWorkerEvent value;
+
+    storage_ipc_make_event(&value, type, channel, 0, 0u, "worker_fatal");
+    value.result.data_persisted = true;
+    value.result.receive_integrity_ok = true;
+    value.result.storage_integrity_ok = true;
+    value.result.integrity_ok = true;
+    value.result.dma_received_bytes = 10u;
+    value.result.nvme_completed_bytes = 10u;
+    value.result.file_bytes = 10u;
+    return value;
+}
+
+static void assert_reason(const StorageTaskSupervisor *s, const char *reason)
+{
+    assert(s->fatal_reason[0] != '\0');
+    assert(strcmp(s->fatal_reason, reason) == 0);
+}
+
+static void test_worker_exit_without_final(void)
+{
+    StorageTaskSupervisor s;
+
+    storage_supervisor_init(&s, 3u);
+    assert(storage_supervisor_handle_worker_exit(&s, 0u, 7) != 0);
+    assert((s.unavailable_mask & 1u) != 0u);
+    assert_reason(&s, "worker_exit_without_final");
+    assert(!s.aggregate_ready);
+    assert(storage_supervisor_handle_worker_exit(&s, 1u, 0) != 0);
+    assert(s.aggregate_ready);
+    assert(storage_supervisor_result_status(&s) == STORAGE_TASK_FAILED);
+
+    storage_supervisor_init(&s, 1u);
+    assert(storage_supervisor_handle_worker_exit(&s, 0u, 0) != 0);
+    assert_reason(&s, "event_eof_without_final");
+    assert(storage_supervisor_result_status(&s) == STORAGE_TASK_FAILED);
+}
+
+static void test_stop_send_state(void)
+{
+    StorageTaskSupervisor s;
+    StorageWorkerEvent value;
+
+    storage_supervisor_init(&s, 3u);
+    value = event(STORAGE_WORKER_FATAL, 0u);
+    assert(storage_supervisor_handle_event(&s, &value) == 0);
+    assert(storage_supervisor_peek_stop_mask(&s) == 3u);
+    assert(s.stop_sent_mask == 0u);
+
+    storage_supervisor_mark_stop_failed(&s, 0u);
+    assert(storage_supervisor_peek_stop_mask(&s) == 3u);
+    assert((s.stop_failed_mask & 1u) != 0u);
+
+    storage_supervisor_mark_stop_sent(&s, 0u);
+    assert(storage_supervisor_peek_stop_mask(&s) == 2u);
+    assert((s.stop_failed_mask & 1u) == 0u);
+    storage_supervisor_mark_stop_sent(&s, 0u);
+    assert(storage_supervisor_peek_stop_mask(&s) == 2u);
+
+    storage_supervisor_init(&s, 1u);
+    value = event(STORAGE_WORKER_FATAL, 0u);
+    value.reason[0] = '\0';
+    assert(storage_supervisor_handle_event(&s, &value) == 0);
+    assert_reason(&s, "worker_fatal");
+}
+
+static void test_invalid_sequences(void)
+{
+    StorageTaskSupervisor s;
+    StorageWorkerEvent value;
+
+    storage_supervisor_init(&s, 1u);
+    value = event(STORAGE_WORKER_READY, 0u);
+    assert(storage_supervisor_handle_event(&s, &value) == 0);
+    assert(storage_supervisor_handle_event(&s, &value) != 0);
+    assert_reason(&s, "invalid_ready_sequence");
+
+    storage_supervisor_init(&s, 1u);
+    value = event(STORAGE_WORKER_ARMED, 0u);
+    assert(storage_supervisor_handle_event(&s, &value) != 0);
+    assert_reason(&s, "invalid_armed_sequence");
+
+    storage_supervisor_init(&s, 1u);
+    value = event(STORAGE_WORKER_RUNNING, 0u);
+    assert(storage_supervisor_handle_event(&s, &value) != 0);
+    assert_reason(&s, "invalid_running_sequence");
+}
+
+static void test_final_and_aggregate(void)
+{
+    StorageTaskSupervisor s;
+    StorageWorkerEvent value;
+
+    storage_supervisor_init(&s, 3u);
+    value = event(STORAGE_WORKER_FINAL_RESULT, 0u);
+    assert(storage_supervisor_handle_event(&s, &value) == 0);
+    assert(!s.aggregate_ready);
+    assert(storage_supervisor_result_status(&s) == STORAGE_TASK_ACTIVE);
+    assert(storage_supervisor_handle_worker_eof(&s, 0u) == 0);
+    assert(s.final_seen_mask == 1u);
+    assert(s.final_result[0].file_bytes == 10u);
+    assert(!s.aggregate_ready);
+    value = event(STORAGE_WORKER_FINAL_RESULT, 1u);
+    assert(storage_supervisor_handle_event(&s, &value) == 0);
+    assert(s.aggregate_ready);
+    assert(storage_supervisor_result_status(&s) == STORAGE_TASK_SUCCESS);
+
+    storage_supervisor_init(&s, 1u);
+    value = event(STORAGE_WORKER_FINAL_RESULT, 0u);
+    assert(storage_supervisor_handle_event(&s, &value) == 0);
+    assert(storage_supervisor_handle_event(&s, &value) != 0);
+    assert_reason(&s, "duplicate_final");
+    assert(storage_supervisor_result_status(&s) == STORAGE_TASK_FAILED);
+}
+
+static void test_result_failure_reasons(void)
+{
+    StorageTaskSupervisor s;
+    StorageWorkerEvent value;
+
+#define CHECK_RESULT_REASON(field, reason)                                      \
+    do {                                                                        \
+        storage_supervisor_init(&s, 1u);                                        \
+        value = event(STORAGE_WORKER_FINAL_RESULT, 0u);                         \
+        value.result.field = false;                                             \
+        assert(storage_supervisor_handle_event(&s, &value) == 0);               \
+        assert(storage_supervisor_result_status(&s) == STORAGE_TASK_FAILED);    \
+        assert_reason(&s, reason);                                              \
+    } while (0)
+
+    CHECK_RESULT_REASON(receive_integrity_ok, "receive_integrity_failed");
+    CHECK_RESULT_REASON(data_persisted, "storage_integrity_failed");
+    CHECK_RESULT_REASON(storage_integrity_ok, "storage_integrity_failed");
+    CHECK_RESULT_REASON(integrity_ok, "storage_integrity_failed");
+
+#undef CHECK_RESULT_REASON
+
+    storage_supervisor_init(&s, 1u);
+    value = event(STORAGE_WORKER_FINAL_RESULT, 0u);
+    value.result.nvme_completed_bytes = 9u;
+    assert(storage_supervisor_handle_event(&s, &value) == 0);
+    assert_reason(&s, "dma_nvme_byte_mismatch");
+
+    storage_supervisor_init(&s, 1u);
+    value = event(STORAGE_WORKER_FINAL_RESULT, 0u);
+    value.result.file_bytes = 9u;
+    assert(storage_supervisor_handle_event(&s, &value) == 0);
+    assert_reason(&s, "nvme_file_byte_mismatch");
+
+    storage_supervisor_init(&s, 3u);
+    value = event(STORAGE_WORKER_FINAL_RESULT, 0u);
+    assert(storage_supervisor_handle_event(&s, &value) == 0);
+    value = event(STORAGE_WORKER_FINAL_RESULT, 1u);
+    value.result.dma_received_bytes = 11u;
+    value.result.nvme_completed_bytes = 11u;
+    value.result.file_bytes = 11u;
+    assert(storage_supervisor_handle_event(&s, &value) == 0);
+    assert_reason(&s, "split_channel_byte_mismatch");
+}
+
+int main(void)
+{
+    test_worker_exit_without_final();
+    test_stop_send_state();
+    test_invalid_sequences();
+    test_final_and_aggregate();
+    test_result_failure_reasons();
+    puts("mock_storage_supervisor_test: ok");
+    return 0;
+}

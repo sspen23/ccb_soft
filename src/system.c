@@ -33,6 +33,7 @@
 #include "ccb_metadata.h"
 #include "ccb_storage_ipc.h"
 #include "ccb_storage_supervisor.h"
+#include "ccb_storage_task.h"
 #include "ccb_storage_perf.h"
 #include "ccb_tcp_transfer.h"
 #include "debug_uart.h"
@@ -69,7 +70,6 @@
 
 #define BAUD B115200
 #define TASK_TIMEOUT 300
-#define PROCESS_OUTPUT_BUF 4096
 #define STORAGE_WORKER_ARG "--storage-worker"
 #define STORAGE_WRITE_ARG "storage-write"
 #define DDR_PATTERN_STORE_ARG "ddr-pattern-store"
@@ -95,58 +95,6 @@
 
 /* ================== Task structures ================== */
 
-typedef enum {
-    IDLE,
-    RUNNING,
-    ERROR
-} TaskState;
-
-typedef struct {
-    int channel_id;
-    int proto_file_type_code;
-    const char *file_type_name;
-    uint64_t size_bytes;
-    int file_index;
-    uint64_t start_lba;
-    uint64_t sector_count;
-    uint8_t calibration_type;
-} PlannedFile;
-
-typedef struct {
-    pid_t pid;
-    time_t start_time;
-    TaskState state;
-    char name[32];
-    int output_fd;
-    int control_fd;
-    int event_fd;
-    StorageWorkerEvent worker_event;
-    StorageWorkerEvent first_fatal;
-    WriteResult final_result;
-    uint32_t worker_phase;
-    bool ready_seen;
-    bool armed_seen;
-    bool running_seen;
-    bool drained_seen;
-    bool fatal_seen;
-    char output[PROCESS_OUTPUT_BUF];
-    size_t output_used;
-    char echo_line[2048];
-    size_t echo_line_used;
-    bool final_result_seen;
-    bool final_data_persisted;
-    bool final_integrity_ok;
-    bool final_status_success;
-    bool final_receive_seen;
-    bool split_mismatch_reported;
-    uint64_t final_dma_received_bytes;
-    PlannedFile planned_file;
-    bool has_planned_file;
-    char task_id[12];
-    time_t overpass_time;
-    long timeout_seconds;
-} Task;
-
 typedef struct {
     bool valid;
     char task_id[12];
@@ -163,9 +111,20 @@ Task storage_tasks[STORAGE_TASK_COUNT] = {
     {.state = IDLE, .name = "storage1", .output_fd = -1, .control_fd = -1, .event_fd = -1, .timeout_seconds = 0},
     {.state = IDLE, .name = "storage2", .output_fd = -1, .control_fd = -1, .event_fd = -1, .timeout_seconds = 0},
 };
-Task transfer_task = {.state = IDLE, .name = "transfer", .output_fd = -1, .timeout_seconds = TASK_TIMEOUT};
+Task transfer_task = {
+    .state = IDLE, .name = "transfer", .output_fd = -1, .control_fd = -1,
+    .event_fd = -1, .timeout_seconds = TASK_TIMEOUT
+};
 LastTaskContext g_last_task = {0};
 static StorageTaskSupervisor g_storage_supervisor;
+
+static void poll_task_output(Task *task);
+static void drain_storage_events(Task *task, bool report_eof);
+static void poll_storage_events(Task *task);
+static void finalize_storage_task(Task *task, int exit_code);
+static void storage_try_send_pending_stops(void);
+static void storage_finish_worker_exit(Task *task, int exit_code, int signal_number);
+static void storage_handle_worker_exit(Task *task, int status);
 
 static void storage_supervisor_emit_aggregate(void)
 {
@@ -188,20 +147,6 @@ static void storage_supervisor_emit_aggregate(void)
 }
 
 static int storage_send_control(Task *task, StorageControlType type, uint64_t timestamp_us);
-static void storage_task_close_fds(Task *task)
-{
-    if (!task) return;
-    if (task->output_fd >= 0) { close(task->output_fd); task->output_fd = -1; }
-    if (task->control_fd >= 0) { close(task->control_fd); task->control_fd = -1; }
-    if (task->event_fd >= 0) { close(task->event_fd); task->event_fd = -1; }
-}
-static void storage_task_reset_runtime(Task *task)
-{
-    if (!task) return;
-    storage_task_close_fds(task); task->state = IDLE; task->has_planned_file = false;
-    task->ready_seen = task->armed_seen = task->running_seen = task->drained_seen = task->fatal_seen = false;
-    task->final_result_seen = false; memset(&task->final_result, 0, sizeof(task->final_result));
-}
 
 int serial_fd = -1;
 static const char *g_program_path = NULL;
@@ -370,51 +315,38 @@ static void stop_all_storage_tasks(void)
 
     for (i = 0; i < STORAGE_TASK_COUNT; ++i) {
         if (storage_tasks[i].state == RUNNING) {
-            kill(storage_tasks[i].pid, SIGKILL);
-            (void)waitpid(storage_tasks[i].pid, NULL, 0);
-            storage_task_close_fds(&storage_tasks[i]);
-            storage_tasks[i].state = ERROR;
-            storage_tasks[i].has_planned_file = false;
+            int status = 0;
+            pid_t ret;
+
+            (void)kill(storage_tasks[i].pid, SIGKILL);
+            do {
+                ret = waitpid(storage_tasks[i].pid, &status, 0);
+            } while (ret < 0 && errno == EINTR);
+            if (ret > 0) {
+                storage_handle_worker_exit(&storage_tasks[i], status);
+            } else {
+                storage_finish_worker_exit(&storage_tasks[i], 1, 0);
+            }
         }
     }
+    storage_try_send_pending_stops();
+    storage_supervisor_emit_aggregate();
 }
 
 static int request_storage_stop_all(void)
 {
     size_t i;
     int requested = 0;
+    uint32_t stop_mask = 0u;
 
     for (i = 0; i < STORAGE_TASK_COUNT; ++i) {
         if (storage_tasks[i].state == RUNNING) {
-            if (storage_tasks[i].control_fd >= 0) {
-                if (storage_send_control(&storage_tasks[i], STORAGE_CTRL_STOP,
-                                         storage_ipc_monotonic_us()) == 0) {
-                    ++requested;
-                    continue;
-                }
-            }
-            if (kill(storage_tasks[i].pid, SIGTERM) == 0) {
-                ++requested;
-                LOG_INFO("STORAGE", "Stop requested: name=%s pid=%d task=%s",
-                         storage_tasks[i].name,
-                         storage_tasks[i].pid,
-                         storage_tasks[i].task_id);
-                dbg_printf("[DBG][STORAGE] stop requested name=%s pid=%d task=%s\n",
-                           storage_tasks[i].name,
-                           storage_tasks[i].pid,
-                           storage_tasks[i].task_id);
-            } else {
-                LOG_ERROR("STORAGE", "Stop request failed: name=%s pid=%d errno=%d",
-                          storage_tasks[i].name,
-                          storage_tasks[i].pid,
-                          errno);
-                dbg_printf("[DBG][STORAGE] stop request failed name=%s pid=%d errno=%d\n",
-                           storage_tasks[i].name,
-                           storage_tasks[i].pid,
-                           errno);
-            }
+            stop_mask |= 1u << i;
+            ++requested;
         }
     }
+    storage_supervisor_request_stop(&g_storage_supervisor, stop_mask);
+    storage_try_send_pending_stops();
     return requested;
 }
 
@@ -749,16 +681,83 @@ int serial_send(uint8_t *buf, int len)
 
 /* ================== Task control ================== */
 
-static void poll_task_output(Task *task);
-static void poll_storage_events(Task *task);
-static void finalize_storage_task(Task *task, int exit_code);
-
 static int storage_send_control(Task *task, StorageControlType type, uint64_t timestamp_us)
 {
     StorageControlMessage msg;
+    ssize_t written;
+
     if (!task || task->control_fd < 0) return -1;
     storage_ipc_make_control(&msg, type, timestamp_us);
+    if (type == STORAGE_CTRL_STOP) {
+        written = write(task->control_fd, &msg, sizeof(msg));
+        if (written == (ssize_t)sizeof(msg)) return 0;
+        if (written >= 0) errno = EIO;
+        return -1;
+    }
     return storage_ipc_write_control(task->control_fd, &msg);
+}
+
+#define STORAGE_STOP_MAX_SEND_ATTEMPTS 3u
+
+static void storage_fallback_stop(Task *task, uint32_t channel, int send_errno)
+{
+    int signal_rc;
+    int signal_errno;
+
+    if (!task) return;
+    if (task->control_fd >= 0) {
+        close(task->control_fd);
+        task->control_fd = -1;
+    }
+    signal_rc = kill(task->pid, SIGTERM);
+    signal_errno = errno;
+    if (signal_rc == 0 || signal_errno == ESRCH) {
+        LOG_WARN("STORAGE",
+                 "STOP control failed; SIGTERM fallback requested: name=%s pid=%d ch=%u errno=%d",
+                 task->name, task->pid, (unsigned)channel, send_errno);
+    } else {
+        LOG_ERROR("STORAGE",
+                  "STOP control and SIGTERM fallback failed: name=%s pid=%d ch=%u errno=%d signal_errno=%d",
+                  task->name, task->pid, (unsigned)channel, send_errno, signal_errno);
+    }
+    storage_supervisor_mark_stop_failed(&g_storage_supervisor, channel);
+    task->stop_send_attempts = STORAGE_STOP_MAX_SEND_ATTEMPTS + 1u;
+}
+
+static void storage_try_send_pending_stops(void)
+{
+    uint32_t pending = storage_supervisor_peek_stop_mask(&g_storage_supervisor);
+    size_t i;
+
+    for (i = 0u; i < STORAGE_TASK_COUNT; ++i) {
+        Task *task = &storage_tasks[i];
+        int send_errno;
+
+        if ((pending & (1u << i)) == 0u || task->state != RUNNING ||
+            task->stop_send_attempts > STORAGE_STOP_MAX_SEND_ATTEMPTS) {
+            continue;
+        }
+        if (task->control_fd < 0) {
+            storage_fallback_stop(task, (uint32_t)i, EBADF);
+            continue;
+        }
+        if (storage_send_control(task, STORAGE_CTRL_STOP,
+                                 storage_ipc_monotonic_us()) == 0) {
+            storage_supervisor_mark_stop_sent(&g_storage_supervisor, (uint32_t)i);
+            LOG_INFO("STORAGE", "STOP sent: name=%s pid=%d task=%s",
+                     task->name, task->pid, task->task_id);
+            continue;
+        }
+
+        send_errno = errno;
+        ++task->stop_send_attempts;
+        storage_supervisor_mark_stop_failed(&g_storage_supervisor, (uint32_t)i);
+        if (send_errno != EAGAIN && send_errno != EWOULDBLOCK && send_errno != EINTR) {
+            storage_fallback_stop(task, (uint32_t)i, send_errno);
+        } else if (task->stop_send_attempts >= STORAGE_STOP_MAX_SEND_ATTEMPTS) {
+            storage_fallback_stop(task, (uint32_t)i, send_errno);
+        }
+    }
 }
 
 pid_t start_process(const char *prog, const char *arg)
@@ -801,54 +800,84 @@ void stop_task(Task *task)
     }
 }
 
+static void storage_finish_worker_exit(Task *task, int exit_code, int signal_number)
+{
+    bool is_storage;
+
+    if (!task) return;
+    is_storage = task->has_planned_file;
+
+    /* The child is reaped, so a nonblocking drain now reaches the true pipe end. */
+    poll_task_output(task);
+    if (is_storage) {
+        drain_storage_events(task, false);
+        (void)storage_supervisor_handle_worker_exit(
+            &g_storage_supervisor, (uint32_t)task->planned_file.channel_id, exit_code);
+    }
+    storage_task_close_fds(task);
+
+    if (signal_number != 0) {
+        LOG_ERROR(task->name, "Task terminated by signal %d", signal_number);
+        dbg_printf("[DBG][TASK] %s terminated by signal=%d output=%s\n",
+                   task->name, signal_number, task->output);
+    }
+    task->pid = -1;
+    if (is_storage) {
+        finalize_storage_task(task, exit_code);
+    } else if (exit_code == 0) {
+        task->state = IDLE;
+        LOG_INFO(task->name, "Task finished successfully");
+        printf("%s finished OK\n", task->name);
+    } else {
+        task->state = ERROR;
+        LOG_ERROR(task->name, "Task failed with status %d", exit_code);
+        printf("%s failed\n", task->name);
+    }
+
+    if (is_storage) {
+        storage_try_send_pending_stops();
+        storage_supervisor_emit_aggregate();
+    }
+}
+
+static void storage_handle_worker_exit(Task *task, int status)
+{
+    int exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+    int signal_number = WIFSIGNALED(status) ? WTERMSIG(status) : 0;
+
+    storage_finish_worker_exit(task, exit_code, signal_number);
+}
+
 void check_task(Task *task)
 {
     if (task->state != RUNNING) return;
-    poll_task_output(task);
-    if (task->has_planned_file) poll_storage_events(task);
 
     {
         int status;
         pid_t ret = waitpid(task->pid, &status, WNOHANG);
 
         if (ret == 0) {
+            poll_task_output(task);
+            if (task->has_planned_file) poll_storage_events(task);
             if (task->timeout_seconds > 0 &&
                 time(NULL) - task->start_time > task->timeout_seconds) {
                 LOG_ERROR(task->name, "Task timeout after %ld seconds", task->timeout_seconds);
                 printf("%s timeout\n", task->name);
-                kill(task->pid, SIGKILL);
-                task->state = ERROR;
+                (void)kill(task->pid, SIGKILL);
+                do {
+                    ret = waitpid(task->pid, &status, 0);
+                } while (ret < 0 && errno == EINTR);
+                if (ret > 0) storage_handle_worker_exit(task, status);
+                else storage_finish_worker_exit(task, 1, 0);
             }
             return;
         }
 
         if (ret > 0) {
-            int exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : 1;
-            poll_task_output(task);
-            storage_task_close_fds(task);
-            if (WIFSIGNALED(status)) {
-                task->state = ERROR;
-                LOG_ERROR(task->name, "Task terminated by signal %d", WTERMSIG(status));
-                dbg_printf("[DBG][TASK] %s terminated by signal=%d output=%s\n",
-                           task->name,
-                           WTERMSIG(status),
-                           task->output);
-                if (task->has_planned_file) {
-                    finalize_storage_task(task, exit_code);
-                }
-                return;
-            }
-            if (task->has_planned_file) {
-                finalize_storage_task(task, exit_code);
-            } else if (exit_code == 0) {
-                task->state = IDLE;
-                LOG_INFO(task->name, "Task finished successfully");
-                printf("%s finished OK\n", task->name);
-            } else {
-                task->state = ERROR;
-                LOG_ERROR(task->name, "Task failed with status %d", exit_code);
-                printf("%s failed\n", task->name);
-            }
+            storage_handle_worker_exit(task, status);
+        } else if (ret < 0 && errno != EINTR) {
+            LOG_ERROR(task->name, "waitpid failed: pid=%d errno=%d", task->pid, errno);
+            storage_finish_worker_exit(task, 1, 0);
         }
     }
 }
@@ -1554,34 +1583,25 @@ static void poll_task_output(Task *task)
     }
 }
 
-static void poll_storage_events(Task *task)
+static void drain_storage_events(Task *task, bool report_eof)
 {
     StorageWorkerEvent event;
-    int rc;
+    int rc = -1;
     if (!task || task->event_fd < 0) return;
     while ((rc = storage_ipc_read_event(task->event_fd, &event)) == 0) {
+        int supervisor_rc;
+
         if (event.type == STORAGE_WORKER_PERF_SAMPLE || event.type == STORAGE_WORKER_FATAL ||
             event.type == STORAGE_WORKER_FINAL_RESULT) {
             (void)storage_perf_log_event(&event, task->task_id);
         }
-        (void)storage_supervisor_handle_event(&g_storage_supervisor, &event);
-        storage_supervisor_emit_aggregate();
-        {
-            uint32_t stop_mask = storage_supervisor_take_stop_mask(&g_storage_supervisor);
-            size_t i;
-            for (i = 0u; i < STORAGE_TASK_COUNT; ++i) {
-                if ((stop_mask & (1u << i)) != 0u && storage_tasks[i].state == RUNNING) {
-                    (void)storage_send_control(&storage_tasks[i], STORAGE_CTRL_STOP,
-                                               storage_ipc_monotonic_us());
-                }
-            }
-        }
+        supervisor_rc = storage_supervisor_handle_event(&g_storage_supervisor, &event);
         task->worker_event = event;
         task->worker_phase = event.type;
-        if (event.type == STORAGE_WORKER_READY) task->ready_seen = true;
-        else if (event.type == STORAGE_WORKER_ARMED) task->armed_seen = true;
-        else if (event.type == STORAGE_WORKER_RUNNING) task->running_seen = true;
-        else if (event.type == STORAGE_WORKER_DRAINED) task->drained_seen = true;
+        if (event.type == STORAGE_WORKER_READY && supervisor_rc == 0) task->ready_seen = true;
+        else if (event.type == STORAGE_WORKER_ARMED && supervisor_rc == 0) task->armed_seen = true;
+        else if (event.type == STORAGE_WORKER_RUNNING && supervisor_rc == 0) task->running_seen = true;
+        else if (event.type == STORAGE_WORKER_DRAINED && supervisor_rc == 0) task->drained_seen = true;
         else if (event.type == STORAGE_WORKER_FINAL_RESULT) {
             if (task->final_result_seen) {
                 task->fatal_seen = true;
@@ -1595,18 +1615,23 @@ static void poll_storage_events(Task *task)
             task->final_receive_seen = true;
             task->final_dma_received_bytes = event.result.dma_received_bytes;
         } else if (event.type == STORAGE_WORKER_FATAL && !task->fatal_seen) {
-            size_t i;
             task->fatal_seen = true;
             task->first_fatal = event;
-            for (i = 0; i < STORAGE_TASK_COUNT; ++i) {
-                if (storage_tasks[i].state == RUNNING) {
-                    (void)storage_send_control(&storage_tasks[i], STORAGE_CTRL_STOP,
-                                               storage_ipc_monotonic_us());
-                }
-            }
         }
     }
-    if (rc == 1 && task->event_fd >= 0) { (void)storage_supervisor_handle_worker_eof(&g_storage_supervisor, (uint32_t)task->planned_file.channel_id); storage_supervisor_emit_aggregate(); close(task->event_fd); task->event_fd = -1; }
+    if (rc == 1 && task->event_fd >= 0 && report_eof) {
+        (void)storage_supervisor_handle_worker_eof(
+            &g_storage_supervisor, (uint32_t)task->planned_file.channel_id);
+        close(task->event_fd);
+        task->event_fd = -1;
+    }
+}
+
+static void poll_storage_events(Task *task)
+{
+    drain_storage_events(task, true);
+    storage_try_send_pending_stops();
+    storage_supervisor_emit_aggregate();
 }
 
 static int start_storage_worker(const PlannedFile *planned, const char *task_id, time_t overpass_time)
@@ -1739,17 +1764,9 @@ static int start_storage_worker(const PlannedFile *planned, const char *task_id,
         const char *meta_dir = get_storage_meta_dir();
         char start_fd[16];
         char event_fd[16];
-        size_t inherited;
-        for (inherited = 0u; inherited < STORAGE_TASK_COUNT; ++inherited) {
-            int fds[3] = { storage_tasks[inherited].output_fd,
-                           storage_tasks[inherited].control_fd,
-                           storage_tasks[inherited].event_fd };
-            size_t j;
-            for (j = 0u; j < 3u; ++j) {
-                if (fds[j] >= 0 && fds[j] != control_pipe[0] && fds[j] != event_pipe[1] &&
-                    fds[j] != pipefd[1]) (void)close(fds[j]);
-            }
-        }
+        int keep_fds[3] = { control_pipe[0], event_pipe[1], pipefd[1] };
+        storage_child_close_inherited_fds(storage_tasks, STORAGE_TASK_COUNT,
+                                          keep_fds, 3u);
         setenv("CCB_PROCESS_META_DIR", meta_dir, 1);
         snprintf(start_fd, sizeof(start_fd), "%d", control_pipe[0]);
         setenv("SRC_REAL_START_FD", start_fd, 1);
@@ -1782,6 +1799,12 @@ static int start_storage_worker(const PlannedFile *planned, const char *task_id,
             (void)fcntl(event_pipe[0], F_SETFL, flags | O_NONBLOCK);
         }
     }
+    {
+        int flags = fcntl(control_pipe[1], F_GETFL, 0);
+        if (flags >= 0) {
+            (void)fcntl(control_pipe[1], F_SETFL, flags | O_NONBLOCK);
+        }
+    }
 
     task->pid = pid;
     task->start_time = time(NULL);
@@ -1789,6 +1812,7 @@ static int start_storage_worker(const PlannedFile *planned, const char *task_id,
     task->output_fd = pipefd[0];
     task->control_fd = control_pipe[1];
     task->event_fd = event_pipe[0];
+    task->stop_send_attempts = 0u;
     task->output_used = 0u;
     task->output[0] = '\0';
     task->echo_line_used = 0u;
@@ -1845,8 +1869,6 @@ static int wait_storage_workers_ready(const PlannedFile *planned, int planned_co
 
         for (i = 0; i < planned_count; ++i) {
             Task *task = storage_task_for_channel(planned[i].channel_id);
-            int status = 0;
-            pid_t ret;
 
             if (!task || task->state != RUNNING) {
                 dbg_printf("[DBG][STORAGE] ready wait missing worker task=%s ch=%d\n",
@@ -1854,50 +1876,18 @@ static int wait_storage_workers_ready(const PlannedFile *planned, int planned_co
                 return -1;
             }
 
-            poll_task_output(task);
-            poll_storage_events(task);
+            check_task(task);
+            if (task->state != RUNNING) {
+                LOG_ERROR("STORAGE",
+                          "Storage worker exited before ready: pid=%d ch=%d output=%s",
+                          task->pid, planned[i].channel_id, task->output);
+                dbg_printf("[DBG][STORAGE] worker exited before ready pid=%d ch=%d output=%s\n",
+                           task->pid, planned[i].channel_id, task->output);
+                return -1;
+            }
             if (storage_task_is_ready(task)) {
                 ++ready_count;
                 continue;
-            }
-
-            ret = waitpid(task->pid, &status, WNOHANG);
-            if (ret > 0) {
-                poll_task_output(task);
-                if (task->output_fd >= 0) {
-                    close(task->output_fd);
-                    task->output_fd = -1;
-                }
-                task->state = ERROR;
-                task->has_planned_file = false;
-                LOG_ERROR("STORAGE",
-                          "Storage worker exited before ready: pid=%d ch=%d status=%d output=%s",
-                          task->pid,
-                          planned[i].channel_id,
-                          WIFEXITED(status) ? WEXITSTATUS(status) : 1,
-                          task->output);
-                dbg_printf("[DBG][STORAGE] worker exited before ready pid=%d ch=%d status=%d output=%s\n",
-                           task->pid,
-                           planned[i].channel_id,
-                           WIFEXITED(status) ? WEXITSTATUS(status) : 1,
-                           task->output);
-                return -1;
-            }
-            if (ret < 0 && errno != EINTR) {
-                task->state = ERROR;
-                task->has_planned_file = false;
-                LOG_ERROR("STORAGE",
-                          "Storage worker wait failed before ready: pid=%d ch=%d errno=%d output=%s",
-                          task->pid,
-                          planned[i].channel_id,
-                          errno,
-                          task->output);
-                dbg_printf("[DBG][STORAGE] worker wait failed before ready pid=%d ch=%d errno=%d output=%s\n",
-                           task->pid,
-                           planned[i].channel_id,
-                           errno,
-                           task->output);
-                return -1;
             }
         }
 
@@ -1942,8 +1932,10 @@ static int start_storage_workers_barrier(const char *task_id)
 
     for (i = 0u; i < STORAGE_TASK_COUNT; ++i) {
         Task *task = &storage_tasks[i];
-        if (task->state != RUNNING || task->control_fd < 0 ||
+        if ((g_storage_supervisor.target_channel_mask & (1u << i)) == 0u ||
             (task_id && strcmp(task->task_id, task_id) != 0)) continue;
+        check_task(task);
+        if (task->state != RUNNING || task->control_fd < 0) return -1;
         if (storage_send_control(task, STORAGE_CTRL_ARM, start_us) != 0) {
             return -1;
         }
@@ -1955,10 +1947,10 @@ static int start_storage_workers_barrier(const char *task_id)
         int armed = 0;
         for (i = 0u; i < STORAGE_TASK_COUNT; ++i) {
             Task *task = &storage_tasks[i];
-            if (task->state != RUNNING ||
+            if ((g_storage_supervisor.target_channel_mask & (1u << i)) == 0u ||
                 (task_id && strcmp(task->task_id, task_id) != 0)) continue;
-            poll_task_output(task);
-            poll_storage_events(task);
+            check_task(task);
+            if (task->state != RUNNING) return -1;
             if (task->armed_seen) ++armed;
         }
         if (armed == target_count) break;
@@ -1968,7 +1960,10 @@ static int start_storage_workers_barrier(const char *task_id)
     start_us = storage_ipc_monotonic_us();
     for (i = 0u; i < STORAGE_TASK_COUNT; ++i) {
         Task *task = &storage_tasks[i];
-        if (task->state == RUNNING && (!task_id || strcmp(task->task_id, task_id) == 0) &&
+        if ((g_storage_supervisor.target_channel_mask & (1u << i)) == 0u ||
+            (task_id && strcmp(task->task_id, task_id) != 0)) continue;
+        check_task(task);
+        if (task->state != RUNNING ||
             storage_send_control(task, STORAGE_CTRL_RUN, start_us) != 0) return -1;
     }
     deadline_us = storage_ipc_monotonic_us() + timeout_us;
@@ -1976,8 +1971,10 @@ static int start_storage_workers_barrier(const char *task_id)
         int started = 0;
         for (i = 0u; i < STORAGE_TASK_COUNT; ++i) {
             Task *task = &storage_tasks[i];
-            if (task->state != RUNNING || (task_id && strcmp(task->task_id, task_id) != 0)) continue;
-            poll_storage_events(task);
+            if ((g_storage_supervisor.target_channel_mask & (1u << i)) == 0u ||
+                (task_id && strcmp(task->task_id, task_id) != 0)) continue;
+            check_task(task);
+            if (task->state != RUNNING) return -1;
             if (storage_task_is_started(task)) ++started;
         }
         if (started == target_count) return 0;
@@ -3537,7 +3534,10 @@ static uint8_t start_storage_for_last_task(uint8_t *failure_type)
             if (failure_type) {
                 *failure_type = failure_type_from_acq_type(acq_type);
             }
-            stop_all_storage_tasks();
+            {
+                int stopped = request_storage_stop_all();
+                (void)wait_storage_workers_finished_after_stop(g_last_task.task_id, stopped);
+            }
             (void)task_update_status(g_last_task.task_id, TASK_FAILED);
             dbg_printf("[DBG][CAPTURE] start_storage_worker failed task=%s ch=%d\n",
                        g_last_task.task_id, planned[i].channel_id);
@@ -3548,7 +3548,10 @@ static uint8_t start_storage_for_last_task(uint8_t *failure_type)
         if (failure_type) {
             *failure_type = failure_type_from_acq_type(acq_type);
         }
-        stop_all_storage_tasks();
+        {
+            int stopped = request_storage_stop_all();
+            (void)wait_storage_workers_finished_after_stop(g_last_task.task_id, stopped);
+        }
         (void)task_update_status(g_last_task.task_id, TASK_FAILED);
         dbg_printf("[DBG][CAPTURE] storage ready wait failed task=%s count=%d\n",
                    g_last_task.task_id, planned_count);
@@ -4651,6 +4654,7 @@ int main(int argc, char **argv)
         return run_network_worker_main(argc, argv);
     }
 
+    (void)signal(SIGPIPE, SIG_IGN);
     setenv("CCB_PROCESS_META_DIR", get_storage_meta_dir(), 0);
 
     if (logger_init(LOG_DB_PATH) != 0) {
