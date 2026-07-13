@@ -20,6 +20,9 @@ typedef struct {
     unsigned yield_count;
     unsigned sleep_count;
     uint64_t now_us;
+    unsigned fail_submit_call;
+    unsigned reset_calls;
+    int reset_result;
 } Mock;
 
 static void queue_completion(Mock *mock, uint16_t cid, int error);
@@ -34,6 +37,8 @@ static int submit(void *opaque, uint16_t cid, uint64_t lba, uint32_t sectors, ui
         mock->sq_full_once = 0;
         return 1;
     }
+    if (mock->fail_submit_call != 0u &&
+        mock->submitted_count + 1u == mock->fail_submit_call) return -1;
     mock->submitted[mock->submitted_count++] = cid;
     return 0;
 }
@@ -73,6 +78,13 @@ static void yield_cpu(void *opaque)
     }
 }
 
+static int reset_engine(void *opaque)
+{
+    Mock *mock = opaque;
+    ++mock->reset_calls;
+    return mock->reset_result;
+}
+
 static int done(void *opaque, const NvmeWriteSlotReq *req)
 {
     Mock *mock = opaque;
@@ -109,7 +121,8 @@ static NvmeWriteSlotReq request(uint32_t slot, uint64_t sectors)
 
 static NvmeCrossSlotEngine *engine(ChannelRuntime *rt, Mock *mock)
 {
-    NvmeCrossSlotOps ops = { submit, poll_completion, monotonic_us, sleep_us, yield_cpu };
+    NvmeCrossSlotOps ops = { submit, poll_completion, monotonic_us, sleep_us,
+                             yield_cpu, reset_engine };
     NvmeCrossSlotConfig value = config();
     memset(rt, 0, sizeof(*rt));
     rt->nvme_qd_effective = 4u;
@@ -171,6 +184,9 @@ static void test_completion_failures(void)
     queue_completion(&mock, mock.submitted[0], 0);
     assert(nvme_cross_slot_engine_step(value, 300u, done, &mock) != 0);
     assert(strcmp(nvme_cross_slot_engine_last_error(value), "duplicate_completion_cid") == 0);
+    assert(nvme_cross_slot_engine_state(value) == NVME_CROSS_SLOT_ABORT_REQUESTED);
+    queue_completion(&mock, mock.submitted[1], 0);
+    assert(nvme_cross_slot_engine_drain_abort(value, mock.now_us + 100u) == 0);
     nvme_cross_slot_engine_destroy(value);
 
     memset(&mock, 0, sizeof(mock)); value = engine(&rt, &mock);
@@ -179,6 +195,10 @@ static void test_completion_failures(void)
     queue_completion(&mock, 0xffffu, 0);
     assert(nvme_cross_slot_engine_step(value, 300u, done, &mock) != 0);
     assert(strcmp(nvme_cross_slot_engine_last_error(value), "unknown_completion_cid") == 0);
+    assert(nvme_cross_slot_engine_state(value) == NVME_CROSS_SLOT_ABORT_REQUESTED);
+    queue_completion(&mock, mock.submitted[0], 0);
+    queue_completion(&mock, mock.submitted[1], 0);
+    assert(nvme_cross_slot_engine_drain_abort(value, mock.now_us + 100u) == 0);
     nvme_cross_slot_engine_destroy(value);
 
     memset(&mock, 0, sizeof(mock)); value = engine(&rt, &mock);
@@ -187,6 +207,11 @@ static void test_completion_failures(void)
     queue_completion(&mock, mock.submitted[0], 1);
     assert(nvme_cross_slot_engine_step(value, 300u, done, &mock) != 0);
     assert(strcmp(nvme_cross_slot_engine_last_error(value), "completion_status_error") == 0);
+    assert(nvme_cross_slot_engine_inflight(value) == 1u);
+    queue_completion(&mock, mock.submitted[1], 0);
+    assert(nvme_cross_slot_engine_drain_abort(value, mock.now_us + 100u) == 0);
+    assert(nvme_cross_slot_engine_inflight(value) == 0u);
+    assert(mock.callbacks == 0u);
     nvme_cross_slot_engine_destroy(value);
 }
 
@@ -223,6 +248,7 @@ static void test_capacity_sq_full_and_callback(void)
     queue_completion(&mock, mock.submitted[0], 0);
     assert(nvme_cross_slot_engine_step(value, 300u, done, &mock) != 0);
     assert(strcmp(nvme_cross_slot_engine_last_error(value), "slot_callback_failed") == 0);
+    assert(nvme_cross_slot_engine_drain_abort(value, mock.now_us + 10u) == 0);
     nvme_cross_slot_engine_destroy(value);
 }
 
@@ -272,7 +298,8 @@ static void test_no_progress_timeout(void)
     Mock mock;
     NvmeCrossSlotEngine *value;
     NvmeCrossSlotConfig value_config = config();
-    NvmeCrossSlotOps ops = { submit, poll_completion, monotonic_us, sleep_us, yield_cpu };
+    NvmeCrossSlotOps ops = { submit, poll_completion, monotonic_us, sleep_us,
+                             yield_cpu, reset_engine };
     NvmeWriteSlotReq req = request(8u, 1u);
 
     value_config.busy_poll_us = 0u;
@@ -286,6 +313,66 @@ static void test_no_progress_timeout(void)
     assert(value && nvme_cross_slot_engine_add(value, &req) == 0);
     assert(nvme_cross_slot_engine_step(value, 300u, done, &mock) != 0);
     assert(strcmp(nvme_cross_slot_engine_last_error(value), "no_progress_timeout") == 0);
+    assert(nvme_cross_slot_engine_drain_abort(value, mock.now_us + 2u) == 0);
+    nvme_cross_slot_engine_destroy(value);
+}
+
+static void test_abort_reset_and_submit_failure(void)
+{
+    ChannelRuntime rt;
+    Mock mock;
+    NvmeCrossSlotEngine *value;
+    NvmeWriteSlotReq req = request(9u, 2u);
+
+    memset(&mock, 0, sizeof(mock));
+    value = engine(&rt, &mock);
+    assert(nvme_cross_slot_engine_add(value, &req) == 0);
+    nvme_cross_slot_engine_request_abort(value, "test_abort");
+    nvme_cross_slot_engine_request_abort(value, "ignored_second_abort");
+    assert(nvme_cross_slot_engine_step(value, 300u, done, &mock) != 0);
+    assert(mock.submitted_count == 0u);
+    assert(nvme_cross_slot_engine_drain_abort(value, mock.now_us + 10u) == 0);
+    assert(nvme_cross_slot_engine_is_quiesced(value));
+    nvme_cross_slot_engine_destroy(value);
+
+    memset(&mock, 0, sizeof(mock)); mock.fail_submit_call = 2u;
+    value = engine(&rt, &mock);
+    assert(nvme_cross_slot_engine_add(value, &req) == 0);
+    assert(nvme_cross_slot_engine_step(value, 300u, done, &mock) != 0);
+    assert(strcmp(nvme_cross_slot_engine_last_error(value), "submit_failed") == 0);
+    assert(nvme_cross_slot_engine_inflight(value) == 1u);
+    assert(nvme_cross_slot_engine_drain_abort(value, mock.now_us + 2u) == 0);
+    assert(mock.reset_calls == 1u && nvme_cross_slot_engine_is_quiesced(value));
+    nvme_cross_slot_engine_destroy(value);
+
+    memset(&mock, 0, sizeof(mock)); mock.fail_submit_call = 2u; mock.reset_result = -1;
+    value = engine(&rt, &mock);
+    assert(nvme_cross_slot_engine_add(value, &req) == 0);
+    assert(nvme_cross_slot_engine_step(value, 300u, done, &mock) != 0);
+    assert(nvme_cross_slot_engine_drain_abort(value, mock.now_us + 2u) != 0);
+    assert(mock.reset_calls == 1u);
+    assert(nvme_cross_slot_engine_state(value) == NVME_CROSS_SLOT_FAILED);
+    assert(!nvme_cross_slot_engine_is_quiesced(value));
+    /* Deliberately not destroyed: reset did not confirm DDR-safe quiescence. */
+}
+
+static void test_multislot_error_drains_without_callbacks(void)
+{
+    ChannelRuntime rt;
+    Mock mock;
+    NvmeCrossSlotEngine *value;
+    NvmeWriteSlotReq a = request(10u, 1u), b = request(11u, 1u);
+
+    memset(&mock, 0, sizeof(mock)); value = engine(&rt, &mock);
+    assert(nvme_cross_slot_engine_add(value, &a) == 0);
+    assert(nvme_cross_slot_engine_add(value, &b) == 0);
+    assert(nvme_cross_slot_engine_step(value, 300u, done, &mock) == 0);
+    queue_completion(&mock, mock.submitted[0], 1);
+    queue_completion(&mock, mock.submitted[1], 0);
+    assert(nvme_cross_slot_engine_step(value, 300u, done, &mock) != 0);
+    assert(nvme_cross_slot_engine_drain_abort(value, mock.now_us + 100u) == 0);
+    assert(nvme_cross_slot_engine_inflight(value) == 0u);
+    assert(mock.callbacks == 0u);
     nvme_cross_slot_engine_destroy(value);
 }
 
@@ -296,6 +383,8 @@ int main(void)
     test_capacity_sq_full_and_callback();
     test_stall_policy_and_stats();
     test_no_progress_timeout();
+    test_abort_reset_and_submit_failure();
+    test_multislot_error_drains_without_callbacks();
     puts("mock_nvme_cross_slot_test: ok");
     return 0;
 }

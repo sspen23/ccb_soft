@@ -135,6 +135,7 @@ typedef struct {
     bool producer_done;
     bool run_enabled;
     bool error;
+    bool nvme_engine_quiesced;
     pthread_mutex_t lock;
     pthread_cond_t not_empty;
     pthread_cond_t not_full;
@@ -1191,6 +1192,7 @@ static int storage_queue_init(StorageWriteQueue *q,
     q->task_no = task_no;
     q->cross_slot_qd = cross_slot_qd;
     q->cross_slot_batch = cross_slot_batch;
+    q->nvme_engine_quiesced = true;
     storage_run_state_init(&q->run_state);
     q->backlog_mode = storage_env_flag_enabled("SRC_REAL_WRITER_BACKLOG_MODE") != 0;
     if (pthread_mutex_init(&q->lock, NULL) != 0 ||
@@ -1211,6 +1213,7 @@ static void storage_queue_destroy(StorageWriteQueue *q) {
     if (!q) {
         return;
     }
+    if (!q->nvme_engine_quiesced) return;
     (void)pthread_cond_destroy(&q->not_full);
     (void)pthread_cond_destroy(&q->not_empty);
     (void)pthread_mutex_destroy(&q->lock);
@@ -2287,6 +2290,7 @@ static void *storage_nvme_writer_thread(void *arg) {
 static void *storage_nvme_cross_slot_writer_thread(void *arg) {
     StorageWriteQueue *q = (StorageWriteQueue *)arg;
     NvmeCrossSlotEngine *engine;
+    bool writer_failed = false;
 
     if (!q) {
         return NULL;
@@ -2330,7 +2334,7 @@ static void *storage_nvme_cross_slot_writer_thread(void *arg) {
             pop_rc = 0;
         }
         if (pop_rc < 0) {
-            storage_mark_writer_error(q);
+            writer_failed = true;
             break;
         }
         if (pop_rc > 0) {
@@ -2340,12 +2344,12 @@ static void *storage_nvme_cross_slot_writer_thread(void *arg) {
             req.file_offset = item.file_offset;
             storage_trace_flush_start(q->rt, &item);
             if (nvme_cross_slot_engine_add(engine, &req) != 0) {
-                storage_mark_writer_error(q); break;
+                writer_failed = true; break;
             }
         }
         if (nvme_cross_slot_engine_step(engine, 0u, storage_cross_slot_done_cb, q) != 0) {
             storage_cross_slot_update_stats(q, engine);
-            storage_mark_writer_error(q); break;
+            writer_failed = true; break;
         }
         storage_cross_slot_update_stats(q, engine);
         if (pop_rc == 0 && nvme_cross_slot_engine_active(engine) == 0u) {
@@ -2354,7 +2358,21 @@ static void *storage_nvme_cross_slot_writer_thread(void *arg) {
             break;
         }
     }
-    nvme_cross_slot_engine_destroy(engine);
+    if (writer_failed) {
+        uint64_t now_us = storage_wall_time_us();
+        uint64_t drain_us = q->cross_slot_config.no_progress_timeout_us != 0u
+                                ? q->cross_slot_config.no_progress_timeout_us
+                                : (uint64_t)q->rt->gopt.timeout_us;
+        nvme_cross_slot_engine_request_abort(engine,
+                                             nvme_cross_slot_engine_last_error(engine));
+        (void)nvme_cross_slot_engine_drain_abort(engine, now_us + drain_us);
+        q->nvme_engine_quiesced = nvme_cross_slot_engine_is_quiesced(engine);
+        storage_cross_slot_update_stats(q, engine);
+        storage_mark_writer_error(q);
+    } else {
+        q->nvme_engine_quiesced = nvme_cross_slot_engine_is_quiesced(engine);
+    }
+    if (q->nvme_engine_quiesced) nvme_cross_slot_engine_destroy(engine);
     return NULL;
 }
 
@@ -3587,7 +3605,7 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                  sizeof(producer_stats.receive_integrity_risk), "writer_drain_timeout");
         (void)storage_emit_event(STORAGE_WORKER_FATAL, &rt, -1, dma_received_bytes,
                                  producer_stats.receive_integrity_risk);
-        (void)pthread_cancel(writer_thread);
+        if (!cross_slot_qd) (void)pthread_cancel(writer_thread);
         (void)pthread_join(writer_thread, NULL);
         writer_started = false;
         goto out;
@@ -4051,7 +4069,7 @@ out:
             producer_stats.receive_integrity_ok = false;
             snprintf(producer_stats.receive_integrity_risk,
                      sizeof(producer_stats.receive_integrity_risk), "writer_drain_timeout");
-            (void)pthread_cancel(writer_thread);
+            if (!cross_slot_qd) (void)pthread_cancel(writer_thread);
             (void)pthread_join(writer_thread, NULL);
         }
         writer_started = false;
@@ -4065,8 +4083,10 @@ out:
     if (write_queue_ready) {
         storage_maybe_dump_event_rings(&write_queue, &rt,
                                        rc != 0 || write_queue.error, manual_stop_seen);
-        storage_queue_destroy(&write_queue);
-        write_queue_ready = false;
+        if (write_queue.nvme_engine_quiesced) {
+            storage_queue_destroy(&write_queue);
+            write_queue_ready = false;
+        }
     }
     if (rc != 0) {
         if (result) {
@@ -4217,7 +4237,8 @@ out:
                    bytes_written,
                    total_sectors);
     }
-    channel_runtime_close(&rt);
+    if (!write_queue_ready || write_queue.nvme_engine_quiesced)
+        channel_runtime_close(&rt);
     return rc;
 }
 
