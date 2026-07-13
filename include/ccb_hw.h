@@ -52,8 +52,16 @@ typedef struct {
 
 typedef int (*NvmeWriteSlotDoneCb)(void *opaque, const NvmeWriteSlotReq *req);
 typedef struct NvmeCrossSlotEngine NvmeCrossSlotEngine;
+typedef struct {
+    int (*submit)(void *opaque, uint16_t cid, uint64_t lba, uint32_t sectors, uint64_t ddr_addr);
+    int (*poll_completion)(void *opaque, NvmeCompletion *out);
+    uint64_t (*monotonic_us)(void *opaque);
+    void (*sleep_us)(void *opaque, uint32_t us);
+} NvmeCrossSlotOps;
 
 NvmeCrossSlotEngine *nvme_cross_slot_engine_create(ChannelRuntime *rt);
+NvmeCrossSlotEngine *nvme_cross_slot_engine_create_with_ops(ChannelRuntime *rt,
+                                                             const NvmeCrossSlotOps *ops, void *opaque);
 void nvme_cross_slot_engine_destroy(NvmeCrossSlotEngine *engine);
 int nvme_cross_slot_engine_add(NvmeCrossSlotEngine *engine, const NvmeWriteSlotReq *req);
 int nvme_cross_slot_engine_step(NvmeCrossSlotEngine *engine, uint32_t budget_us,
