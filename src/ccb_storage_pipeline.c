@@ -95,8 +95,19 @@ int storage_pipeline_counts_valid(const StoragePipeline *p)
     const StorageSlotCounts *c;
     if (!p) return 0;
     c = &p->counts;
-    return c->total == c->dma_writable + c->completed_unharvested + c->ready +
+    return c->total == p->capacity &&
+           c->total == c->dma_writable + c->completed_unharvested + c->ready +
                        c->nvme_busy + c->requeue_pending + c->free_count;
+}
+
+uint32_t storage_harvest_limit_for_remaining(uint64_t remaining_bytes,
+                                             uint32_t dma_desc_bytes,
+                                             uint32_t max_batch)
+{
+    uint64_t needed;
+    if (remaining_bytes == 0u || dma_desc_bytes == 0u || max_batch == 0u) return 0u;
+    needed = (remaining_bytes + dma_desc_bytes - 1u) / dma_desc_bytes;
+    return needed < max_batch ? (uint32_t)needed : max_batch;
 }
 
 int storage_pipeline_init(StoragePipeline *p, uint32_t slots)
@@ -154,23 +165,32 @@ int storage_pipeline_mark_completed(StoragePipeline *p, uint32_t slot)
 int storage_queue_push_batch(StoragePipeline *p, const StoragePipelineItem *items,
                              uint32_t item_count)
 {
-    uint32_t i, j;
+    uint32_t i, j, tail;
     if (!p || !items || item_count == 0u) return -1;
     pthread_mutex_lock(&p->lock);
-    if (p->error || item_count > p->capacity - p->count) goto bad;
+    if (p->error || !storage_pipeline_counts_valid(p) ||
+        item_count > p->capacity - p->count || item_count > p->counts.completed_unharvested) goto bad;
     for (i = 0u; i < item_count; ++i) {
-        if (items[i].slot >= p->capacity || p->states[items[i].slot] != STORAGE_SLOT_DMA_COMPLETED_UNHARVESTED)
+        uint64_t expected_sectors;
+        if (items[i].bytes == 0u || items[i].sectors == 0u ||
+            items[i].slot >= p->capacity ||
+            p->states[items[i].slot] != STORAGE_SLOT_DMA_COMPLETED_UNHARVESTED)
             goto bad;
+        expected_sectors = (items[i].bytes + 511u) / 512u;
+        if (items[i].sectors != expected_sectors) goto bad;
         for (j = 0u; j < i; ++j) if (items[j].slot == items[i].slot) goto bad;
     }
+    /* Commit below only performs assignments proven safe by the validation above. */
+    tail = p->tail;
     for (i = 0u; i < item_count; ++i) {
-        p->items[p->tail] = items[i];
-        p->tail = (p->tail + 1u) % p->capacity;
-        ++p->count;
-        if (storage_slot_transition_locked(p, items[i].slot,
-                                           STORAGE_SLOT_DMA_COMPLETED_UNHARVESTED,
-                                           STORAGE_SLOT_READY_FOR_NVME) != 0) goto bad;
+        p->items[tail] = items[i];
+        tail = (tail + 1u) % p->capacity;
+        p->states[items[i].slot] = STORAGE_SLOT_READY_FOR_NVME;
     }
+    p->tail = tail;
+    p->count += item_count;
+    p->counts.completed_unharvested -= item_count;
+    p->counts.ready += item_count;
     pthread_cond_signal(&p->not_empty);
     pthread_mutex_unlock(&p->lock);
     return 0;

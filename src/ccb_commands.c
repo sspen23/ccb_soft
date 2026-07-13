@@ -1143,7 +1143,8 @@ static int storage_local_slot_transition_locked(StorageWriteQueue *q, uint32_t s
     from = storage_local_count_for_state(c, expected); to = storage_local_count_for_state(c, next);
     if (!from || !to || *from == 0u) goto bad;
     --*from; ++*to; q->slot_state[slot] = (uint8_t)next;
-    if (c->total != c->dma_writable + c->completed_unharvested + c->ready +
+    if (c->total != q->capacity ||
+        c->total != c->dma_writable + c->completed_unharvested + c->ready +
                     c->nvme_busy + c->requeue_pending + c->free_count) goto bad;
     return 0;
 bad:
@@ -1238,98 +1239,59 @@ static void storage_queue_record_depth_locked(StorageWriteQueue *q) {
     }
 }
 
-static int storage_queue_push(StorageWriteQueue *q,
-                              uint32_t slot,
-                              uint64_t bytes,
-                              uint64_t chunk_index,
-                              uint64_t file_offset,
-                              uint64_t start_lba,
-                              uint64_t sectors,
-                              uint64_t hw_addr) {
-    if (!q || bytes == 0u) {
-        return 0;
-    }
-    pthread_mutex_lock(&q->lock);
-    if (slot >= q->capacity || q->slot_busy[slot]) {
-        fprintf(stderr,
-                "Duplicate or invalid DDR slot enqueue: channel=%d slot=%u capacity=%u busy=%u\n",
-                q->rt ? q->rt->cfg->id : -1,
-                (unsigned)slot,
-                (unsigned)q->capacity,
-                (slot < q->capacity && q->slot_busy[slot]) ? 1u : 0u);
-        q->error = true;
-        pthread_cond_broadcast(&q->not_empty);
-        pthread_cond_broadcast(&q->not_full);
-        pthread_mutex_unlock(&q->lock);
-        return -1;
-    }
-    if (q->error || q->count == q->capacity) {
-        q->error = true;
-        storage_ring_event(&q->producer_event_ring, STORAGE_EVENT_QUEUE_FULL, q->rt,
-                           q->count, q->capacity, true);
-        pthread_cond_broadcast(&q->not_empty);
-        pthread_mutex_unlock(&q->lock);
-        return -1;
-    }
-    q->slot_busy[slot] = true;
-    ++q->busy_count;
-    q->buffered_bytes += bytes;
-    if (q->busy_count > q->max_busy_count) {
-        q->max_busy_count = q->busy_count;
-    }
-    if (q->buffered_bytes > q->max_buffered_bytes) {
-        q->max_buffered_bytes = q->buffered_bytes;
-    }
-    q->items[q->tail].slot = slot;
-    q->items[q->tail].bytes = bytes;
-    q->items[q->tail].chunk_index = chunk_index;
-    q->items[q->tail].file_offset = file_offset;
-    q->items[q->tail].start_lba = start_lba;
-    q->items[q->tail].sectors = sectors;
-    q->items[q->tail].hw_addr = hw_addr;
-    if (storage_local_slot_transition_locked(q, slot, STORAGE_SLOT_DMA_WRITABLE,
-                                             STORAGE_SLOT_DMA_COMPLETED_UNHARVESTED) != 0 ||
-        storage_local_slot_transition_locked(q, slot, STORAGE_SLOT_DMA_COMPLETED_UNHARVESTED,
-                                             STORAGE_SLOT_READY_FOR_NVME) != 0) goto bad;
-    q->tail = (q->tail + 1u) % q->capacity;
-    ++q->count;
-    storage_queue_record_depth_locked(q);
-    pthread_cond_signal(&q->not_empty);
-    pthread_mutex_unlock(&q->lock);
-    return 0;
-bad:
-    q->error = true;
-    storage_ring_event(&q->producer_event_ring, STORAGE_EVENT_SLOT_STATE_ERROR, q->rt, slot, 0u, true);
-    pthread_cond_broadcast(&q->not_empty);
-    pthread_mutex_unlock(&q->lock);
-    return -1;
-}
 
 /* Producer never waits for writer capacity: validate the complete harvest first. */
 static int storage_local_queue_push_batch(StorageWriteQueue *q, const PendingDdrSlot *items,
                                     uint32_t item_count)
 {
-    uint32_t i, j;
+    uint32_t i, j, tail;
+    uint64_t batch_bytes = 0u;
     if (!q || !items || item_count == 0u) return -1;
     pthread_mutex_lock(&q->lock);
-    if (q->error || item_count > q->capacity - q->count) goto bad;
+    if (q->error || item_count > q->capacity - q->count ||
+        q->slot_counts.total != q->capacity ||
+        q->slot_counts.total != q->slot_counts.dma_writable +
+            q->slot_counts.completed_unharvested + q->slot_counts.ready +
+            q->slot_counts.nvme_busy + q->slot_counts.requeue_pending +
+            q->slot_counts.free_count ||
+        item_count > q->slot_counts.dma_writable) goto bad;
     for (i = 0u; i < item_count; ++i) {
-        if (items[i].bytes == 0u || items[i].slot >= q->capacity || q->slot_busy[items[i].slot]) goto bad;
+        uint64_t expected_sectors;
+        uint64_t ddr_end;
+        if (items[i].bytes == 0u || items[i].bytes > q->rt->dma_desc_bytes ||
+            items[i].sectors == 0u || items[i].slot >= q->capacity ||
+            q->slot_busy[items[i].slot] ||
+            q->slot_state[items[i].slot] != STORAGE_SLOT_DMA_WRITABLE) goto bad;
+        expected_sectors = bytes_to_sectors(items[i].bytes);
+        if (items[i].sectors != expected_sectors ||
+            items[i].hw_addr != q->rt->cfg->ddr_hw_base +
+                                (uint64_t)items[i].slot * q->rt->dma_desc_bytes ||
+            items[i].hw_addr > UINT64_MAX - items[i].bytes) goto bad;
+        ddr_end = items[i].hw_addr + items[i].bytes;
+        if (ddr_end > q->rt->cfg->ddr_hw_base + q->rt->dma_ring_bytes ||
+            batch_bytes > UINT64_MAX - items[i].bytes) goto bad;
+        batch_bytes += items[i].bytes;
         for (j = 0u; j < i; ++j) if (items[j].slot == items[i].slot) goto bad;
     }
+    if (q->buffered_bytes > UINT64_MAX - batch_bytes) goto bad;
+    /* All validation is complete. No operation below may fail. */
+    tail = q->tail;
     for (i = 0u; i < item_count; ++i) {
         uint32_t slot = items[i].slot;
-        if (storage_local_slot_transition_locked(q, slot, STORAGE_SLOT_DMA_WRITABLE,
-                                                 STORAGE_SLOT_DMA_COMPLETED_UNHARVESTED) != 0) goto bad;
-        q->items[q->tail] = items[i];
-        q->tail = (q->tail + 1u) % q->capacity;
-        ++q->count;
+        q->items[tail] = items[i];
+        tail = (tail + 1u) % q->capacity;
         q->slot_busy[slot] = true;
-        ++q->busy_count;
-        q->buffered_bytes += items[i].bytes;
-        if (storage_local_slot_transition_locked(q, slot, STORAGE_SLOT_DMA_COMPLETED_UNHARVESTED,
-                                                 STORAGE_SLOT_READY_FOR_NVME) != 0) goto bad;
+        q->slot_state[slot] = STORAGE_SLOT_DMA_COMPLETED_UNHARVESTED;
+        --q->slot_counts.dma_writable;
+        ++q->slot_counts.completed_unharvested;
+        q->slot_state[slot] = STORAGE_SLOT_READY_FOR_NVME;
+        --q->slot_counts.completed_unharvested;
+        ++q->slot_counts.ready;
     }
+    q->tail = tail;
+    q->count += item_count;
+    q->busy_count += item_count;
+    q->buffered_bytes += batch_bytes;
     if (q->busy_count > q->max_busy_count) q->max_busy_count = q->busy_count;
     if (q->buffered_bytes > q->max_buffered_bytes) q->max_buffered_bytes = q->buffered_bytes;
     storage_queue_record_depth_locked(q);
@@ -1399,8 +1361,6 @@ static uint64_t storage_queue_written_bytes(const StorageWriteQueue *q) {
 }
 
 static void storage_queue_snapshot(StorageWriteQueue *q, StorageQueueSnapshot *out) {
-    uint32_t i;
-
     if (!out) {
         return;
     }
@@ -1424,30 +1384,17 @@ static void storage_queue_snapshot(StorageWriteQueue *q, StorageQueueSnapshot *o
     out->writer_rt_enabled = __atomic_load_n(&q->writer_rt_enabled, __ATOMIC_ACQUIRE);
     out->writer_rt_policy = __atomic_load_n(&q->writer_rt_policy, __ATOMIC_ACQUIRE);
     out->writer_rt_prio = __atomic_load_n(&q->writer_rt_prio, __ATOMIC_ACQUIRE);
-    for (i = 0u; i < q->capacity; ++i) {
-        switch (q->slot_state ? q->slot_state[i] : STORAGE_SLOT_FREE) {
-        case STORAGE_SLOT_FREE:
-            ++out->free_slots;
-            break;
-        case STORAGE_SLOT_DMA_WRITABLE:
-            ++out->dma_writable_slots;
-            break;
-        case STORAGE_SLOT_DMA_COMPLETED_UNHARVESTED:
-            ++out->completed_unharvested_slots;
-            break;
-        case STORAGE_SLOT_READY_FOR_NVME:
-            ++out->ready_for_nvme_slots;
-            break;
-        case STORAGE_SLOT_NVME_BUSY:
-            ++out->nvme_busy_slots;
-            break;
-        case STORAGE_SLOT_REQUEUE_PENDING:
-            ++out->requeue_pending_slots;
-            break;
-        default:
-            break;
-        }
-    }
+    out->free_slots = q->slot_counts.free_count;
+    out->dma_writable_slots = q->slot_counts.dma_writable;
+    out->completed_unharvested_slots = q->slot_counts.completed_unharvested;
+    out->ready_for_nvme_slots = q->slot_counts.ready;
+    out->nvme_busy_slots = q->slot_counts.nvme_busy;
+    out->requeue_pending_slots = q->slot_counts.requeue_pending;
+    if (q->slot_counts.total != q->capacity ||
+        q->slot_counts.total != q->slot_counts.dma_writable +
+            q->slot_counts.completed_unharvested + q->slot_counts.ready +
+            q->slot_counts.nvme_busy + q->slot_counts.requeue_pending +
+            q->slot_counts.free_count) q->error = true;
     pthread_mutex_unlock(&q->lock);
 }
 
@@ -3111,8 +3058,6 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
         bool ring_full_logged = false;
 
         while (!bounded || bytes_captured < requested_size) {
-            uint32_t slot = 0u;
-            uint32_t actual = 0u;
             DmaHarvestItem harvest_items[16];
             uint32_t harvest_count = 0u;
             uint32_t harvest_limit = harvest_batch_max_cfg == 0u ? 1u :
@@ -3120,8 +3065,13 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
             int harvest_rc;
             bool harvest_fatal;
             int h;
-            uint64_t chunk_bytes;
             bool stop_requested = storage_write_stop_requested() != 0 || storage_control_stop_requested();
+
+            if (bounded && stop_state.state == STORAGE_CAPTURE_ACCEPTING) {
+                harvest_limit = storage_harvest_limit_for_remaining(
+                    requested_size - bytes_captured, rt.dma_desc_bytes, harvest_limit);
+                if (harvest_limit == 0u) break;
+            }
 
             if (storage_queue_has_error(&write_queue)) {
                 storage_emit_event(STORAGE_WORKER_FATAL, &rt, -1, dma_received_bytes,
@@ -3374,37 +3324,43 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                                              now_us);
                 continue;
             }
-            if (harvest_count > 1u) {
+            {
                 PendingDdrSlot pending[16];
+                uint64_t batch_base_chunk_index = producer_stats.dma_desc_completed_count;
+                uint64_t batch_base_file_offset = bytes_captured;
+                uint64_t batch_base_lba = next_queue_lba;
+                uint64_t batch_bytes = 0u;
+                uint64_t batch_sectors = 0u;
                 uint32_t i;
 
                 for (i = 0u; i < harvest_count; ++i) {
                     uint64_t queued_bytes = harvest_items[i].actual_bytes;
-                    uint64_t remaining = bounded ? requested_size - bytes_captured : queued_bytes;
+                    uint64_t remaining = bounded
+                        ? requested_size - (batch_base_file_offset + batch_bytes)
+                        : queued_bytes;
                     if (queued_bytes == 0u || queued_bytes > rt.dma_desc_bytes ||
                         (bounded && remaining == 0u)) {
                         producer_stats.receive_integrity_ok = false;
+                        snprintf(producer_stats.receive_integrity_risk,
+                                 sizeof(producer_stats.receive_integrity_risk),
+                                 "invalid_dma_harvest_bytes");
                         storage_ring_event(&write_queue.producer_event_ring,
                                            STORAGE_EVENT_DESCRIPTOR_ERROR, &rt,
                                            queued_bytes, rt.dma_desc_bytes, true);
-                        snprintf(producer_stats.receive_integrity_risk,
-                                 sizeof(producer_stats.receive_integrity_risk), "invalid_dma_harvest_bytes");
                         goto out;
                     }
                     if (bounded && queued_bytes > remaining) queued_bytes = remaining;
                     memset(&pending[i], 0, sizeof(pending[i]));
                     pending[i].slot = harvest_items[i].slot;
                     pending[i].bytes = queued_bytes;
-                    pending[i].chunk_index = producer_stats.dma_desc_completed_count + i;
-                    pending[i].file_offset = bytes_captured;
-                    pending[i].start_lba = next_queue_lba;
+                    pending[i].chunk_index = batch_base_chunk_index + i;
+                    pending[i].file_offset = batch_base_file_offset + batch_bytes;
+                    pending[i].start_lba = batch_base_lba + batch_sectors;
                     pending[i].sectors = bytes_to_sectors(queued_bytes);
                     pending[i].hw_addr = rt.cfg->ddr_hw_base +
                                          (uint64_t)pending[i].slot * rt.dma_desc_bytes;
-                    bytes_captured += queued_bytes;
-                    dma_received_bytes += harvest_items[i].actual_bytes;
-                    next_queue_lba += pending[i].sectors;
-                    storage_stats_record_dma_desc(&producer_stats, storage_wall_time_us());
+                    batch_bytes += queued_bytes;
+                    batch_sectors += pending[i].sectors;
                 }
                 if (storage_local_queue_push_batch(&write_queue, pending, harvest_count) != 0) {
                     storage_ring_event(&write_queue.producer_event_ring,
@@ -3414,140 +3370,27 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                                        "storage_queue_full_or_state_error");
                     goto out;
                 }
-                if (harvest_fatal) {
-                    producer_stats.receive_integrity_ok = false;
-                    snprintf(producer_stats.receive_integrity_risk,
-                             sizeof(producer_stats.receive_integrity_risk), "dma_harvest_failed");
-                    storage_emit_event(STORAGE_WORKER_FATAL, &rt, -1, dma_received_bytes,
-                                       producer_stats.receive_integrity_risk);
-                    goto out;
-                }
+                bytes_captured = batch_base_file_offset + batch_bytes;
+                dma_received_bytes += batch_bytes;
+                next_queue_lba = batch_base_lba + batch_sectors;
+                for (i = 0u; i < harvest_count; ++i)
+                    storage_stats_record_dma_desc(&producer_stats, storage_wall_time_us());
+                ring_full_logged = false;
                 saw_dma_data = true;
+                idle_notice_logged = false;
                 last_dma_us = storage_wall_time_us();
-                storage_stats_finish_harvest_batch(&producer_stats);
-                continue;
-            }
-            slot = harvest_items[0].slot;
-            actual = harvest_items[0].actual_bytes;
-            ring_full_logged = false;
-            saw_dma_data = true;
-            idle_notice_logged = false;
-            last_dma_us = storage_wall_time_us();
-            storage_stats_record_dma_desc(&producer_stats, last_dma_us);
-
-            chunk_bytes = actual;
-            if (chunk_bytes == 0u || chunk_bytes > rt.dma_desc_bytes) {
-                fprintf(stderr, "Invalid DMA harvest bytes=%" PRIu64 " on channel %d\n", chunk_bytes, cfg->id);
-                goto out;
-            }
-            {
-                uint64_t chunk_index = producer_stats.dma_desc_completed_count - 1u;
-                uint64_t file_offset = bytes_captured;
-                uint32_t status = rt.dma_last_completed_status;
-                if (storage_trace_chunk_enabled(chunk_index, slot)) {
-                    printf("storage_dma_chunk_trace phase=harvest channel=%d chunk=%" PRIu64
-                           " chunk_ordinal=%" PRIu64 " slot=%u file_offset=%" PRIu64
-                           " status=0x%08x actual_bytes=%u desc_bytes=%u"
-                           " rxsof=%u rxeof=%u hw_owned=%u\n",
-                           cfg->id,
-                           chunk_index,
-                           chunk_index + 1u,
-                           (unsigned)slot,
-                           file_offset,
-                           status,
-                           (unsigned)actual,
-                           (unsigned)rt.dma_desc_bytes,
-                           (status & STORAGE_DESC_STS_RXSOF) ? 1u : 0u,
-                           (status & STORAGE_DESC_STS_RXEOF) ? 1u : 0u,
-                           (unsigned)__atomic_load_n(&rt.dma_hw_desc_count, __ATOMIC_ACQUIRE));
-                    fflush(stdout);
-                }
-            }
-            storage_print_slot_fingerprint(&rt, slot, bytes_captured, actual);
-            dma_received_bytes += actual;
-            if (bounded) {
-                uint64_t remaining_write = requested_size - bytes_captured;
-                if (chunk_bytes > remaining_write) {
-                    chunk_bytes = remaining_write;
-                }
-            }
-
-            {
-                uint64_t chunk_index = producer_stats.dma_desc_completed_count - 1u;
-                uint64_t file_offset = bytes_captured;
-                uint64_t chunk_sectors;
-                uint64_t chunk_hw_addr;
-                if (storage_trace_chunk_enabled(chunk_index, slot) &&
-                    chunk_bytes != (uint64_t)actual) {
-                    printf("storage_dma_chunk_trace phase=bounded_trim channel=%d chunk=%" PRIu64
-                           " chunk_ordinal=%" PRIu64 " slot=%u actual_bytes=%u queued_bytes=%" PRIu64
-                           " file_offset=%" PRIu64 "\n",
-                           cfg->id,
-                           chunk_index,
-                           chunk_index + 1u,
-                           (unsigned)slot,
-                           (unsigned)actual,
-                        chunk_bytes,
-                        file_offset);
-                    fflush(stdout);
-                }
-                chunk_sectors = bytes_to_sectors(chunk_bytes);
-                chunk_hw_addr = rt.cfg->ddr_hw_base +
-                                (uint64_t)slot * (uint64_t)rt.dma_desc_bytes;
-                bytes_captured += chunk_bytes;
-                if (storage_queue_push(&write_queue,
-                                       slot,
-                                       chunk_bytes,
-                                       chunk_index,
-                                       file_offset,
-                                       next_queue_lba,
-                                       chunk_sectors,
-                                       chunk_hw_addr) != 0) {
-                    dbg_printf("[DBG][WRITE] queue push failed ch=%d slot=%u bytes=%" PRIu64 "\n",
-                               cfg->id, (unsigned)slot, chunk_bytes);
-                    goto out;
-                }
-                next_queue_lba += chunk_sectors;
                 if (harvest_fatal) {
                     producer_stats.receive_integrity_ok = false;
                     snprintf(producer_stats.receive_integrity_risk,
-                             sizeof(producer_stats.receive_integrity_risk), "dma_harvest_failed");
+                             sizeof(producer_stats.receive_integrity_risk),
+                             "dma_harvest_failed");
                     storage_emit_event(STORAGE_WORKER_FATAL, &rt, -1, dma_received_bytes,
                                        producer_stats.receive_integrity_risk);
                     goto out;
                 }
-            }
-            {
-                uint64_t now_us = storage_wall_time_us();
-                DmaBdSnapshot bd_snapshot;
-                (void)storage_queue_busy_count(&write_queue, &max_busy_slots);
-                (void)storage_queue_buffered_bytes(&write_queue, &max_buffered_bytes);
-                if (storage_capture_bd_snapshot(&producer_stats,
-                                                &write_queue,
-                                                &rt,
-                                                args->task_no,
-                                                effective_file_index,
-                                                dma_received_bytes,
-                                                &bd_snapshot) != 0) {
-                    goto out;
-                }
-                storage_maybe_log_watermark(&producer_stats,
-                                            &write_queue,
-                                            &rt,
-                                            args->task_no,
-                                            effective_file_index,
-                                            dma_received_bytes);
-                storage_stats_print_periodic(&producer_stats,
-                                             &write_queue,
-                                             &rt,
-                                             args->task_no,
-                                             effective_file_index,
-                                             dma_received_bytes,
-                                             now_us);
-            }
-            if (producer_stats.dma_harvest_batch_current >= harvest_batch_max_cfg) {
                 storage_stats_finish_harvest_batch(&producer_stats);
-                sched_yield();
+                if (harvest_count >= harvest_batch_max_cfg) sched_yield();
+                continue;
             }
         }
     }

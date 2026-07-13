@@ -71,6 +71,9 @@ int storage_queue_push_batch(StoragePipeline *p, const StoragePipelineItem *item
 int storage_pipeline_pop(StoragePipeline *p, StoragePipelineItem *out, int wait);
 int storage_pipeline_complete(StoragePipeline *p, uint32_t slot, int requeue);
 int storage_pipeline_counts_valid(const StoragePipeline *p);
+uint32_t storage_harvest_limit_for_remaining(uint64_t remaining_bytes,
+                                             uint32_t dma_desc_bytes,
+                                             uint32_t max_batch);
 void storage_stop_state_init(StorageStopState *state);
 bool storage_stop_state_latch(StorageStopState *state, uint64_t deadline_us);
 int storage_stop_state_advance(StorageStopState *state, StorageCaptureState next);
