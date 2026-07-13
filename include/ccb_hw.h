@@ -53,6 +53,15 @@ typedef struct {
 typedef int (*NvmeWriteSlotDoneCb)(void *opaque, const NvmeWriteSlotReq *req);
 typedef struct NvmeCrossSlotEngine NvmeCrossSlotEngine;
 typedef struct {
+    uint32_t max_active_slots;
+    uint32_t target_qd;
+    uint32_t cq_batch;
+    uint32_t writer_budget_us;
+    uint32_t busy_poll_us;
+    uint32_t empty_sleep_us;
+    uint64_t no_progress_timeout_us;
+} NvmeCrossSlotConfig;
+typedef struct {
     int (*submit)(void *opaque, uint16_t cid, uint64_t lba, uint32_t sectors, uint64_t ddr_addr);
     int (*poll_completion)(void *opaque, NvmeCompletion *out);
     uint64_t (*monotonic_us)(void *opaque);
@@ -60,8 +69,13 @@ typedef struct {
 } NvmeCrossSlotOps;
 
 NvmeCrossSlotEngine *nvme_cross_slot_engine_create(ChannelRuntime *rt);
+NvmeCrossSlotEngine *nvme_cross_slot_engine_create_with_config(
+    ChannelRuntime *rt, const NvmeCrossSlotConfig *config);
 NvmeCrossSlotEngine *nvme_cross_slot_engine_create_with_ops(ChannelRuntime *rt,
                                                              const NvmeCrossSlotOps *ops, void *opaque);
+NvmeCrossSlotEngine *nvme_cross_slot_engine_create_with_ops_config(
+    ChannelRuntime *rt, const NvmeCrossSlotConfig *config,
+    const NvmeCrossSlotOps *ops, void *opaque);
 void nvme_cross_slot_engine_destroy(NvmeCrossSlotEngine *engine);
 int nvme_cross_slot_engine_add(NvmeCrossSlotEngine *engine, const NvmeWriteSlotReq *req);
 int nvme_cross_slot_engine_step(NvmeCrossSlotEngine *engine, uint32_t budget_us,
@@ -69,6 +83,7 @@ int nvme_cross_slot_engine_step(NvmeCrossSlotEngine *engine, uint32_t budget_us,
 uint32_t nvme_cross_slot_engine_active(const NvmeCrossSlotEngine *engine);
 uint32_t nvme_cross_slot_engine_capacity(const NvmeCrossSlotEngine *engine);
 bool nvme_cross_slot_engine_can_accept(const NvmeCrossSlotEngine *engine);
+const char *nvme_cross_slot_engine_last_error(const NvmeCrossSlotEngine *engine);
 
 int nvme_write_slots_qd(ChannelRuntime *rt,
                         const NvmeWriteSlotReq *reqs,

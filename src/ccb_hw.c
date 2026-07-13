@@ -2160,10 +2160,75 @@ struct NvmeCrossSlotEngine {
     NvmeWriteSlotReq reqs[NVME_PENDING_CAPACITY];
     bool active[NVME_PENDING_CAPACITY];
     uint32_t active_count;
-    uint32_t max_active;
+    NvmeCrossSlotConfig config;
     uint32_t global_inflight;
     uint32_t rr_index;
+    bool completed_cid_seen[UINT16_MAX + 1u];
+    char last_error[64];
 };
+
+static int cross_slot_fail(NvmeCrossSlotEngine *e, const char *reason)
+{
+    if (e) {
+        snprintf(e->last_error, sizeof(e->last_error), "%s", reason);
+        nvme_set_last_error(e->rt, reason);
+    }
+    return -1;
+}
+
+static int cross_slot_validate(NvmeCrossSlotEngine *e)
+{
+    uint32_t i, active_count = 0u, pending_count = 0u, inflight_count = 0u;
+    if (!e) return -1;
+    for (i = 0u; i < NVME_PENDING_CAPACITY; ++i) {
+        NvmeSlotWriteContext *ctx = &e->contexts[i];
+        if (!e->active[i]) continue;
+        ++active_count;
+        if (ctx->slot != e->reqs[i].slot || ctx->next_submit_sector > ctx->total_sectors ||
+            ctx->completed_cmds > ctx->submitted_cmds ||
+            ctx->submitted_cmds != ctx->completed_cmds + ctx->inflight_cmds)
+            return cross_slot_fail(e, "context_count_invariant_failed");
+        inflight_count += ctx->inflight_cmds;
+    }
+    if (active_count != e->active_count || active_count > e->config.max_active_slots)
+        return cross_slot_fail(e, "context_count_invariant_failed");
+    for (i = 0u; i < NVME_PENDING_CAPACITY; ++i) {
+        uint32_t j;
+        if (!e->pending[i].valid) continue;
+        ++pending_count;
+        for (j = 0u; j < NVME_PENDING_CAPACITY; ++j)
+            if (e->active[j] && e->contexts[j].slot == e->pending[i].slot) break;
+        if (j == NVME_PENDING_CAPACITY) return cross_slot_fail(e, "pending_cid_state_inconsistent");
+    }
+    if (pending_count != e->global_inflight || inflight_count != e->global_inflight)
+        return cross_slot_fail(e, "submitted_completed_inflight_invariant_failed");
+    return 0;
+}
+
+static int cross_slot_handle_completion(NvmeCrossSlotEngine *e, const NvmeCompletion *completion)
+{
+    NvmePendingCmd *entry;
+    NvmeSlotWriteContext *ctx;
+    if (!e || !completion) return -1;
+    entry = nvme_find_pending_by_cid(e->pending, NVME_PENDING_CAPACITY, completion->cid);
+    if (!entry) return cross_slot_fail(e, e->completed_cid_seen[completion->cid] ?
+                                      "duplicate_completion_cid" : "unknown_completion_cid");
+    ctx = nvme_find_slot_context(e->contexts, NVME_PENDING_CAPACITY, entry->slot);
+    if (!ctx || ctx->inflight_cmds == 0u || e->global_inflight == 0u)
+        return cross_slot_fail(e, "pending_cid_state_inconsistent");
+    if (completion->error) {
+        ++ctx->failed_cmds;
+        entry->valid = false;
+        return cross_slot_fail(e, "completion_status_error");
+    }
+    nvme_record_write_completion(e->rt, entry, e->ops.monotonic_us(e->ops_opaque));
+    entry->valid = false;
+    e->completed_cid_seen[completion->cid] = true;
+    --ctx->inflight_cmds;
+    ++ctx->completed_cmds;
+    --e->global_inflight;
+    return cross_slot_validate(e);
+}
 
 static int cross_slot_real_submit(void *opaque, uint16_t cid, uint64_t lba,
                                   uint32_t sectors, uint64_t ddr_addr)
@@ -2180,31 +2245,43 @@ NvmeCrossSlotEngine *nvme_cross_slot_engine_create(ChannelRuntime *rt)
     return nvme_cross_slot_engine_create_with_ops(rt, &ops, rt);
 }
 
+NvmeCrossSlotEngine *nvme_cross_slot_engine_create_with_config(
+    ChannelRuntime *rt, const NvmeCrossSlotConfig *config)
+{
+    NvmeCrossSlotOps ops = { cross_slot_real_submit, cross_slot_real_poll,
+                             cross_slot_real_time, cross_slot_real_sleep };
+    return nvme_cross_slot_engine_create_with_ops_config(rt, config, &ops, rt);
+}
+
 NvmeCrossSlotEngine *nvme_cross_slot_engine_create_with_ops(ChannelRuntime *rt,
                                                              const NvmeCrossSlotOps *ops, void *opaque)
 {
+    NvmeCrossSlotConfig config = {
+        .max_active_slots = 4u, .target_qd = rt ? rt->nvme_qd_effective : 0u,
+        .cq_batch = rt ? rt->nvme_cq_pop_batch : 1u, .writer_budget_us = 300u,
+        .busy_poll_us = rt ? rt->nvme_busy_poll_us : 0u,
+        .empty_sleep_us = rt ? rt->nvme_poll_sleep_us : 0u,
+        .no_progress_timeout_us = rt ? rt->gopt.timeout_us : 0u,
+    };
+    return nvme_cross_slot_engine_create_with_ops_config(rt, &config, ops, opaque);
+}
+
+NvmeCrossSlotEngine *nvme_cross_slot_engine_create_with_ops_config(
+    ChannelRuntime *rt, const NvmeCrossSlotConfig *config,
+    const NvmeCrossSlotOps *ops, void *opaque)
+{
     NvmeCrossSlotEngine *e;
     if (!rt || !ops || !ops->submit || !ops->poll_completion || !ops->monotonic_us ||
-        rt->nvme_qd_effective == 0u || rt->nvme_qd_effective > NVME_PENDING_CAPACITY) return NULL;
+        !config || config->max_active_slots == 0u || config->target_qd == 0u ||
+        config->cq_batch == 0u || config->max_active_slots > NVME_PENDING_CAPACITY ||
+        config->target_qd > NVME_PENDING_CAPACITY) return NULL;
     e = calloc(1u, sizeof(*e));
     if (e) {
         uint32_t i;
-        char env_name[64];
-        const char *env;
         e->rt = rt;
         e->ops = *ops;
         e->ops_opaque = opaque;
-        e->max_active = rt->cfg && rt->cfg->id == LOW_SPEED_CHANNEL_ID ? 1u : 4u;
-        if (rt->cfg) {
-            snprintf(env_name, sizeof(env_name), "SRC_REAL_NVME_CROSS_SLOT_BATCH_CH%d", rt->cfg->id);
-            env = getenv(env_name);
-            if (!env || !env[0]) env = getenv("SRC_REAL_NVME_CROSS_SLOT_BATCH");
-            if (env && env[0]) {
-                char *end = NULL; unsigned long value = strtoul(env, &end, 0);
-                if (end != env && *end == '\0' && value > 0u && value <= NVME_PENDING_CAPACITY)
-                    e->max_active = (uint32_t)value;
-            }
-        }
+        e->config = *config;
         for (i = 0u; i < NVME_PENDING_CAPACITY; ++i) e->contexts[i].slot = UINT32_MAX;
     }
     return e;
@@ -2216,9 +2293,11 @@ void nvme_cross_slot_engine_destroy(NvmeCrossSlotEngine *engine)
 uint32_t nvme_cross_slot_engine_active(const NvmeCrossSlotEngine *engine)
 { return engine ? engine->active_count : 0u; }
 uint32_t nvme_cross_slot_engine_capacity(const NvmeCrossSlotEngine *engine)
-{ return engine ? engine->max_active : 0u; }
+{ return engine ? engine->config.max_active_slots : 0u; }
 bool nvme_cross_slot_engine_can_accept(const NvmeCrossSlotEngine *engine)
-{ return engine && engine->active_count < engine->max_active; }
+{ return engine && engine->active_count < engine->config.max_active_slots; }
+const char *nvme_cross_slot_engine_last_error(const NvmeCrossSlotEngine *engine)
+{ return engine ? engine->last_error : "invalid_engine"; }
 
 int nvme_cross_slot_engine_add(NvmeCrossSlotEngine *e, const NvmeWriteSlotReq *req)
 {
@@ -2226,13 +2305,15 @@ int nvme_cross_slot_engine_add(NvmeCrossSlotEngine *e, const NvmeWriteSlotReq *r
     if (!e || !req || req->sectors == 0u || req->bytes == 0u) return -1;
     if (!nvme_cross_slot_engine_can_accept(e)) return 1;
     for (i = 0u; i < NVME_PENDING_CAPACITY; ++i) {
-        if (e->active[i] && e->reqs[i].slot == req->slot) return -1;
+        if (e->active[i] && e->reqs[i].slot == req->slot)
+            return cross_slot_fail(e, "duplicate_active_slot");
         if (!e->active[i]) {
             e->active[i] = true; e->reqs[i] = *req;
             memset(&e->contexts[i], 0, sizeof(e->contexts[i]));
             e->contexts[i].slot = req->slot; e->contexts[i].base_lba = req->start_lba;
             e->contexts[i].base_ddr_addr = req->hw_addr; e->contexts[i].total_sectors = req->sectors;
-            e->contexts[i].total_bytes = req->bytes; ++e->active_count; return 0;
+            e->contexts[i].total_bytes = req->bytes; ++e->active_count;
+            return cross_slot_validate(e);
         }
     }
     return 1;
@@ -2245,17 +2326,18 @@ int nvme_cross_slot_engine_step(NvmeCrossSlotEngine *e, uint32_t budget_us,
     uint64_t command_limit;
     uint32_t qd;
     if (!e || !e->rt) return -1;
-    qd = e->rt->nvme_qd_effective;
+    qd = e->config.target_qd;
     command_limit = e->rt->nvme_cmd_sectors ? e->rt->nvme_cmd_sectors : 512u;
     start_us = e->ops.monotonic_us(e->ops_opaque);
     while (e->active_count > 0u) {
         uint32_t i, pops = 0u;
         bool progress = false;
-        while (pops < e->rt->nvme_cq_pop_batch && e->global_inflight > 0u) {
+        uint32_t effective_budget = budget_us != 0u ? budget_us : e->config.writer_budget_us;
+        if (cross_slot_validate(e) != 0) return -1;
+        while (pops < e->config.cq_batch && e->global_inflight > 0u) {
             NvmeCompletion cpl; int prc = e->ops.poll_completion(e->ops_opaque, &cpl);
-            if (prc < 0 || (prc > 0 && nvme_handle_multi_write_completion(e->rt, e->pending,
-                    NVME_PENDING_CAPACITY, e->contexts, NVME_PENDING_CAPACITY,
-                    &e->global_inflight, &cpl) != 0)) return -1;
+            if (prc < 0) return cross_slot_fail(e, "completion_poll_failed");
+            if (prc > 0 && cross_slot_handle_completion(e, &cpl) != 0) return -1;
             if (prc == 0) break;
             progress = true;
             ++pops;
@@ -2264,7 +2346,9 @@ int nvme_cross_slot_engine_step(NvmeCrossSlotEngine *e, uint32_t budget_us,
             NvmeSlotWriteContext *ctx = &e->contexts[i];
             if (e->active[i] && ctx->next_submit_sector == ctx->total_sectors &&
                 ctx->completed_cmds == ctx->submitted_cmds && ctx->inflight_cmds == 0u) {
-                if (ctx->failed_cmds != 0u || (done_cb && done_cb(opaque, &e->reqs[i]) != 0)) return -1;
+                if (ctx->failed_cmds != 0u) return cross_slot_fail(e, "completion_status_error");
+                if (done_cb && done_cb(opaque, &e->reqs[i]) != 0)
+                    return cross_slot_fail(e, "slot_callback_failed");
                 e->active[i] = false; e->contexts[i].slot = UINT32_MAX;
                 --e->active_count; progress = true;
             }
@@ -2278,7 +2362,8 @@ int nvme_cross_slot_engine_step(NvmeCrossSlotEngine *e, uint32_t budget_us,
                                                    NVME_PENDING_CAPACITY, &e->rr_index);
             if (index < 0) break;
             ctx = &e->contexts[index]; p = nvme_find_free_pending(e->pending, NVME_PENDING_CAPACITY);
-            if (!p || nvme_alloc_cid(e->rt, e->pending, NVME_PENDING_CAPACITY, &cid) != 0) return -1;
+            if (!p || nvme_alloc_cid(e->rt, e->pending, NVME_PENDING_CAPACITY, &cid) != 0)
+                return cross_slot_fail(e, "pending_cid_state_inconsistent");
             remaining = ctx->total_sectors - ctx->next_submit_sector;
             sectors = (uint32_t)(remaining > command_limit ? command_limit : remaining);
             memset(p, 0, sizeof(*p)); p->valid = true; p->cid = cid; p->slot = ctx->slot;
@@ -2287,11 +2372,13 @@ int nvme_cross_slot_engine_step(NvmeCrossSlotEngine *e, uint32_t budget_us,
             p->sectors = sectors; p->bytes = sectors * NVME_SECTOR_BYTES;
             src = e->ops.submit(e->ops_opaque, cid, p->lba, sectors, p->ddr_addr);
             if (src == 1) { p->valid = false; break; }
-            if (src != 0) { p->valid = false; return -1; }
+            if (src != 0) { p->valid = false; return cross_slot_fail(e, "submit_failed"); }
+            e->completed_cid_seen[cid] = false;
             ctx->next_submit_sector += sectors; ++ctx->submitted_cmds; ++ctx->inflight_cmds;
             ++e->global_inflight; progress = true;
         }
-        if (!progress || (budget_us != 0u && e->ops.monotonic_us(e->ops_opaque) - start_us >= budget_us)) break;
+        if (!progress || (effective_budget != 0u &&
+            e->ops.monotonic_us(e->ops_opaque) - start_us >= effective_budget)) break;
     }
     return 0;
 }

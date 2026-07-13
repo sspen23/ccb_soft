@@ -122,6 +122,7 @@ typedef struct {
     const char *task_no;
     bool cross_slot_qd;
     uint32_t cross_slot_batch;
+    NvmeCrossSlotConfig cross_slot_config;
     bool producer_done;
     bool run_enabled;
     bool error;
@@ -2162,7 +2163,7 @@ static void *storage_nvme_cross_slot_writer_thread(void *arg) {
     }
     if (storage_queue_wait_run(q) != 0) return NULL;
     storage_apply_writer_rt(q);
-    engine = nvme_cross_slot_engine_create(q->rt);
+    engine = nvme_cross_slot_engine_create_with_config(q->rt, &q->cross_slot_config);
     if (!engine) {
         storage_mark_writer_error(q);
         return NULL;
@@ -2190,7 +2191,7 @@ static void *storage_nvme_cross_slot_writer_thread(void *arg) {
                 storage_mark_writer_error(q); break;
             }
         }
-        if (nvme_cross_slot_engine_step(engine, 300u, storage_cross_slot_done_cb, q) != 0) {
+        if (nvme_cross_slot_engine_step(engine, 0u, storage_cross_slot_done_cb, q) != 0) {
             storage_mark_writer_error(q); break;
         }
         if (pop_rc == 0 && nvme_cross_slot_engine_active(engine) == 0u) {
@@ -2553,6 +2554,7 @@ int execute_write_with_result(const ParsedArgs *args, GlobalOptions gopt, WriteR
     uint32_t storage_high_poll_sleep_us;
     uint32_t storage_critical_poll_sleep_us;
     uint32_t cross_slot_batch;
+    NvmeCrossSlotConfig cross_slot_config;
     uint32_t ready_queue_depth_cfg;
     uint32_t harvest_batch_max_cfg;
     uint32_t dma_idle_done_ms;
@@ -2624,6 +2626,27 @@ int execute_write_with_result(const ParsedArgs *args, GlobalOptions gopt, WriteR
         cross_slot_batch = getenv(name) ? storage_env_u32_limit(name, 4u, 32u) :
                            storage_env_u32_limit("SRC_REAL_NVME_CROSS_SLOT_BATCH",
                                                  cfg->id == 2 ? 1u : 4u, 32u);
+        cross_slot_config.max_active_slots = storage_channel_env_u32(
+            cfg, "NVME_CROSS_SLOT_MAX_ACTIVE", "SRC_REAL_NVME_CROSS_SLOT_MAX_ACTIVE",
+            cfg->id == 2 ? 1u : 4u, 64u);
+        cross_slot_config.target_qd = storage_channel_env_u32(
+            cfg, "NVME_CROSS_SLOT_TARGET_QD", "SRC_REAL_NVME_CROSS_SLOT_TARGET_QD",
+            cfg->id == 2 ? 1u : 8u, 64u);
+        cross_slot_config.cq_batch = storage_channel_env_u32(
+            cfg, "NVME_CROSS_SLOT_CQ_BATCH", "SRC_REAL_NVME_CROSS_SLOT_CQ_BATCH",
+            32u, 64u);
+        cross_slot_config.writer_budget_us = storage_channel_env_u32(
+            cfg, "NVME_CROSS_SLOT_WRITER_BUDGET_US", "SRC_REAL_NVME_CROSS_SLOT_WRITER_BUDGET_US",
+            300u, 1000000u);
+        cross_slot_config.busy_poll_us = storage_channel_env_u32(
+            cfg, "NVME_CROSS_SLOT_BUSY_POLL_US", "SRC_REAL_NVME_CROSS_SLOT_BUSY_POLL_US",
+            20u, 1000000u);
+        cross_slot_config.empty_sleep_us = storage_channel_env_u32(
+            cfg, "NVME_CROSS_SLOT_EMPTY_SLEEP_US", "SRC_REAL_NVME_CROSS_SLOT_EMPTY_SLEEP_US",
+            1u, 1000000u);
+        cross_slot_config.no_progress_timeout_us = storage_channel_env_u32(
+            cfg, "NVME_CROSS_SLOT_NO_PROGRESS_TIMEOUT_US", "SRC_REAL_NVME_CROSS_SLOT_NO_PROGRESS_TIMEOUT_US",
+            5000000u, UINT32_MAX);
     }
     dbg_printf("[DBG][WRITE] start ch=%d mode=%s size=%" PRIu64 " task=%s idx=%u lba_auto=%u dry=%u\n",
                cfg->id,
@@ -2776,6 +2799,7 @@ int execute_write_with_result(const ParsedArgs *args, GlobalOptions gopt, WriteR
         fprintf(stderr, "Failed to initialize storage write queue on channel %d\n", cfg->id);
         goto out;
     }
+    write_queue.cross_slot_config = cross_slot_config;
     write_queue_ready = true;
     printf("nvme_scheduler_config channel=%d mode=%s qd=%u cmd_size=%u max_dts=%u batch=%u\n",
            cfg->id,
