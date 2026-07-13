@@ -74,7 +74,7 @@ static int storage_ipc_control_valid(const StorageControlMessage *msg)
            msg->type >= STORAGE_CTRL_ARM && msg->type <= STORAGE_CTRL_STOP;
 }
 
-static int storage_ipc_event_valid(const StorageWorkerEvent *event)
+int storage_ipc_validate_event(const StorageWorkerEvent *event)
 {
     return event && event->magic == STORAGE_IPC_MAGIC &&
            event->version == STORAGE_IPC_VERSION && event->size == sizeof(*event) &&
@@ -86,14 +86,14 @@ int storage_ipc_write_control(int fd, const StorageControlMessage *msg)
 int storage_ipc_read_control(int fd, StorageControlMessage *msg)
 { int rc = storage_ipc_read_full(fd, msg, sizeof(*msg)); return rc == 0 && !storage_ipc_control_valid(msg) ? -1 : rc; }
 int storage_ipc_write_event(int fd, const StorageWorkerEvent *event)
-{ return storage_ipc_event_valid(event) ? storage_ipc_write_full(fd, event, sizeof(*event)) : -1; }
+{ return storage_ipc_validate_event(event) ? storage_ipc_write_full(fd, event, sizeof(*event)) : -1; }
 
 int storage_ipc_try_write_perf(int fd, const StorageWorkerEvent *event,
                                _Atomic uint64_t *dropped_perf_samples)
 {
     ssize_t written;
 
-    if (!storage_ipc_event_valid(event) || event->type != STORAGE_WORKER_PERF_SAMPLE) {
+    if (!storage_ipc_validate_event(event) || event->type != STORAGE_WORKER_PERF_SAMPLE) {
         errno = EINVAL;
         return -1;
     }
@@ -114,7 +114,7 @@ int storage_ipc_write_event_deadline(int fd, const StorageWorkerEvent *event,
 {
     struct pollfd pfd;
 
-    if (!storage_ipc_event_valid(event) || event->type == STORAGE_WORKER_PERF_SAMPLE) {
+    if (!storage_ipc_validate_event(event) || event->type == STORAGE_WORKER_PERF_SAMPLE) {
         errno = EINVAL;
         return -1;
     }
@@ -153,4 +153,10 @@ int storage_ipc_write_event_deadline(int fd, const StorageWorkerEvent *event,
     }
 }
 int storage_ipc_read_event(int fd, StorageWorkerEvent *event)
-{ int rc = storage_ipc_read_full(fd, event, sizeof(*event)); return rc == 0 && !storage_ipc_event_valid(event) ? -1 : rc; }
+{
+    int rc = storage_ipc_read_event_raw(fd, event);
+    return rc == 0 && !storage_ipc_validate_event(event) ? -1 : rc;
+}
+
+int storage_ipc_read_event_raw(int fd, StorageWorkerEvent *event)
+{ return storage_ipc_read_full(fd, event, sizeof(*event)); }

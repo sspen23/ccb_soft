@@ -1587,15 +1587,30 @@ static void drain_storage_events(Task *task, bool report_eof)
 {
     StorageWorkerEvent event;
     int rc = -1;
+    uint32_t expected_channel;
     if (!task || task->event_fd < 0) return;
-    while ((rc = storage_ipc_read_event(task->event_fd, &event)) == 0) {
+    expected_channel = (uint32_t)task->planned_file.channel_id;
+    while ((rc = storage_ipc_read_event_raw(task->event_fd, &event)) == 0) {
         int supervisor_rc;
 
+        supervisor_rc = storage_supervisor_handle_event_for_channel(
+            &g_storage_supervisor, expected_channel, &event);
+        if (supervisor_rc != 0) {
+            StorageWorkerEvent protocol_fatal;
+
+            storage_ipc_make_event(&protocol_fatal, STORAGE_WORKER_FATAL,
+                                   expected_channel, -1, 0u,
+                                   g_storage_supervisor.fatal_reason[0] != '\0'
+                                       ? g_storage_supervisor.fatal_reason
+                                       : "event_protocol_invalid");
+            task->fatal_seen = true;
+            task->first_fatal = protocol_fatal;
+            continue;
+        }
         if (event.type == STORAGE_WORKER_PERF_SAMPLE || event.type == STORAGE_WORKER_FATAL ||
             event.type == STORAGE_WORKER_FINAL_RESULT || event.type == STORAGE_WORKER_DIAG_EVENT) {
             (void)storage_perf_log_event(&event, task->task_id);
         }
-        supervisor_rc = storage_supervisor_handle_event(&g_storage_supervisor, &event);
         task->worker_event = event;
         task->worker_phase = event.type;
         if (event.type == STORAGE_WORKER_READY && supervisor_rc == 0) task->ready_seen = true;
@@ -1618,6 +1633,14 @@ static void drain_storage_events(Task *task, bool report_eof)
             task->fatal_seen = true;
             task->first_fatal = event;
         }
+    }
+    if (rc < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+        storage_supervisor_protocol_fail(&g_storage_supervisor, expected_channel,
+                                         "event_read_integrity_failed");
+        task->fatal_seen = true;
+        storage_ipc_make_event(&task->first_fatal, STORAGE_WORKER_FATAL,
+                               expected_channel, -1, 0u,
+                               "event_read_integrity_failed");
     }
     if (rc == 1 && task->event_fd >= 0 && report_eof) {
         (void)storage_supervisor_handle_worker_eof(

@@ -2,7 +2,31 @@
 #define CCB_STORAGE_PIPELINE_H
 
 #include "ccb_types.h"
+#include <stdbool.h>
 #include <pthread.h>
+
+typedef enum {
+    STORAGE_CAPTURE_ACCEPTING = 0,
+    STORAGE_CAPTURE_STOP_LATCHED,
+    STORAGE_CAPTURE_DMA_QUIESCING,
+    STORAGE_CAPTURE_HARVESTING_COMPLETED,
+    STORAGE_CAPTURE_WRITER_DRAINING,
+    STORAGE_CAPTURE_FINALIZING
+} StorageCaptureState;
+
+typedef struct {
+    StorageCaptureState state;
+    uint64_t deadline_us;
+} StorageStopState;
+
+typedef struct {
+    bool writer_enabled;
+    bool writer_run_ready;
+    bool writer_schedule_failed;
+    bool producer_run_ready;
+    bool producer_schedule_failed;
+    bool running_sent;
+} StorageRunState;
 
 typedef struct {
     uint32_t total;
@@ -47,5 +71,15 @@ int storage_queue_push_batch(StoragePipeline *p, const StoragePipelineItem *item
 int storage_pipeline_pop(StoragePipeline *p, StoragePipelineItem *out, int wait);
 int storage_pipeline_complete(StoragePipeline *p, uint32_t slot, int requeue);
 int storage_pipeline_counts_valid(const StoragePipeline *p);
+void storage_stop_state_init(StorageStopState *state);
+bool storage_stop_state_latch(StorageStopState *state, uint64_t deadline_us);
+int storage_stop_state_advance(StorageStopState *state, StorageCaptureState next);
+bool storage_stop_state_expired(const StorageStopState *state, uint64_t now_us);
+void storage_run_state_init(StorageRunState *state);
+int storage_run_state_enable_writer(StorageRunState *state);
+int storage_run_state_set_writer_ready(StorageRunState *state, bool success);
+int storage_run_state_set_producer_ready(StorageRunState *state, bool success);
+bool storage_run_state_can_emit_running(const StorageRunState *state);
+int storage_run_state_mark_running(StorageRunState *state);
 
 #endif

@@ -3335,8 +3335,9 @@ int dma_init_s2mm_ring(ChannelRuntime *rt, uint32_t dma_desc_bytes)
     return dma_start_s2mm_ring(rt);
 }
 
-int dma_harvest_batch(ChannelRuntime *rt, DmaHarvestItem *items,
-                      uint32_t max_items, uint32_t budget_us, uint32_t *out_count)
+static int dma_harvest_batch_impl(ChannelRuntime *rt, DmaHarvestItem *items,
+                                  uint32_t max_items, uint32_t budget_us,
+                                  uint32_t *out_count, bool allow_halted)
 {
     uint32_t count = 0u;
     uint64_t start_us = 0u;
@@ -3358,7 +3359,8 @@ int dma_harvest_batch(ChannelRuntime *rt, DmaHarvestItem *items,
         uint32_t idx, st, dsr;
         if (__atomic_load_n(&rt->dma_hw_desc_count, __ATOMIC_ACQUIRE) == 0u) break;
         dsr = reg_read32(&rt->dma, S2MM_DMASR);
-        if ((dsr & DMA_ERROR_MASK_S2MM) != 0u || (dsr & DMA_SR_HALT_BIT) != 0u) {
+        if ((dsr & DMA_ERROR_MASK_S2MM) != 0u ||
+            (!allow_halted && (dsr & DMA_SR_HALT_BIT) != 0u)) {
             *out_count = count; return -1;
         }
         desc = (volatile DmaSgDesc *)(void *)rt->desc.virt;
@@ -3378,6 +3380,18 @@ int dma_harvest_batch(ChannelRuntime *rt, DmaHarvestItem *items,
     }
     *out_count = count;
     return 0;
+}
+
+int dma_harvest_batch(ChannelRuntime *rt, DmaHarvestItem *items,
+                      uint32_t max_items, uint32_t budget_us, uint32_t *out_count)
+{
+    return dma_harvest_batch_impl(rt, items, max_items, budget_us, out_count, false);
+}
+
+int dma_harvest_completed_batch(ChannelRuntime *rt, DmaHarvestItem *items,
+                                uint32_t max_items, uint32_t *out_count)
+{
+    return dma_harvest_batch_impl(rt, items, max_items, 0u, out_count, true);
 }
 
 int dma_harvest_one(ChannelRuntime *rt, uint32_t *slot, uint32_t *actual_bytes) {
@@ -3527,9 +3541,9 @@ bool dma_s2mm_tail_incomplete(const ChannelRuntime *rt) {
            (((status & DESC_STS_CMPLT) == 0u) && ((status & DESC_STS_LEN_MASK) != 0u));
 }
 
-DmaStopResult dma_stop_s2mm(ChannelRuntime *rt, DmaStopReport *report) {
+int dma_quiesce_s2mm(ChannelRuntime *rt, uint64_t deadline_us, DmaStopReport *report)
+{
     volatile const DmaSgDesc *desc = NULL;
-    DmaStopResult result = DMA_STOP_FAILED;
     uint32_t control;
     uint32_t next_status = 0u;
     uint32_t hw_owned;
@@ -3538,7 +3552,7 @@ DmaStopResult dma_stop_s2mm(ChannelRuntime *rt, DmaStopReport *report) {
         if (report) {
             memset(report, 0, sizeof(*report));
         }
-        return DMA_STOP_OK;
+        return rt ? 0 : -1;
     }
 
     if (rt->desc.valid && rt->dma_desc_count > 0u &&
@@ -3580,17 +3594,42 @@ DmaStopResult dma_stop_s2mm(ChannelRuntime *rt, DmaStopReport *report) {
         fflush(stdout);
     }
 
-    __atomic_store_n(&rt->dma_hw_desc_count, 0u, __ATOMIC_RELEASE);
-    if (report) {
-        report->reset_attempted = true;
+    reg_write32(&rt->dma, S2MM_DMACR, control & ~DMA_CR_RS_BIT);
+    __sync_synchronize();
+    for (;;) {
+        uint32_t status = reg_read32(&rt->dma, S2MM_DMASR);
+
+        if ((status & DMA_ERROR_MASK_S2MM) != 0u) {
+            errno = EIO;
+            return -1;
+        }
+        if ((status & DMA_SR_HALT_BIT) != 0u) break;
+        if (deadline_us != 0u && wall_time_us() >= deadline_us) {
+            errno = ETIMEDOUT;
+            return -1;
+        }
+        sched_yield();
     }
-    /* Match src_real (1): a storage stop always resets the shared DMA core. */
+
+    if (report) {
+        report->s2mm_cr_after = reg_read32(&rt->dma, S2MM_DMACR);
+        report->s2mm_sr_after = reg_read32(&rt->dma, S2MM_DMASR);
+    }
+    return 0;
+}
+
+DmaStopResult dma_finalize_stop_s2mm(ChannelRuntime *rt, DmaStopReport *report)
+{
+    DmaStopResult result = DMA_STOP_FAILED;
+
+    if (!rt || rt->gopt.dry_run) return rt ? DMA_STOP_OK : DMA_STOP_FAILED;
+    __atomic_store_n(&rt->dma_hw_desc_count, 0u, __ATOMIC_RELEASE);
+    if (report) report->reset_attempted = true;
+    /* Final reset is deliberately after the halted descriptor state was harvested. */
     if (dma_reset_full(rt, "s2mm_stop") != 0) {
-        goto done;
+        return DMA_STOP_FAILED;
     }
     result = DMA_STOP_OK;
-
-done:
     if (report) {
         report->s2mm_cr_after = reg_read32(&rt->dma, S2MM_DMACR);
         report->s2mm_sr_after = reg_read32(&rt->dma, S2MM_DMASR);
@@ -3605,7 +3644,7 @@ done:
                    : (result == DMA_STOP_RESET_RECOVERED ? "soft_reset_recovered" : "failed"),
                reg_read32(&rt->dma, S2MM_DMACR),
                reg_read32(&rt->dma, S2MM_DMASR),
-               next_status,
+               report ? report->next_bd_status : 0u,
                rt->dma_rxsof_count,
                rt->dma_rxeof_count,
                rt->dma_rx_packet_open ? 1u : 0u,
@@ -3613,4 +3652,15 @@ done:
         fflush(stdout);
     }
     return result;
+}
+
+DmaStopResult dma_stop_s2mm(ChannelRuntime *rt, DmaStopReport *report)
+{
+    uint64_t deadline_us;
+
+    if (!rt) return DMA_STOP_FAILED;
+    deadline_us = wall_time_us() + (rt->gopt.timeout_us ? rt->gopt.timeout_us
+                                                        : DEFAULT_TIMEOUT_US);
+    if (dma_quiesce_s2mm(rt, deadline_us, report) != 0) return DMA_STOP_FAILED;
+    return dma_finalize_stop_s2mm(rt, report);
 }

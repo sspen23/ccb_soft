@@ -151,12 +151,16 @@ typedef struct {
 } DmaHarvestItem;
 int dma_harvest_batch(ChannelRuntime *rt, DmaHarvestItem *items,
                       uint32_t max_items, uint32_t budget_us, uint32_t *out_count);
+int dma_harvest_completed_batch(ChannelRuntime *rt, DmaHarvestItem *items,
+                                uint32_t max_items, uint32_t *out_count);
 int dma_harvest_one(ChannelRuntime *rt, uint32_t *slot, uint32_t *actual_bytes);
 int dma_requeue_one(ChannelRuntime *rt, uint32_t slot);
 int dma_get_bd_snapshot(ChannelRuntime *rt,
                         const uint8_t *software_slot_state,
                         DmaBdSnapshot *out);
 bool dma_s2mm_tail_incomplete(const ChannelRuntime *rt);
+int dma_quiesce_s2mm(ChannelRuntime *rt, uint64_t deadline_us, DmaStopReport *report);
+DmaStopResult dma_finalize_stop_s2mm(ChannelRuntime *rt, DmaStopReport *report);
 DmaStopResult dma_stop_s2mm(ChannelRuntime *rt, DmaStopReport *report);
 
 #endif

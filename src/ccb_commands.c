@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include "ccb_commands.h"
 
 #include "ccb_config.h"
@@ -23,8 +24,6 @@
 #include <limits.h>
 #include <fcntl.h>
 
-#define STORAGE_STOP_DRAIN_POLLS_DEFAULT 1000u
-#define STORAGE_STOP_DRAIN_SLEEP_US 1000u
 #define STORAGE_IDLE_NOTICE_MS_DEFAULT 5000u
 #define STORAGE_PIPELINE_STATS_SEC_DEFAULT 5u
 #define STORAGE_POLL_SLEEP_US_DEFAULT 100u
@@ -132,6 +131,7 @@ typedef struct {
     bool cross_slot_qd;
     uint32_t cross_slot_batch;
     NvmeCrossSlotConfig cross_slot_config;
+    StorageRunState run_state;
     bool producer_done;
     bool run_enabled;
     bool error;
@@ -261,16 +261,16 @@ static int storage_env_fd(const char *name)
     return end != value && *end == '\0' && fd >= 0 && fd <= INT_MAX ? (int)fd : -1;
 }
 
-static void storage_emit_event(StorageWorkerEventType type, const ChannelRuntime *rt,
-                               int error_code, uint64_t bytes, const char *reason)
+static int storage_emit_event(StorageWorkerEventType type, const ChannelRuntime *rt,
+                              int error_code, uint64_t bytes, const char *reason)
 {
     StorageWorkerEvent event;
     int fd = storage_env_fd("SRC_REAL_STORAGE_EVENT_FD");
-    if (fd < 0) return;
+    if (fd < 0) return 0;
     storage_ipc_make_event(&event, type, rt && rt->cfg ? (uint32_t)rt->cfg->id : UINT32_MAX,
                            error_code, bytes, reason);
-    (void)storage_ipc_write_event_deadline(fd, &event,
-                                           storage_ipc_monotonic_us() + STORAGE_EVENT_DEADLINE_US);
+    return storage_ipc_write_event_deadline(fd, &event,
+                                            storage_ipc_monotonic_us() + STORAGE_EVENT_DEADLINE_US);
 }
 
 static void storage_emit_perf_event(const ChannelRuntime *rt, const StorageProducerStats *stats,
@@ -363,10 +363,10 @@ static int storage_wait_start_gate(ChannelRuntime *rt, uint64_t *start_skew_us, 
     if (start_skew_us) *start_skew_us = 0u;
     if (gate_mode) *gate_mode = "standalone_immediate";
     if (control_fd >= 0) {
-        storage_emit_event(STORAGE_WORKER_READY, rt, 0, 0u, "ready");
+        if (storage_emit_event(STORAGE_WORKER_READY, rt, 0, 0u, "ready") != 0) return -1;
         if (storage_ipc_read_control(control_fd, &msg) != 0 || msg.type != STORAGE_CTRL_ARM) return -1;
         if (dma_start_s2mm_ring(rt) != 0) return -1;
-        storage_emit_event(STORAGE_WORKER_ARMED, rt, 0, 0u, "armed");
+        if (storage_emit_event(STORAGE_WORKER_ARMED, rt, 0, 0u, "armed") != 0) return -1;
         if (storage_ipc_read_control(control_fd, &msg) != 0 || msg.type != STORAGE_CTRL_RUN) return -1;
         { int flags = fcntl(control_fd, F_GETFL, 0); if (flags >= 0) (void)fcntl(control_fd, F_SETFL, flags | O_NONBLOCK); }
         if (gate_mode) *gate_mode = "software_two_phase_barrier";
@@ -374,7 +374,6 @@ static int storage_wait_start_gate(ChannelRuntime *rt, uint64_t *start_skew_us, 
             uint64_t now_us = storage_wall_time_us();
             *start_skew_us = now_us >= msg.timestamp_us ? now_us - msg.timestamp_us : 0u;
         }
-        storage_emit_event(STORAGE_WORKER_RUNNING, rt, 0, 0u, "running");
         return 0;
     }
     if (!value || value[0] == '\0') return 0;
@@ -799,7 +798,7 @@ static uint32_t storage_dma_idle_done_ms(void)
     return storage_env_u32_limit("SRC_REAL_DMA_IDLE_DONE_MS", 5000u, 3600000u);
 }
 
-static void storage_apply_writer_rt(StorageWriteQueue *q)
+static int storage_apply_writer_rt(StorageWriteQueue *q)
 {
     struct sched_param sp;
     uint32_t prio;
@@ -807,7 +806,7 @@ static void storage_apply_writer_rt(StorageWriteQueue *q)
     int rc;
 
     if (!q || !q->rt) {
-        return;
+        return -1;
     }
     prio = storage_writer_rt_prio(q->rt);
     __atomic_store_n(&q->writer_rt_prio, prio, __ATOMIC_RELEASE);
@@ -816,7 +815,7 @@ static void storage_apply_writer_rt(StorageWriteQueue *q)
         storage_emit_line("storage_writer_scheduler channel=%d effective_policy=other"
                           " effective_prio=0 rt_enabled=0",
                           q->rt->cfg->id);
-        return;
+        return 0;
     }
     memset(&sp, 0, sizeof(sp));
     policy = storage_rt_policy("SRC_REAL_WRITER_RT_POLICY", SCHED_RR);
@@ -838,6 +837,7 @@ static void storage_apply_writer_rt(StorageWriteQueue *q)
                 rc);
         __atomic_store_n(&q->writer_rt_policy, SCHED_OTHER, __ATOMIC_RELEASE);
         __atomic_store_n(&q->writer_rt_prio, 0u, __ATOMIC_RELEASE);
+        return -1;
     }
     storage_emit_line("storage_writer_scheduler channel=%d effective_policy=%s"
                       " effective_prio=%u rt_enabled=%u",
@@ -846,18 +846,19 @@ static void storage_apply_writer_rt(StorageWriteQueue *q)
                                                               __ATOMIC_ACQUIRE)),
                       (unsigned)__atomic_load_n(&q->writer_rt_prio, __ATOMIC_ACQUIRE),
                       __atomic_load_n(&q->writer_rt_enabled, __ATOMIC_ACQUIRE) ? 1u : 0u);
+    return 0;
 }
 
-static void storage_apply_producer_rt(const ChannelRuntime *rt,
-                                      int *effective_policy,
-                                      uint32_t *effective_prio)
+static int storage_apply_producer_rt(const ChannelRuntime *rt,
+                                     int *effective_policy,
+                                     uint32_t *effective_prio)
 {
     struct sched_param sp;
     uint32_t producer_prio;
     int policy;
     int rc;
 
-    if (!rt) return;
+    if (!rt) return -1;
     producer_prio = storage_producer_rt_prio(rt);
     policy = storage_rt_policy("SRC_REAL_PRODUCER_RT_POLICY", SCHED_RR);
     memset(&sp, 0, sizeof(sp));
@@ -869,9 +870,13 @@ static void storage_apply_producer_rt(const ChannelRuntime *rt,
                 rt->cfg->id, storage_rt_policy_name(policy), producer_prio, rc);
         policy = SCHED_OTHER;
         producer_prio = 0u;
+        if (effective_policy) *effective_policy = policy;
+        if (effective_prio) *effective_prio = producer_prio;
+        return -1;
     }
     if (effective_policy) *effective_policy = policy;
     if (effective_prio) *effective_prio = producer_prio;
+    return 0;
 }
 
 static void storage_nvme_timing_snapshot(const ChannelRuntime *rt,
@@ -1186,6 +1191,7 @@ static int storage_queue_init(StorageWriteQueue *q,
     q->task_no = task_no;
     q->cross_slot_qd = cross_slot_qd;
     q->cross_slot_batch = cross_slot_batch;
+    storage_run_state_init(&q->run_state);
     q->backlog_mode = storage_env_flag_enabled("SRC_REAL_WRITER_BACKLOG_MODE") != 0;
     if (pthread_mutex_init(&q->lock, NULL) != 0 ||
         pthread_cond_init(&q->not_empty, NULL) != 0 ||
@@ -2053,13 +2059,95 @@ static int storage_queue_wait_run(StorageWriteQueue *q)
     return rc;
 }
 
-static void storage_queue_enable_run(StorageWriteQueue *q)
+static int storage_queue_enable_run(StorageWriteQueue *q)
+{
+    int rc;
+
+    if (!q) return -1;
+    pthread_mutex_lock(&q->lock);
+    rc = storage_run_state_enable_writer(&q->run_state);
+    if (rc == 0) q->run_enabled = true;
+    pthread_cond_broadcast(&q->not_empty);
+    pthread_mutex_unlock(&q->lock);
+    return rc;
+}
+
+static void storage_queue_set_writer_ready(StorageWriteQueue *q, bool success)
 {
     if (!q) return;
     pthread_mutex_lock(&q->lock);
-    q->run_enabled = true;
+    (void)storage_run_state_set_writer_ready(&q->run_state, success);
+    if (!success) {
+        q->error = true;
+        q->producer_done = true;
+    }
     pthread_cond_broadcast(&q->not_empty);
     pthread_mutex_unlock(&q->lock);
+}
+
+static int storage_queue_wait_writer_ready(StorageWriteQueue *q, uint64_t deadline_us)
+{
+    struct timespec pause = {0, 100000L};
+
+    if (!q) return -1;
+    for (;;) {
+        bool ready;
+        bool failed;
+
+        pthread_mutex_lock(&q->lock);
+        ready = q->run_state.writer_run_ready;
+        failed = q->run_state.writer_schedule_failed || q->error;
+        pthread_mutex_unlock(&q->lock);
+        if (ready) return 0;
+        if (failed) return -1;
+        if (storage_wall_time_us() >= deadline_us) {
+            errno = ETIMEDOUT;
+            return -1;
+        }
+        (void)clock_nanosleep(CLOCK_MONOTONIC, 0, &pause, NULL);
+    }
+}
+
+static int storage_queue_set_producer_ready(StorageWriteQueue *q, bool success)
+{
+    int rc;
+
+    if (!q) return -1;
+    pthread_mutex_lock(&q->lock);
+    rc = storage_run_state_set_producer_ready(&q->run_state, success);
+    pthread_mutex_unlock(&q->lock);
+    return rc;
+}
+
+static int storage_queue_mark_running(StorageWriteQueue *q)
+{
+    int rc;
+
+    if (!q) return -1;
+    pthread_mutex_lock(&q->lock);
+    rc = storage_run_state_mark_running(&q->run_state);
+    pthread_mutex_unlock(&q->lock);
+    return rc;
+}
+
+static int storage_join_writer_deadline(pthread_t thread, uint64_t deadline_us)
+{
+    struct timespec pause = {0, 100000L};
+
+    for (;;) {
+        int rc = pthread_tryjoin_np(thread, NULL);
+
+        if (rc == 0) return 0;
+        if (rc != EBUSY) {
+            errno = rc;
+            return -1;
+        }
+        if (storage_wall_time_us() >= deadline_us) {
+            errno = ETIMEDOUT;
+            return -1;
+        }
+        (void)clock_nanosleep(CLOCK_MONOTONIC, 0, &pause, NULL);
+    }
 }
 
 static uint32_t storage_queue_ready_count(StorageWriteQueue *q)
@@ -2119,7 +2207,14 @@ static void *storage_nvme_writer_thread(void *arg) {
     StorageWriteQueue *q = (StorageWriteQueue *)arg;
 
     if (storage_queue_wait_run(q) != 0) return NULL;
-    storage_apply_writer_rt(q);
+    if (storage_apply_writer_rt(q) != 0) {
+        storage_queue_set_writer_ready(q, false);
+        storage_ring_event(&q->writer_event_ring, STORAGE_EVENT_WORKER_FATAL,
+                           q->rt, 0u, 0u, true);
+        storage_write_request_stop();
+        return NULL;
+    }
+    storage_queue_set_writer_ready(q, true);
     while (1) {
         PendingDdrSlot item;
         uint64_t wait_start_us;
@@ -2197,12 +2292,22 @@ static void *storage_nvme_cross_slot_writer_thread(void *arg) {
         return NULL;
     }
     if (storage_queue_wait_run(q) != 0) return NULL;
-    storage_apply_writer_rt(q);
-    engine = nvme_cross_slot_engine_create_with_config(q->rt, &q->cross_slot_config);
-    if (!engine) {
-        storage_mark_writer_error(q);
+    if (storage_apply_writer_rt(q) != 0) {
+        storage_queue_set_writer_ready(q, false);
+        storage_ring_event(&q->writer_event_ring, STORAGE_EVENT_WORKER_FATAL,
+                           q->rt, 0u, 0u, true);
+        storage_write_request_stop();
         return NULL;
     }
+    engine = nvme_cross_slot_engine_create_with_config(q->rt, &q->cross_slot_config);
+    if (!engine) {
+        storage_queue_set_writer_ready(q, false);
+        storage_ring_event(&q->writer_event_ring, STORAGE_EVENT_WORKER_FATAL,
+                           q->rt, 0u, 0u, true);
+        storage_write_request_stop();
+        return NULL;
+    }
+    storage_queue_set_writer_ready(q, true);
 
     while (1) {
         PendingDdrSlot item;
@@ -2583,10 +2688,12 @@ int execute_write_with_result(const ParsedArgs *args, GlobalOptions gopt, WriteR
     StorageQueueSnapshot final_queue_snapshot;
     DmaStopReport dma_stop_report;
     DmaStopResult dma_stop_result = DMA_STOP_OK;
+    StorageStopState stop_state;
     pthread_t writer_thread;
     bool write_queue_ready = false;
     bool writer_started = false;
     bool dma_started = false;
+    bool dma_quiesced = false;
     bool dma_stop_attempted = false;
     bool manual_stop_seen = false;
     bool tail_incomplete = false;
@@ -2616,6 +2723,7 @@ int execute_write_with_result(const ParsedArgs *args, GlobalOptions gopt, WriteR
     const char *start_gate_mode = "standalone_immediate";
 
     storage_write_reset_stop();
+    storage_stop_state_init(&stop_state);
     atomic_store_explicit(&g_storage_dropped_perf_samples, 0u, memory_order_relaxed);
     memset(&producer_stats, 0, sizeof(producer_stats));
     producer_stats.receive_integrity_ok = true;
@@ -2914,15 +3022,48 @@ int execute_write_with_result(const ParsedArgs *args, GlobalOptions gopt, WriteR
     storage_emit_line("storage_ready channel=%d task=%s file_index=%u start_gate_mode=%s",
                       cfg->id, args->task_no, (unsigned)effective_file_index,
                       getenv("SRC_REAL_START_FD") ? "software_barrier" : "standalone_immediate");
+    dma_started = true;
     if (storage_wait_start_gate(&rt, &start_skew_us, &start_gate_mode) != 0) {
         producer_stats.receive_integrity_ok = false;
         snprintf(producer_stats.receive_integrity_risk,
                  sizeof(producer_stats.receive_integrity_risk), "start_gate_failed");
         goto out;
     }
-    dma_started = true;
-    storage_queue_enable_run(&write_queue);
-    storage_apply_producer_rt(&rt, &producer_rt_policy, &producer_rt_prio);
+    if (storage_queue_enable_run(&write_queue) != 0) {
+        producer_stats.receive_integrity_ok = false;
+        snprintf(producer_stats.receive_integrity_risk,
+                 sizeof(producer_stats.receive_integrity_risk), "writer_enable_failed");
+        goto out;
+    }
+    {
+        uint32_t ready_timeout_us = storage_env_u32_limit(
+            "SRC_REAL_STORAGE_RUN_READY_TIMEOUT_US",
+            rt.gopt.timeout_us ? rt.gopt.timeout_us : DEFAULT_TIMEOUT_US,
+            UINT32_MAX);
+        uint64_t ready_deadline_us = storage_wall_time_us() + ready_timeout_us;
+
+        if (storage_queue_wait_writer_ready(&write_queue, ready_deadline_us) != 0) {
+            producer_stats.receive_integrity_ok = false;
+            snprintf(producer_stats.receive_integrity_risk,
+                     sizeof(producer_stats.receive_integrity_risk),
+                     errno == ETIMEDOUT ? "writer_run_ready_timeout" : "writer_schedule_failed");
+            (void)storage_emit_event(STORAGE_WORKER_FATAL, &rt, -1, 0u,
+                                     producer_stats.receive_integrity_risk);
+            goto out;
+        }
+    }
+    if (storage_apply_producer_rt(&rt, &producer_rt_policy, &producer_rt_prio) != 0 ||
+        storage_queue_set_producer_ready(&write_queue, true) != 0) {
+        producer_stats.receive_integrity_ok = false;
+        snprintf(producer_stats.receive_integrity_risk,
+                 sizeof(producer_stats.receive_integrity_risk), "producer_schedule_failed");
+        (void)storage_queue_set_producer_ready(&write_queue, false);
+        storage_mark_writer_error(&write_queue);
+        (void)storage_emit_event(STORAGE_WORKER_FATAL, &rt, -1, 0u,
+                                 producer_stats.receive_integrity_risk);
+        goto out;
+    }
+    nvme_reset_sw_timing(&rt);
     capture_start_us = storage_wall_time_us();
     producer_stats.window_start_us = capture_start_us;
     producer_stats.next_log_us = capture_start_us +
@@ -2930,12 +3071,19 @@ int execute_write_with_result(const ParsedArgs *args, GlobalOptions gopt, WriteR
     producer_stats.perf_window_start_us = capture_start_us;
     producer_stats.perf_next_us = capture_start_us +
                                   (uint64_t)storage_perf_log_interval_ms() * 1000ull;
+    if (storage_emit_event(STORAGE_WORKER_RUNNING, &rt, 0, 0u, "running") != 0 ||
+        storage_queue_mark_running(&write_queue) != 0) {
+        producer_stats.receive_integrity_ok = false;
+        snprintf(producer_stats.receive_integrity_risk,
+                 sizeof(producer_stats.receive_integrity_risk), "running_event_send_failed");
+        storage_mark_writer_error(&write_queue);
+        goto out;
+    }
     storage_emit_line("storage_started channel=%d task=%s file_index=%u"
                       " start_gate_mode=%s start_skew_us=%" PRIu64,
                       cfg->id, args->task_no, (unsigned)effective_file_index,
                       start_gate_mode, start_skew_us);
     {
-        uint32_t stop_idle_polls = 0u;
         uint32_t idle_notice_ms = storage_idle_notice_ms();
         uint64_t last_dma_us = storage_wall_time_us();
         bool saw_dma_data = false;
@@ -2971,21 +3119,56 @@ int execute_write_with_result(const ParsedArgs *args, GlobalOptions gopt, WriteR
                 storage_ring_event(&write_queue.producer_event_ring, STORAGE_EVENT_STOP_LATCHED,
                                    &rt, dma_received_bytes, 0u, false);
             }
-            if (stop_requested) {
+            if (stop_requested && stop_state.state == STORAGE_CAPTURE_ACCEPTING) {
+                uint32_t stop_timeout_us = storage_env_u32_limit(
+                    "SRC_REAL_STORAGE_STOP_TIMEOUT_US",
+                    rt.gopt.timeout_us ? rt.gopt.timeout_us : DEFAULT_TIMEOUT_US,
+                    UINT32_MAX);
+
                 manual_stop_seen = true;
+                (void)storage_stop_state_latch(
+                    &stop_state, storage_wall_time_us() + stop_timeout_us);
+                (void)storage_stop_state_advance(&stop_state,
+                                                 STORAGE_CAPTURE_DMA_QUIESCING);
+                if (dma_quiesce_s2mm(&rt, stop_state.deadline_us,
+                                     &dma_stop_report) != 0) {
+                    producer_stats.receive_integrity_ok = false;
+                    snprintf(producer_stats.receive_integrity_risk,
+                             sizeof(producer_stats.receive_integrity_risk),
+                             errno == ETIMEDOUT ? "dma_quiesce_timeout"
+                                                : "dma_quiesce_failed");
+                    (void)storage_emit_event(STORAGE_WORKER_FATAL, &rt, -1,
+                                             dma_received_bytes,
+                                             producer_stats.receive_integrity_risk);
+                    goto out;
+                }
+                dma_quiesced = true;
+                (void)storage_stop_state_advance(
+                    &stop_state, STORAGE_CAPTURE_HARVESTING_COMPLETED);
             }
-            if (stop_requested && rt.gopt.dry_run) {
+            if (stop_state.state == STORAGE_CAPTURE_HARVESTING_COMPLETED && rt.gopt.dry_run) {
                 dbg_printf("[DBG][WRITE] dry-run stop requested ch=%d captured=%" PRIu64 "\n",
                            cfg->id, bytes_captured);
                 break;
             }
-            if (stop_requested && stop_idle_polls >= STORAGE_STOP_DRAIN_POLLS_DEFAULT) {
-                dbg_printf("[DBG][WRITE] stop drain done ch=%d captured=%" PRIu64 "\n",
-                           cfg->id, bytes_captured);
-                break;
-            }
 
-            harvest_rc = dma_harvest_batch(&rt, harvest_items, harvest_limit, 100u, &harvest_count);
+            if (stop_state.state == STORAGE_CAPTURE_HARVESTING_COMPLETED) {
+                if (storage_stop_state_expired(&stop_state, storage_wall_time_us())) {
+                    producer_stats.receive_integrity_ok = false;
+                    snprintf(producer_stats.receive_integrity_risk,
+                             sizeof(producer_stats.receive_integrity_risk),
+                             "stop_harvest_timeout");
+                    (void)storage_emit_event(STORAGE_WORKER_FATAL, &rt, -1,
+                                             dma_received_bytes,
+                                             producer_stats.receive_integrity_risk);
+                    goto out;
+                }
+                harvest_rc = dma_harvest_completed_batch(&rt, harvest_items,
+                                                         harvest_limit, &harvest_count);
+            } else {
+                harvest_rc = dma_harvest_batch(&rt, harvest_items, harvest_limit,
+                                               100u, &harvest_count);
+            }
             harvest_fatal = harvest_rc != 0;
             h = harvest_count != 0u ? 1 : (harvest_fatal ? -1 : 0);
             if (h < 0) {
@@ -3019,6 +3202,12 @@ int execute_write_with_result(const ParsedArgs *args, GlobalOptions gopt, WriteR
                 goto out;
             }
             if (h == 0) {
+                if (stop_state.state == STORAGE_CAPTURE_HARVESTING_COMPLETED) {
+                    dbg_printf("[DBG][WRITE] stopped DMA completed-BD harvest done"
+                               " ch=%d captured=%" PRIu64 "\n",
+                               cfg->id, bytes_captured);
+                    break;
+                }
                 uint32_t busy_slots = storage_queue_busy_count(&write_queue, &max_busy_slots);
                 uint64_t now_us = storage_wall_time_us();
                 uint64_t buffered_bytes = storage_queue_buffered_bytes(&write_queue, &max_buffered_bytes);
@@ -3112,10 +3301,7 @@ int execute_write_with_result(const ParsedArgs *args, GlobalOptions gopt, WriteR
                         break;
                     }
                 }
-                if (stop_requested) {
-                    ++stop_idle_polls;
-                    usleep(STORAGE_STOP_DRAIN_SLEEP_US);
-                } else {
+                if (!stop_requested) {
                     uint32_t sleep_us = storage_poll_sleep_us;
                     if (idle_notice_ms > 0u && saw_dma_data && !idle_notice_logged) {
                         uint64_t idle_us = storage_elapsed_us(last_dma_us);
@@ -3224,7 +3410,6 @@ int execute_write_with_result(const ParsedArgs *args, GlobalOptions gopt, WriteR
             }
             slot = harvest_items[0].slot;
             actual = harvest_items[0].actual_bytes;
-            stop_idle_polls = 0u;
             ring_full_logged = false;
             saw_dma_data = true;
             idle_notice_logged = false;
@@ -3352,16 +3537,64 @@ int execute_write_with_result(const ParsedArgs *args, GlobalOptions gopt, WriteR
                                    storage_wall_time_us(),
                                    dma_received_bytes);
     tail_incomplete = manual_stop_seen && dma_s2mm_tail_incomplete(&rt);
+    if (tail_incomplete) {
+        producer_stats.receive_integrity_ok = false;
+        snprintf(producer_stats.receive_integrity_risk,
+                 sizeof(producer_stats.receive_integrity_risk), "tail_descriptor_incomplete");
+    }
+    if (stop_state.state == STORAGE_CAPTURE_ACCEPTING) {
+        uint32_t stop_timeout_us = storage_env_u32_limit(
+            "SRC_REAL_STORAGE_STOP_TIMEOUT_US",
+            rt.gopt.timeout_us ? rt.gopt.timeout_us : DEFAULT_TIMEOUT_US,
+            UINT32_MAX);
+        (void)storage_stop_state_latch(&stop_state,
+                                       storage_wall_time_us() + stop_timeout_us);
+        (void)storage_stop_state_advance(&stop_state, STORAGE_CAPTURE_DMA_QUIESCING);
+    }
+    if (!dma_quiesced) {
+        if (dma_quiesce_s2mm(&rt, stop_state.deadline_us, &dma_stop_report) != 0) {
+            dma_stop_failed = true;
+            producer_stats.receive_integrity_ok = false;
+            snprintf(producer_stats.receive_integrity_risk,
+                     sizeof(producer_stats.receive_integrity_risk),
+                     errno == ETIMEDOUT ? "dma_quiesce_timeout" : "dma_quiesce_failed");
+        } else {
+            dma_quiesced = true;
+        }
+        if (stop_state.state == STORAGE_CAPTURE_DMA_QUIESCING) {
+            (void)storage_stop_state_advance(
+                &stop_state, STORAGE_CAPTURE_HARVESTING_COMPLETED);
+        }
+    }
+    if (stop_state.state == STORAGE_CAPTURE_HARVESTING_COMPLETED) {
+        (void)storage_stop_state_advance(&stop_state, STORAGE_CAPTURE_WRITER_DRAINING);
+    }
     storage_queue_finish(&write_queue);
     dma_stop_attempted = true;
-    dma_stop_result = dma_stop_s2mm(&rt, &dma_stop_report);
+    {
+        DmaStopResult finalize_result = dma_finalize_stop_s2mm(&rt, &dma_stop_report);
+        dma_stop_result = dma_quiesced ? finalize_result : DMA_STOP_FAILED;
+    }
     if (dma_stop_result == DMA_STOP_FAILED) {
         dma_stop_failed = true;
         dbg_printf("[DBG][WRITE] dma S2MM halt failed ch=%d task=%s idx=%u\n",
                    cfg->id, args->task_no, (unsigned)effective_file_index);
     }
-    pthread_join(writer_thread, NULL);
+    if (storage_join_writer_deadline(writer_thread, stop_state.deadline_us) != 0) {
+        producer_stats.receive_integrity_ok = false;
+        snprintf(producer_stats.receive_integrity_risk,
+                 sizeof(producer_stats.receive_integrity_risk), "writer_drain_timeout");
+        (void)storage_emit_event(STORAGE_WORKER_FATAL, &rt, -1, dma_received_bytes,
+                                 producer_stats.receive_integrity_risk);
+        (void)pthread_cancel(writer_thread);
+        (void)pthread_join(writer_thread, NULL);
+        writer_started = false;
+        goto out;
+    }
     writer_started = false;
+    if (stop_state.state == STORAGE_CAPTURE_WRITER_DRAINING) {
+        (void)storage_stop_state_advance(&stop_state, STORAGE_CAPTURE_FINALIZING);
+    }
     if (write_queue.error) {
         dbg_printf("[DBG][WRITE] writer thread failed ch=%d captured=%" PRIu64 "\n",
                    cfg->id, bytes_captured);
@@ -3730,27 +3963,102 @@ out:
                                    false,
                                    storage_wall_time_us(),
                                    dma_received_bytes);
-    if (manual_stop_seen && !tail_incomplete) {
-        tail_incomplete = dma_s2mm_tail_incomplete(&rt);
-    }
-    if (writer_started) {
-        storage_queue_finish(&write_queue);
-    }
-    if (rc != 0 && dma_started && !dma_stop_attempted) {
+    if (dma_started && !dma_stop_attempted) {
+        if (stop_state.state == STORAGE_CAPTURE_ACCEPTING) {
+            uint32_t stop_timeout_us = storage_env_u32_limit(
+                "SRC_REAL_STORAGE_STOP_TIMEOUT_US",
+                rt.gopt.timeout_us ? rt.gopt.timeout_us : DEFAULT_TIMEOUT_US,
+                UINT32_MAX);
+            (void)storage_stop_state_latch(
+                &stop_state, storage_wall_time_us() + stop_timeout_us);
+            (void)storage_stop_state_advance(&stop_state,
+                                             STORAGE_CAPTURE_DMA_QUIESCING);
+        }
+        if (!dma_quiesced &&
+            dma_quiesce_s2mm(&rt, stop_state.deadline_us, &dma_stop_report) == 0) {
+            dma_quiesced = true;
+        }
+        if (dma_quiesced) {
+            for (;;) {
+                DmaHarvestItem stopped_items[16];
+                uint32_t stopped_count = 0u;
+                uint32_t i;
+
+                if (storage_stop_state_expired(&stop_state, storage_wall_time_us())) {
+                    producer_stats.receive_integrity_ok = false;
+                    snprintf(producer_stats.receive_integrity_risk,
+                             sizeof(producer_stats.receive_integrity_risk),
+                             "stop_harvest_timeout");
+                    break;
+                }
+                if (dma_harvest_completed_batch(&rt, stopped_items, 16u,
+                                                &stopped_count) != 0) {
+                    producer_stats.receive_integrity_ok = false;
+                    if (strcmp(producer_stats.receive_integrity_risk, "none") == 0) {
+                        snprintf(producer_stats.receive_integrity_risk,
+                                 sizeof(producer_stats.receive_integrity_risk),
+                                 "stopped_dma_harvest_failed");
+                    }
+                    break;
+                }
+                if (stopped_count == 0u) break;
+                for (i = 0u; i < stopped_count; ++i) {
+                    dma_received_bytes += stopped_items[i].actual_bytes;
+                }
+                producer_stats.receive_integrity_ok = false;
+                if (strcmp(producer_stats.receive_integrity_risk, "none") == 0) {
+                    snprintf(producer_stats.receive_integrity_risk,
+                             sizeof(producer_stats.receive_integrity_risk),
+                             "fatal_stop_unqueued_dma_data");
+                }
+            }
+        }
+        if (manual_stop_seen && !tail_incomplete && dma_quiesced) {
+            tail_incomplete = dma_s2mm_tail_incomplete(&rt);
+            if (tail_incomplete) {
+                producer_stats.receive_integrity_ok = false;
+                snprintf(producer_stats.receive_integrity_risk,
+                         sizeof(producer_stats.receive_integrity_risk),
+                         "tail_descriptor_incomplete");
+            }
+        }
+        if (stop_state.state == STORAGE_CAPTURE_DMA_QUIESCING) {
+            (void)storage_stop_state_advance(
+                &stop_state, STORAGE_CAPTURE_HARVESTING_COMPLETED);
+        }
+        if (writer_started) storage_queue_finish(&write_queue);
+        if (stop_state.state == STORAGE_CAPTURE_HARVESTING_COMPLETED) {
+            (void)storage_stop_state_advance(
+                &stop_state, STORAGE_CAPTURE_WRITER_DRAINING);
+        }
         dma_stop_attempted = true;
-        dma_stop_result = dma_stop_s2mm(&rt, &dma_stop_report);
+        {
+            DmaStopResult finalize_result = dma_finalize_stop_s2mm(&rt, &dma_stop_report);
+            dma_stop_result = dma_quiesced ? finalize_result : DMA_STOP_FAILED;
+        }
         if (dma_stop_result == DMA_STOP_FAILED) {
             dma_stop_failed = true;
             dbg_printf("[DBG][WRITE] dma S2MM cleanup halt failed ch=%d task=%s idx=%u\n",
                        cfg->id, args->task_no, (unsigned)effective_file_index);
         }
+    } else if (writer_started) {
+        storage_queue_finish(&write_queue);
     }
     if (writer_started) {
-        pthread_join(writer_thread, NULL);
+        if (storage_join_writer_deadline(writer_thread, stop_state.deadline_us) != 0) {
+            producer_stats.receive_integrity_ok = false;
+            snprintf(producer_stats.receive_integrity_risk,
+                     sizeof(producer_stats.receive_integrity_risk), "writer_drain_timeout");
+            (void)pthread_cancel(writer_thread);
+            (void)pthread_join(writer_thread, NULL);
+        }
         writer_started = false;
         bytes_written = write_queue.bytes_written;
         chunks = write_queue.chunks;
         nvme_write_us = write_queue.nvme_write_us;
+    }
+    if (stop_state.state == STORAGE_CAPTURE_WRITER_DRAINING) {
+        (void)storage_stop_state_advance(&stop_state, STORAGE_CAPTURE_FINALIZING);
     }
     if (write_queue_ready) {
         storage_maybe_dump_event_rings(&write_queue, &rt,

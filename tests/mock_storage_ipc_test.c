@@ -17,6 +17,9 @@ int main(void)
     assert(storage_ipc_write_event(p[1], &e) == 0);
     assert(storage_ipc_read_event(p[0], &eo) == 0 && eo.type == STORAGE_WORKER_READY);
     e.version++; assert(storage_ipc_write_event(p[1], &e) != 0);
+    assert(write(p[1], &e, sizeof(e)) == (ssize_t)sizeof(e));
+    assert(storage_ipc_read_event_raw(p[0], &eo) == 0);
+    assert(!storage_ipc_validate_event(&eo));
     close(p[1]); assert(storage_ipc_read_control(p[0], &out) == 1); close(p[0]);
     assert(pipe(p) == 0);
     assert(fcntl(p[1], F_SETFL, fcntl(p[1], F_GETFL, 0) | O_NONBLOCK) == 0);

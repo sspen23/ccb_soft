@@ -81,6 +81,8 @@ int storage_ipc_try_write_perf(int fd, const StorageWorkerEvent *event,
                                _Atomic uint64_t *dropped_perf_samples);
 int storage_ipc_write_event_deadline(int fd, const StorageWorkerEvent *event,
                                      uint64_t deadline_us);
+int storage_ipc_validate_event(const StorageWorkerEvent *event);
+int storage_ipc_read_event_raw(int fd, StorageWorkerEvent *event);
 int storage_ipc_read_event(int fd, StorageWorkerEvent *event);
 
 #endif

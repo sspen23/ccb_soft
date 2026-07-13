@@ -45,6 +45,9 @@ int main(void)
     uint32_t dma_regs[0x100u / 4u];
     uint8_t state[4];
     DmaBdSnapshot snapshot;
+    DmaStopReport stop_report;
+    DmaHarvestItem harvested[4];
+    uint32_t harvested_count = 0u;
 
     init_runtime(&rt, &cfg, desc, dma_regs);
     memset(state, STORAGE_SLOT_DMA_WRITABLE, sizeof(state));
@@ -79,6 +82,32 @@ int main(void)
 
     state[3] = 0xffu;
     assert(dma_get_bd_snapshot(&rt, state, &snapshot) != 0);
+
+    init_runtime(&rt, &cfg, desc, dma_regs);
+    desc[0].status = TEST_DESC_CMPLT | 512u;
+    desc[1].status = TEST_DESC_CMPLT | 1024u;
+    desc[2].status = 64u;
+    dma_regs[TEST_S2MM_DMASR / 4u] = 1u;
+    memset(&stop_report, 0, sizeof(stop_report));
+    assert(dma_quiesce_s2mm(&rt, 1u, &stop_report) == 0);
+    assert((dma_regs[TEST_S2MM_DMACR / 4u] & 1u) == 0u);
+    assert(desc[0].status == (TEST_DESC_CMPLT | 512u));
+    assert(desc[1].status == (TEST_DESC_CMPLT | 1024u));
+    assert(dma_harvest_completed_batch(&rt, harvested, 4u, &harvested_count) == 0);
+    assert(harvested_count == 2u);
+    assert(harvested[0].slot == 0u && harvested[1].slot == 1u);
+    assert(rt.next_harvest_bd == 2u);
+    assert(dma_s2mm_tail_incomplete(&rt));
+
+    init_runtime(&rt, &cfg, desc, dma_regs);
+    desc[0].status = desc[1].status = desc[2].status = desc[3].status =
+        TEST_DESC_CMPLT | 512u;
+    dma_regs[TEST_S2MM_DMASR / 4u] = 1u;
+    assert(dma_quiesce_s2mm(&rt, 1u, &stop_report) == 0);
+    assert(dma_harvest_completed_batch(&rt, harvested, 4u, &harvested_count) == 0);
+    assert(harvested_count == 4u);
+    assert(dma_harvest_completed_batch(&rt, harvested, 4u, &harvested_count) == 0);
+    assert(harvested_count == 0u);
 
     init_runtime(&rt, &cfg, desc, dma_regs);
     desc[0].status = TEST_DESC_CMPLT | 512u;

@@ -3,6 +3,80 @@
 #include <stdlib.h>
 #include <string.h>
 
+void storage_stop_state_init(StorageStopState *state)
+{
+    if (!state) return;
+    memset(state, 0, sizeof(*state));
+    state->state = STORAGE_CAPTURE_ACCEPTING;
+}
+
+bool storage_stop_state_latch(StorageStopState *state, uint64_t deadline_us)
+{
+    if (!state) return false;
+    if (state->state != STORAGE_CAPTURE_ACCEPTING) return false;
+    state->state = STORAGE_CAPTURE_STOP_LATCHED;
+    state->deadline_us = deadline_us;
+    return true;
+}
+
+int storage_stop_state_advance(StorageStopState *state, StorageCaptureState next)
+{
+    if (!state || next != (StorageCaptureState)(state->state + 1) ||
+        next > STORAGE_CAPTURE_FINALIZING) return -1;
+    state->state = next;
+    return 0;
+}
+
+bool storage_stop_state_expired(const StorageStopState *state, uint64_t now_us)
+{
+    return state && state->state != STORAGE_CAPTURE_ACCEPTING &&
+           state->deadline_us != 0u && now_us >= state->deadline_us;
+}
+
+void storage_run_state_init(StorageRunState *state)
+{
+    if (state) memset(state, 0, sizeof(*state));
+}
+
+int storage_run_state_enable_writer(StorageRunState *state)
+{
+    if (!state || state->writer_enabled || state->running_sent) return -1;
+    state->writer_enabled = true;
+    return 0;
+}
+
+int storage_run_state_set_writer_ready(StorageRunState *state, bool success)
+{
+    if (!state || !state->writer_enabled || state->writer_run_ready ||
+        state->writer_schedule_failed || state->running_sent) return -1;
+    state->writer_run_ready = success;
+    state->writer_schedule_failed = !success;
+    return success ? 0 : -1;
+}
+
+int storage_run_state_set_producer_ready(StorageRunState *state, bool success)
+{
+    if (!state || !state->writer_run_ready || state->producer_run_ready ||
+        state->producer_schedule_failed || state->running_sent) return -1;
+    state->producer_run_ready = success;
+    state->producer_schedule_failed = !success;
+    return success ? 0 : -1;
+}
+
+bool storage_run_state_can_emit_running(const StorageRunState *state)
+{
+    return state && state->writer_enabled && state->writer_run_ready &&
+           state->producer_run_ready && !state->writer_schedule_failed &&
+           !state->producer_schedule_failed && !state->running_sent;
+}
+
+int storage_run_state_mark_running(StorageRunState *state)
+{
+    if (!storage_run_state_can_emit_running(state)) return -1;
+    state->running_sent = true;
+    return 0;
+}
+
 static uint32_t *storage_count_for_state(StorageSlotCounts *c, StorageSlotState state)
 {
     switch (state) {

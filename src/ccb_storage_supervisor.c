@@ -33,6 +33,27 @@ static void fail_worker_exit_without_final(StorageTaskSupervisor *s, uint32_t ch
 
 void storage_supervisor_init(StorageTaskSupervisor *s, uint32_t target_mask)
 { memset(s, 0, sizeof(*s)); s->target_channel_mask = target_mask; s->terminal = STORAGE_TASK_ACTIVE; }
+void storage_supervisor_protocol_fail(StorageTaskSupervisor *s, uint32_t ch,
+                                      const char *reason)
+{
+    if (s) fail(s, ch, reason && reason[0] != '\0' ? reason : "event_protocol_invalid");
+}
+
+int storage_supervisor_handle_event_for_channel(StorageTaskSupervisor *s,
+                                                uint32_t expected_channel,
+                                                const StorageWorkerEvent *e)
+{
+    if (!s || !storage_ipc_validate_event(e)) {
+        storage_supervisor_protocol_fail(s, expected_channel, "event_protocol_invalid");
+        return -1;
+    }
+    if (e->channel != expected_channel) {
+        storage_supervisor_protocol_fail(s, expected_channel, "event_channel_mismatch");
+        return -1;
+    }
+    return storage_supervisor_handle_event(s, e);
+}
+
 int storage_supervisor_handle_event(StorageTaskSupervisor *s, const StorageWorkerEvent *e)
 {
     uint32_t b;
@@ -61,12 +82,45 @@ int storage_supervisor_handle_event(StorageTaskSupervisor *s, const StorageWorke
         }
         s->running_mask |= b;
         break;
-    case STORAGE_WORKER_DRAINED: s->drained_mask |= b; break;
-    case STORAGE_WORKER_FATAL: fail(s,e->channel,e->reason); break;
+    case STORAGE_WORKER_DRAINED:
+        if ((s->running_mask & b) == 0u || (s->drained_mask & b) != 0u ||
+            (s->final_seen_mask & b) != 0u) {
+            fail(s, e->channel, "invalid_drained_sequence");
+            return -1;
+        }
+        s->drained_mask |= b;
+        break;
+    case STORAGE_WORKER_FATAL:
+        if ((s->final_seen_mask & b) != 0u) {
+            fail(s, e->channel, "invalid_fatal_sequence");
+            return -1;
+        }
+        s->fatal_seen_mask |= b;
+        fail(s,e->channel,e->reason);
+        break;
     case STORAGE_WORKER_FINAL_RESULT:
         if (s->final_seen_mask & b) { fail(s,e->channel,"duplicate_final"); return -1; }
+        if ((e->error_code == 0 && (s->drained_mask & b) == 0u) ||
+            (e->error_code != 0 && (s->fatal_seen_mask & b) == 0u)) {
+            fail(s, e->channel, "invalid_final_sequence");
+            return -1;
+        }
         s->final_seen_mask |= b; s->final_result[e->channel] = e->result; break;
-    default: break;
+    case STORAGE_WORKER_PERF_SAMPLE:
+        if ((s->running_mask & b) == 0u || (s->final_seen_mask & b) != 0u) {
+            fail(s, e->channel, "invalid_perf_sequence");
+            return -1;
+        }
+        break;
+    case STORAGE_WORKER_DIAG_EVENT:
+        if ((s->final_seen_mask & b) != 0u) {
+            fail(s, e->channel, "invalid_diag_sequence");
+            return -1;
+        }
+        break;
+    default:
+        fail(s, e->channel, "event_type_invalid");
+        return -1;
     }
     (void)storage_supervisor_result_status(s); return 0;
 }
