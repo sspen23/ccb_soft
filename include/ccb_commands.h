@@ -53,6 +53,9 @@ int execute_ssd_continuous_pattern_test(const ParsedArgs *args, GlobalOptions go
 int execute_dma_rx_benchmark(const ParsedArgs *args, GlobalOptions gopt);
 void storage_write_reset_stop(void);
 void storage_write_request_stop(void);
+void storage_write_flush_deferred_diag(void);
+uint32_t storage_cross_slot_active_slots_for_channel(int channel_id);
+uint32_t storage_cross_slot_default_target_qd(int channel_id);
 
 /* Read one file (by metadata key or explicit LBA) back to DDR. */
 int execute_read(const ParsedArgs *args, GlobalOptions gopt);

@@ -70,6 +70,9 @@ storage-host-tests:
 	$(CC) $(CFLAGS) -Wformat=2 -Iinclude tests/mock_storage_perf_test.c \
 		src/ccb_storage_perf.c src/ccb_storage_ipc.c -o /tmp/mock_storage_perf_test
 	/tmp/mock_storage_perf_test
+	$(CC) $(CFLAGS) -Wformat=2 -Wno-unused-function -Wno-stringop-truncation -ffunction-sections -fdata-sections -Iinclude \
+		tests/mock_storage_config_test.c src/ccb_commands.c -Wl,--gc-sections -o /tmp/mock_storage_config_test
+	/tmp/mock_storage_config_test
 	$(CC) $(CFLAGS) -Wformat=2 -ffunction-sections -fdata-sections -Iinclude \
 		tests/mock_nvme_cross_slot_test.c src/ccb_hw.c src/debug_uart.c -Wl,--gc-sections -o /tmp/mock_nvme_cross_slot_test
 	/tmp/mock_nvme_cross_slot_test

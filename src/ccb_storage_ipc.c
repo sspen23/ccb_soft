@@ -88,25 +88,40 @@ int storage_ipc_read_control(int fd, StorageControlMessage *msg)
 int storage_ipc_write_event(int fd, const StorageWorkerEvent *event)
 { return storage_ipc_validate_event(event) ? storage_ipc_write_full(fd, event, sizeof(*event)) : -1; }
 
-int storage_ipc_try_write_perf(int fd, const StorageWorkerEvent *event,
-                               _Atomic uint64_t *dropped_perf_samples)
+static int storage_ipc_try_write_event(int fd, const StorageWorkerEvent *event,
+                                       StorageWorkerEventType expected_type,
+                                       _Atomic uint64_t *dropped_events)
 {
     ssize_t written;
 
-    if (!storage_ipc_validate_event(event) || event->type != STORAGE_WORKER_PERF_SAMPLE) {
+    if (!storage_ipc_validate_event(event) || event->type != expected_type) {
         errno = EINVAL;
         return -1;
     }
     written = write(fd, event, sizeof(*event));
     if (written == (ssize_t)sizeof(*event)) return 0;
     if (written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-        if (dropped_perf_samples) {
-            (void)atomic_fetch_add_explicit(dropped_perf_samples, 1u, memory_order_relaxed);
+        if (dropped_events) {
+            (void)atomic_fetch_add_explicit(dropped_events, 1u, memory_order_relaxed);
         }
         return 1;
     }
     if (written >= 0) errno = EIO;
     return -1;
+}
+
+int storage_ipc_try_write_perf(int fd, const StorageWorkerEvent *event,
+                               _Atomic uint64_t *dropped_perf_samples)
+{
+    return storage_ipc_try_write_event(fd, event, STORAGE_WORKER_PERF_SAMPLE,
+                                       dropped_perf_samples);
+}
+
+int storage_ipc_try_write_diag(int fd, const StorageWorkerEvent *event,
+                               _Atomic uint64_t *dropped_diag_events)
+{
+    return storage_ipc_try_write_event(fd, event, STORAGE_WORKER_DIAG_EVENT,
+                                       dropped_diag_events);
 }
 
 int storage_ipc_write_event_deadline(int fd, const StorageWorkerEvent *event,

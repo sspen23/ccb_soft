@@ -4193,6 +4193,7 @@ static int run_storage_worker_main(int argc, char **argv)
     ParsedArgs args;
     CommandType cmd;
     int rc;
+    bool final_sent = false;
     WriteResult result;
 
     memset(&result, 0, sizeof(result));
@@ -4257,21 +4258,24 @@ static int run_storage_worker_main(int argc, char **argv)
             storage_ipc_make_event(&event, STORAGE_WORKER_FINAL_RESULT, (uint32_t)args.channel_id,
                                    rc, result.dma_received_bytes, rc == 0 ? "final" : "failed");
             event.result = result;
-            (void)storage_ipc_write_event_deadline(event_fd, &event,
-                                                   storage_ipc_monotonic_us() + 1000000ull);
+            final_sent = storage_ipc_write_event_deadline(event_fd, &event,
+                                                           storage_ipc_monotonic_us() + 1000000ull) == 0;
         }
     }
-    printf("storage_worker_result task=%s channel=%d file_index=%u rc=%d"
-           " data_persisted=%u integrity_ok=%u dma_stop_recovered=%u integrity_risk=%s\n",
-           args.task_no,
-           result.channel_id,
-           (unsigned)result.file_index,
-           rc,
-           result.data_persisted ? 1u : 0u,
-           result.integrity_ok ? 1u : 0u,
-           result.dma_stop_recovered ? 1u : 0u,
-           result.integrity_risk[0] != '\0' ? result.integrity_risk : "storage_error");
-    fflush(stdout);
+    if (final_sent) storage_write_flush_deferred_diag();
+    if (system_env_flag_enabled("SRC_REAL_LEGACY_STORAGE_TEXT")) {
+        printf("storage_worker_result task=%s channel=%d file_index=%u rc=%d"
+               " data_persisted=%u integrity_ok=%u dma_stop_recovered=%u integrity_risk=%s\n",
+               args.task_no,
+               result.channel_id,
+               (unsigned)result.file_index,
+               rc,
+               result.data_persisted ? 1u : 0u,
+               result.integrity_ok ? 1u : 0u,
+               result.dma_stop_recovered ? 1u : 0u,
+               result.integrity_risk[0] != '\0' ? result.integrity_risk : "storage_error");
+        fflush(stdout);
+    }
     dbg_printf("[DBG][WORKER] execute_write done rc=%d task=%s idx=%u data_persisted=%u\n",
                rc,
                args.task_no,

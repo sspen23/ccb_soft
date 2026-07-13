@@ -7,7 +7,7 @@
 
 int main(void)
 {
-    int p[2]; StorageControlMessage c, out; StorageWorkerEvent e, eo; _Atomic uint64_t dropped = 0u;
+    int p[2]; StorageControlMessage c, out; StorageWorkerEvent e, eo; _Atomic uint64_t dropped = 0u, dropped_diag = 0u;
     assert(pipe(p) == 0);
     storage_ipc_make_control(&c, STORAGE_CTRL_ARM, 1u);
     assert(storage_ipc_write_control(p[1], &c) == 0);
@@ -27,14 +27,20 @@ int main(void)
     while (write(p[1], &c, sizeof(c)) > 0) { }
     assert(storage_ipc_try_write_perf(p[1], &e, &dropped) == 1);
     assert(atomic_load(&dropped) == 1u);
+    storage_ipc_make_event(&e, STORAGE_WORKER_DIAG_EVENT, 0u, 0, 0u, "diag");
+    assert(storage_ipc_try_write_diag(p[1], &e, &dropped_diag) == 1);
+    assert(atomic_load(&dropped_diag) == 1u);
     close(p[0]); close(p[1]);
     assert(pipe(p) == 0);
     storage_ipc_make_event(&e, STORAGE_WORKER_FATAL, 0u, -1, 1u, "fatal");
     assert(storage_ipc_write_event_deadline(p[1], &e, storage_ipc_monotonic_us() + 100000u) == 0);
     storage_ipc_make_event(&e, STORAGE_WORKER_FINAL_RESULT, 0u, 0, 1u, "final");
     assert(storage_ipc_write_event_deadline(p[1], &e, storage_ipc_monotonic_us() + 100000u) == 0);
+    storage_ipc_make_event(&e, STORAGE_WORKER_DIAG_EVENT, 0u, 0, 0u, "diag");
+    assert(storage_ipc_try_write_diag(p[1], &e, &dropped_diag) == 0);
     assert(storage_ipc_read_event(p[0], &eo) == 0 && eo.type == STORAGE_WORKER_FATAL);
     assert(storage_ipc_read_event(p[0], &eo) == 0 && eo.type == STORAGE_WORKER_FINAL_RESULT);
+    assert(storage_ipc_read_event(p[0], &eo) == 0 && eo.type == STORAGE_WORKER_DIAG_EVENT);
     close(p[0]); close(p[1]);
     puts("mock_storage_ipc_test: ok"); return 0;
 }

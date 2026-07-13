@@ -41,6 +41,10 @@
 static volatile sig_atomic_t g_storage_stop_requested = 0;
 static bool g_storage_control_stop_latched = false;
 static _Atomic uint64_t g_storage_dropped_perf_samples;
+static _Atomic uint64_t g_storage_dropped_diag_events;
+static StorageEventRecord *g_storage_deferred_diag_records;
+static uint32_t g_storage_deferred_diag_count;
+static uint32_t g_storage_deferred_diag_capacity;
 
 typedef struct {
     uint32_t slot;
@@ -72,12 +76,14 @@ typedef struct {
     uint32_t busy_count;
     uint64_t buffered_bytes;
     uint64_t writer_idle_us;
+    uint64_t queue_empty_wait_us;
     uint64_t writer_active_us;
     uint64_t ready_q_nonempty_us;
     uint64_t writer_drain_loop_count;
     uint64_t writer_slots_drained;
     uint64_t writer_schedule_gap_count;
     uint64_t writer_schedule_gap_max_us;
+    uint64_t writer_no_progress_sleep_count;
     bool writer_rt_enabled;
     int writer_rt_policy;
     uint32_t writer_rt_prio;
@@ -105,6 +111,7 @@ typedef struct {
     uint64_t bytes_written;
     uint64_t nvme_write_us;
     uint64_t writer_idle_us;
+    uint64_t queue_empty_wait_us;
     uint64_t writer_active_us;
     uint64_t ready_q_nonempty_us;
     uint64_t writer_drain_loop_count;
@@ -120,6 +127,7 @@ typedef struct {
     uint64_t cross_completion_process_count;
     uint64_t cross_completion_process_max_us;
     uint64_t cross_no_progress_sleep_count;
+    uint64_t writer_no_progress_sleep_count;
     bool writer_rt_enabled;
     int writer_rt_policy;
     uint32_t writer_rt_prio;
@@ -230,6 +238,9 @@ static void storage_trace_flush_done(const ChannelRuntime *rt,
                                      const char *task_no);
 void storage_write_request_stop(void);
 static int storage_env_flag_enabled(const char *name);
+static bool storage_env_string_is(const char *name, const char *expected);
+static bool storage_text_output_enabled(void);
+static bool storage_should_emit_text_format(const char *fmt);
 
 static uint64_t storage_wall_time_us(void) {
     struct timespec ts;
@@ -303,9 +314,15 @@ static void storage_emit_perf_event(const ChannelRuntime *rt, const StorageProdu
     event.perf.submit_mmio_max_us = __atomic_load_n(&q->cross_submit_mmio_max_us, __ATOMIC_ACQUIRE);
     event.perf.completion_process_count = __atomic_load_n(&q->cross_completion_process_count, __ATOMIC_ACQUIRE);
     event.perf.completion_process_max_us = __atomic_load_n(&q->cross_completion_process_max_us, __ATOMIC_ACQUIRE);
+    event.perf.queue_empty_wait_us = __atomic_load_n(&q->queue_empty_wait_us, __ATOMIC_ACQUIRE);
+    event.perf.writer_active_us = __atomic_load_n(&q->writer_active_us, __ATOMIC_ACQUIRE);
     event.perf.no_progress_sleep_count = __atomic_load_n(&q->cross_no_progress_sleep_count, __ATOMIC_ACQUIRE);
+    event.perf.writer_no_progress_sleep_count =
+        __atomic_load_n(&q->writer_no_progress_sleep_count, __ATOMIC_ACQUIRE);
     event.perf.dropped_perf_samples = atomic_load_explicit(&g_storage_dropped_perf_samples,
                                                             memory_order_relaxed);
+    event.perf.dropped_diag_events = atomic_load_explicit(&g_storage_dropped_diag_events,
+                                                           memory_order_relaxed);
     event.perf.receive_integrity_ok = stats->receive_integrity_ok ? 1u : 0u;
     event.perf.storage_integrity_ok = (!q->error && !stats->integrity_risk_ring_full) ? 1u : 0u;
     (void)storage_ipc_try_write_perf(fd, &event, &g_storage_dropped_perf_samples);
@@ -318,25 +335,51 @@ static void storage_emit_diag_event(const ChannelRuntime *rt, const StorageEvent
 
     if (fd < 0 || !record) return;
     storage_ipc_make_event(&event, STORAGE_WORKER_DIAG_EVENT,
-                           rt && rt->cfg ? (uint32_t)rt->cfg->id : UINT32_MAX,
+                           rt && rt->cfg ? (uint32_t)rt->cfg->id : record->channel,
                            0, 0u, "diag_event");
     event.diag = *record;
-    (void)storage_ipc_write_event_deadline(fd, &event,
-                                           storage_ipc_monotonic_us() + 100000ull);
+    (void)storage_ipc_try_write_diag(fd, &event, &g_storage_dropped_diag_events);
 }
 
-static void storage_dump_event_ring(const StorageEventRing *ring, const ChannelRuntime *rt)
+static void storage_defer_event_ring_dump(const StorageEventRing *ring)
 {
     StorageEventRecord *records;
+    StorageEventRecord *resized;
     uint32_t count;
-    uint32_t i;
 
     if (!ring || ring->capacity == 0u) return;
     records = calloc((size_t)ring->capacity + 1u, sizeof(*records));
     if (!records) return;
     count = storage_event_ring_copy((StorageEventRing *)ring, records, ring->capacity + 1u);
-    for (i = 0u; i < count; ++i) storage_emit_diag_event(rt, &records[i]);
+    if (count > 0u && count <= UINT32_MAX - g_storage_deferred_diag_count) {
+        uint32_t needed = g_storage_deferred_diag_count + count;
+        if (needed > g_storage_deferred_diag_capacity) {
+            resized = realloc(g_storage_deferred_diag_records,
+                              (size_t)needed * sizeof(*g_storage_deferred_diag_records));
+            if (resized) {
+                g_storage_deferred_diag_records = resized;
+                g_storage_deferred_diag_capacity = needed;
+            }
+        }
+        if (g_storage_deferred_diag_capacity >= needed) {
+            memcpy(g_storage_deferred_diag_records + g_storage_deferred_diag_count,
+                   records, (size_t)count * sizeof(*records));
+            g_storage_deferred_diag_count = needed;
+        }
+    }
     free(records);
+}
+
+void storage_write_flush_deferred_diag(void)
+{
+    uint32_t i;
+
+    for (i = 0u; i < g_storage_deferred_diag_count; ++i)
+        storage_emit_diag_event(NULL, &g_storage_deferred_diag_records[i]);
+    free(g_storage_deferred_diag_records);
+    g_storage_deferred_diag_records = NULL;
+    g_storage_deferred_diag_count = 0u;
+    g_storage_deferred_diag_capacity = 0u;
 }
 
 static void storage_maybe_dump_event_rings(const StorageWriteQueue *q,
@@ -347,8 +390,9 @@ static void storage_maybe_dump_event_rings(const StorageWriteQueue *q,
     bool dump_stop = storage_env_flag_enabled("SRC_REAL_DUMP_EVENT_RING_ON_STOP") != 0;
 
     if (!q || !storage_event_ring_should_dump(is_error, stopped, dump_error, dump_stop)) return;
-    storage_dump_event_ring(&q->producer_event_ring, rt);
-    storage_dump_event_ring(&q->writer_event_ring, rt);
+    (void)rt;
+    storage_defer_event_ring_dump(&q->producer_event_ring);
+    storage_defer_event_ring_dump(&q->writer_event_ring);
 }
 
 static int storage_wait_start_gate(ChannelRuntime *rt, uint64_t *start_skew_us, const char **gate_mode)
@@ -410,7 +454,7 @@ static bool storage_control_stop_requested(void)
     return g_storage_control_stop_latched;
 }
 
-static void storage_emit_line(const char *fmt, ...)
+static void storage_emit_line_impl(const char *fmt, ...)
 {
     char line[2048];
     va_list ap;
@@ -439,6 +483,12 @@ static void storage_emit_line(const char *fmt, ...)
         (void)written;
     }
 }
+
+#define storage_emit_line(fmt, ...) \
+    do { \
+        if (storage_should_emit_text_format((fmt))) \
+            storage_emit_line_impl((fmt), ##__VA_ARGS__); \
+    } while (0)
 
 static uint32_t storage_idle_notice_ms(void) {
     const char *env = getenv("SRC_REAL_STORAGE_IDLE_NOTICE_MS");
@@ -484,6 +534,18 @@ static StorageLogLevel storage_log_level(void)
 static bool storage_log_enabled(StorageLogLevel need)
 {
     return storage_log_level() >= need;
+}
+
+static bool storage_text_output_enabled(void)
+{
+    return storage_env_flag_enabled("SRC_REAL_LEGACY_STORAGE_TEXT") ||
+           storage_log_enabled(STORAGE_LOG_DEBUG);
+}
+
+static bool storage_should_emit_text_format(const char *fmt)
+{
+    return fmt && (storage_text_output_enabled() ||
+                   strncmp(fmt, "storage_ddr_full", strlen("storage_ddr_full")) == 0);
 }
 
 static uint32_t storage_env_u32_limit(const char *name, uint32_t fallback, uint32_t max_value);
@@ -556,6 +618,32 @@ static uint32_t storage_channel_env_u32(const ChannelConfig *cfg,
         return storage_env_u32_limit(global_fallback, fallback, max_value);
     }
     return fallback;
+}
+
+uint32_t storage_cross_slot_active_slots_for_channel(int channel_id)
+{
+    char name[80];
+    uint32_t fallback;
+
+    fallback = channel_id == 2 ? 1u : 4u;
+    snprintf(name, sizeof(name), "SRC_REAL_NVME_CROSS_SLOT_MAX_ACTIVE_CH%d", channel_id);
+    if (getenv(name)) return storage_env_u32_limit(name, fallback, 64u);
+    snprintf(name, sizeof(name), "SRC_REAL_CH%d_NVME_CROSS_SLOT_MAX_ACTIVE", channel_id);
+    if (getenv(name)) return storage_env_u32_limit(name, fallback, 64u);
+    snprintf(name, sizeof(name), "SRC_REAL_NVME_CROSS_SLOT_BATCH_CH%d", channel_id);
+    if (getenv(name)) return storage_env_u32_limit(name, fallback, 64u);
+    if (getenv("SRC_REAL_NVME_CROSS_SLOT_MAX_ACTIVE")) {
+        return storage_env_u32_limit("SRC_REAL_NVME_CROSS_SLOT_MAX_ACTIVE", fallback, 64u);
+    }
+    if (getenv("SRC_REAL_NVME_CROSS_SLOT_BATCH")) {
+        return storage_env_u32_limit("SRC_REAL_NVME_CROSS_SLOT_BATCH", fallback, 64u);
+    }
+    return fallback;
+}
+
+uint32_t storage_cross_slot_default_target_qd(int channel_id)
+{
+    return channel_id == 2 ? 4u : 8u;
 }
 
 static int storage_env_flag_enabled(const char *name)
@@ -1377,10 +1465,14 @@ static void storage_queue_snapshot(StorageWriteQueue *q, StorageQueueSnapshot *o
     out->busy_count = q->busy_count;
     out->buffered_bytes = q->buffered_bytes;
     out->writer_idle_us = q->writer_idle_us;
+    out->queue_empty_wait_us = q->queue_empty_wait_us;
     out->writer_active_us = q->writer_active_us;
     out->ready_q_nonempty_us = q->ready_q_nonempty_us;
     out->writer_drain_loop_count = q->writer_drain_loop_count;
     out->writer_slots_drained = q->writer_slots_drained;
+    out->writer_schedule_gap_count = q->writer_schedule_gap_count;
+    out->writer_schedule_gap_max_us = q->writer_schedule_gap_max_us;
+    out->writer_no_progress_sleep_count = q->writer_no_progress_sleep_count;
     out->writer_rt_enabled = __atomic_load_n(&q->writer_rt_enabled, __ATOMIC_ACQUIRE);
     out->writer_rt_policy = __atomic_load_n(&q->writer_rt_policy, __ATOMIC_ACQUIRE);
     out->writer_rt_prio = __atomic_load_n(&q->writer_rt_prio, __ATOMIC_ACQUIRE);
@@ -1531,7 +1623,7 @@ static int storage_capture_bd_snapshot(StorageProducerStats *stats,
                 stats->first_receive_failure_us = now_us;
                 stats->first_receive_failure_bytes = received_bytes;
                 stats->first_failure_snapshot = *out;
-                storage_emit_line("dma_bd_exhausted channel=%d task=%s file_index=%u"
+                storage_emit_line("storage_ddr_full channel=%d task=%s file_index=%u"
                                   " received_bytes=%" PRIu64 " completed_unharvested=%u"
                                   " ready_slots=%u nvme_busy_slots=%u requeue_pending=%u"
                                   " curdesc=%u taildesc=%u s2mm_dmasr=0x%08x",
@@ -1726,7 +1818,8 @@ static void storage_stats_print_periodic(StorageProducerStats *stats,
     StorageQueueSnapshot snapshot;
     DmaBdSnapshot bd_snapshot;
 
-    perf_enabled = storage_env_flag_enabled("SRC_REAL_PERF_LOG_ENABLE") != 0;
+    perf_enabled = getenv("SRC_REAL_PERF_LOG_ENABLE") == NULL ||
+                   storage_env_flag_enabled("SRC_REAL_PERF_LOG_ENABLE") != 0;
     if (!stats) {
         return;
     }
@@ -1972,12 +2065,21 @@ static void storage_mark_writer_error(StorageWriteQueue *q) {
 }
 
 static int storage_queue_pop(StorageWriteQueue *q, PendingDdrSlot *out, bool wait_for_item) {
+    uint64_t empty_wait_start_us = 0u;
     if (!q || !out) {
         return -1;
     }
     pthread_mutex_lock(&q->lock);
+    if (wait_for_item && q->count == 0u && !q->producer_done && !q->error) {
+        empty_wait_start_us = storage_wall_time_us();
+    }
     while (wait_for_item && !q->producer_done && !q->error && q->count == 0u) {
         pthread_cond_wait(&q->not_empty, &q->lock);
+    }
+    if (empty_wait_start_us != 0u) {
+        uint64_t wait_us = storage_elapsed_us(empty_wait_start_us);
+        q->queue_empty_wait_us += wait_us;
+        q->writer_idle_us += wait_us; /* legacy alias */
     }
     if ((q->producer_done || q->error || !wait_for_item) && q->count == 0u) {
         pthread_mutex_unlock(&q->lock);
@@ -2151,10 +2253,29 @@ static void storage_cross_slot_update_stats(StorageWriteQueue *q,
                      __ATOMIC_RELEASE);
     __atomic_store_n(&q->cross_no_progress_sleep_count, stats.no_progress_sleep_count,
                      __ATOMIC_RELEASE);
+    __atomic_store_n(&q->writer_no_progress_sleep_count, stats.no_progress_sleep_count,
+                     __ATOMIC_RELEASE);
+}
+
+static void storage_record_writer_schedule_gap(StorageWriteQueue *q,
+                                               uint64_t expected_run_us,
+                                               uint64_t actual_run_us)
+{
+    uint64_t gap_us;
+
+    if (!q || expected_run_us == 0u || actual_run_us <= expected_run_us) return;
+    gap_us = actual_run_us - expected_run_us;
+    if (gap_us < 1000u) return;
+    (void)__atomic_add_fetch(&q->writer_schedule_gap_count, 1u, __ATOMIC_RELAXED);
+    if (gap_us > __atomic_load_n(&q->writer_schedule_gap_max_us, __ATOMIC_RELAXED))
+        __atomic_store_n(&q->writer_schedule_gap_max_us, gap_us, __ATOMIC_RELAXED);
+    storage_ring_event(&q->writer_event_ring, STORAGE_EVENT_WRITER_SCHEDULE_GAP,
+                       q->rt, gap_us, 0u, false);
 }
 
 static void *storage_nvme_writer_thread(void *arg) {
     StorageWriteQueue *q = (StorageWriteQueue *)arg;
+    uint64_t expected_run_us = 0u;
 
     if (storage_queue_wait_run(q) != 0) return NULL;
     if (storage_apply_writer_rt(q) != 0) {
@@ -2167,8 +2288,6 @@ static void *storage_nvme_writer_thread(void *arg) {
     storage_queue_set_writer_ready(q, true);
     while (1) {
         PendingDdrSlot item;
-        uint64_t wait_start_us;
-        uint64_t wait_us;
         uint64_t write_start_us;
         uint64_t write_us;
         uint64_t submit_stalls_before;
@@ -2176,20 +2295,10 @@ static void *storage_nvme_writer_thread(void *arg) {
         bool backlog_after_pop = false;
         int pop_rc;
 
-        wait_start_us = storage_wall_time_us();
+        if (expected_run_us != 0u)
+            storage_record_writer_schedule_gap(q, expected_run_us, storage_wall_time_us());
         pop_rc = storage_queue_pop(q, &item, true);
-        if (pop_rc > 0) {
-            wait_us = storage_elapsed_us(wait_start_us);
-            (void)__atomic_add_fetch(&q->writer_idle_us, wait_us,
-                                     __ATOMIC_RELEASE);
-            if (wait_us >= 1000u) {
-                (void)__atomic_add_fetch(&q->writer_schedule_gap_count, 1u, __ATOMIC_RELAXED);
-                if (wait_us > __atomic_load_n(&q->writer_schedule_gap_max_us, __ATOMIC_RELAXED))
-                    __atomic_store_n(&q->writer_schedule_gap_max_us, wait_us, __ATOMIC_RELAXED);
-                storage_ring_event(&q->writer_event_ring, STORAGE_EVENT_WRITER_SCHEDULE_GAP,
-                                   q->rt, wait_us, 0u, false);
-            }
-        }
+        expected_run_us = 0u;
         if (pop_rc < 0) {
             storage_mark_writer_error(q);
             break;
@@ -2230,6 +2339,7 @@ static void *storage_nvme_writer_thread(void *arg) {
             storage_mark_writer_error(q);
             break;
         }
+        if (storage_queue_ready_count(q) > 0u) expected_run_us = storage_wall_time_us();
     }
     return NULL;
 }
@@ -2238,6 +2348,7 @@ static void *storage_nvme_cross_slot_writer_thread(void *arg) {
     StorageWriteQueue *q = (StorageWriteQueue *)arg;
     NvmeCrossSlotEngine *engine;
     bool writer_failed = false;
+    uint64_t expected_run_us = 0u;
 
     if (!q) {
         return NULL;
@@ -2266,17 +2377,14 @@ static void *storage_nvme_cross_slot_writer_thread(void *arg) {
         int pop_rc;
         bool wait_for_item = nvme_cross_slot_engine_active(engine) == 0u;
 
+        if (wait_for_item) {
+            expected_run_us = 0u;
+        } else {
+            storage_record_writer_schedule_gap(q, expected_run_us, storage_wall_time_us());
+        }
+
         if (nvme_cross_slot_engine_can_accept(engine)) {
-            uint64_t wait_start_us = wait_for_item ? storage_wall_time_us() : 0u;
             pop_rc = storage_queue_pop(q, &item, wait_for_item);
-            if (wait_for_item && pop_rc > 0) {
-                uint64_t gap_us = storage_elapsed_us(wait_start_us);
-                if (gap_us >= 1000u) {
-                    (void)__atomic_add_fetch(&q->writer_schedule_gap_count, 1u, __ATOMIC_RELAXED);
-                    if (gap_us > __atomic_load_n(&q->writer_schedule_gap_max_us, __ATOMIC_RELAXED))
-                        __atomic_store_n(&q->writer_schedule_gap_max_us, gap_us, __ATOMIC_RELAXED);
-                }
-            }
         } else {
             pop_rc = 0;
         }
@@ -2294,11 +2402,19 @@ static void *storage_nvme_cross_slot_writer_thread(void *arg) {
                 writer_failed = true; break;
             }
         }
-        if (nvme_cross_slot_engine_step(engine, 0u, storage_cross_slot_done_cb, q) != 0) {
-            storage_cross_slot_update_stats(q, engine);
-            writer_failed = true; break;
+        {
+            uint64_t step_start_us = storage_wall_time_us();
+            if (nvme_cross_slot_engine_step(engine, 0u, storage_cross_slot_done_cb, q) != 0) {
+                (void)__atomic_add_fetch(&q->writer_active_us,
+                                         storage_elapsed_us(step_start_us), __ATOMIC_RELEASE);
+                storage_cross_slot_update_stats(q, engine);
+                writer_failed = true; break;
+            }
+            (void)__atomic_add_fetch(&q->writer_active_us,
+                                     storage_elapsed_us(step_start_us), __ATOMIC_RELEASE);
         }
         storage_cross_slot_update_stats(q, engine);
+        expected_run_us = storage_wall_time_us();
         if (pop_rc == 0 && nvme_cross_slot_engine_active(engine) == 0u) {
             storage_ring_event(&q->writer_event_ring, STORAGE_EVENT_STOP_DRAINED,
                                q->rt, 0u, 0u, false);
@@ -2745,16 +2861,11 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
         cross_slot_qd = getenv(name) ? storage_env_flag_enabled(name) != 0 :
                         (getenv("SRC_REAL_NVME_CROSS_SLOT_QD") ?
                          storage_env_flag_enabled("SRC_REAL_NVME_CROSS_SLOT_QD") != 0 : cfg->id != 2);
-        snprintf(name, sizeof(name), "SRC_REAL_NVME_CROSS_SLOT_BATCH_CH%d", cfg->id);
-        cross_slot_batch = getenv(name) ? storage_env_u32_limit(name, 4u, 32u) :
-                           storage_env_u32_limit("SRC_REAL_NVME_CROSS_SLOT_BATCH",
-                                                 cfg->id == 2 ? 1u : 4u, 32u);
-        cross_slot_config.max_active_slots = storage_channel_env_u32(
-            cfg, "NVME_CROSS_SLOT_MAX_ACTIVE", "SRC_REAL_NVME_CROSS_SLOT_MAX_ACTIVE",
-            cfg->id == 2 ? 1u : 4u, 64u);
+        cross_slot_config.max_active_slots = storage_cross_slot_active_slots_for_channel(cfg->id);
+        cross_slot_batch = cross_slot_config.max_active_slots;
         cross_slot_config.target_qd = storage_channel_env_u32(
             cfg, "NVME_CROSS_SLOT_TARGET_QD", "SRC_REAL_NVME_CROSS_SLOT_TARGET_QD",
-            cfg->id == 2 ? 1u : 8u, 64u);
+            storage_cross_slot_default_target_qd(cfg->id), 64u);
         cross_slot_config.cq_batch = storage_channel_env_u32(
             cfg, "NVME_CROSS_SLOT_CQ_BATCH", "SRC_REAL_NVME_CROSS_SLOT_CQ_BATCH",
             32u, 64u);
@@ -2843,7 +2954,7 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                 args->task_no, (unsigned)args->file_index);
         goto out;
     }
-    if (effective_file_index != args->file_index) {
+    if (effective_file_index != args->file_index && storage_text_output_enabled()) {
         printf("storage_file_index_advanced task=%s requested_file_index=%u effective_file_index=%u source=metadata\n",
                args->task_no,
                (unsigned)args->file_index,
@@ -2903,13 +3014,12 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                        cfg->ddr_hw_base,
                        rt.dma_ring_bytes,
                        bounded ? 0u : 1u);
-    printf("storage_prepared channel=%d task=%s file_index=%u size=%" PRIu64 " continuous=%u\n",
-           cfg->id,
-           args->task_no,
-           (unsigned)effective_file_index,
-           requested_size,
-           bounded ? 0u : 1u);
-    fflush(stdout);
+    if (storage_text_output_enabled()) {
+        printf("storage_prepared channel=%d task=%s file_index=%u size=%" PRIu64 " continuous=%u\n",
+               cfg->id, args->task_no, (unsigned)effective_file_index, requested_size,
+               bounded ? 0u : 1u);
+        fflush(stdout);
+    }
 
     next_queue_lba = start_lba;
     if (storage_queue_init(&write_queue,
@@ -2924,13 +3034,12 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
     }
     write_queue.cross_slot_config = cross_slot_config;
     write_queue_ready = true;
-    printf("nvme_scheduler_config channel=%d mode=%s qd=%u cmd_size=%u max_dts=%u batch=%u\n",
-           cfg->id,
-           cross_slot_qd ? "cross_slot" : "single_slot",
-           (unsigned)rt.nvme_qd_effective,
-           (unsigned)rt.nvme_cmd_size_bytes,
-           (unsigned)rt.nvme_max_dts_bytes,
-           cross_slot_qd ? (unsigned)cross_slot_batch : 1u);
+    if (storage_text_output_enabled()) {
+        printf("nvme_scheduler_config channel=%d mode=%s qd=%u cmd_size=%u max_dts=%u batch=%u\n",
+               cfg->id, cross_slot_qd ? "cross_slot" : "single_slot",
+               (unsigned)rt.nvme_qd_effective, (unsigned)rt.nvme_cmd_size_bytes,
+               (unsigned)rt.nvme_max_dts_bytes, cross_slot_qd ? (unsigned)cross_slot_batch : 1u);
+    }
     storage_emit_line("storage_pipeline_config channel=%d mode=%s fast_pipeline=%u"
                       " requested_ring_bytes=%" PRIu64
                       " effective_ring_bytes=%" PRIu64
@@ -3285,16 +3394,14 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                                        idle_ms,
                                        dma_received_bytes,
                                        bytes_captured);
-                            printf("storage_idle_detected channel=%d task=%s file_index=%u idle_ms=%" PRIu64
-                                   " dma_received_bytes=%" PRIu64 " queued_file_bytes=%" PRIu64
-                                   " manual_stop_required=1\n",
-                                   cfg->id,
-                                   args->task_no,
-                                   (unsigned)effective_file_index,
-                                   idle_ms,
-                                   dma_received_bytes,
-                                   bytes_captured);
-                            fflush(stdout);
+                            if (storage_text_output_enabled()) {
+                                printf("storage_idle_detected channel=%d task=%s file_index=%u idle_ms=%" PRIu64
+                                       " dma_received_bytes=%" PRIu64 " queued_file_bytes=%" PRIu64
+                                       " manual_stop_required=1\n",
+                                       cfg->id, args->task_no, (unsigned)effective_file_index,
+                                       idle_ms, dma_received_bytes, bytes_captured);
+                                fflush(stdout);
+                            }
                             idle_notice_logged = true;
                         }
                     }
@@ -3965,6 +4072,7 @@ out:
         if (chunks > 0u && next_queue_lba >= start_lba) {
             total_sectors = next_queue_lba - start_lba;
         }
+        if (storage_text_output_enabled()) {
         printf("storage_transfer_failed channel=%d task=%s file_index=%u dma_received_bytes=%" PRIu64
                " file_bytes=%" PRIu64 " ssd_sector_bytes=%" PRIu64 " sectors=%" PRIu64
                " chunks=%u elapsed_ms=%" PRIu64 " nvme_write_ms=%" PRIu64
@@ -4005,6 +4113,7 @@ out:
                rt.dma_rxsof_count,
                rt.dma_rxeof_count,
                rt.dma_rx_packet_open ? 1u : 0u);
+        }
         storage_emit_line("storage_result channel=%d task=%s file_index=%u status=failed"
                           " file_bytes=%" PRIu64 " data_persisted=%u"
                           " receive_integrity_ok=0 storage_integrity_ok=0 integrity_ok=0"

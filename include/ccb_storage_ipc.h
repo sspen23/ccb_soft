@@ -44,8 +44,12 @@ typedef struct {
     uint64_t sq_full_wait_count, sq_full_wait_max_us, cq_empty_wait_count, cq_empty_wait_max_us;
     uint64_t submit_mmio_count, submit_mmio_max_us;
     uint64_t completion_process_count, completion_process_max_us;
+    uint64_t queue_empty_wait_us;
+    uint64_t writer_active_us;
     uint64_t no_progress_sleep_count;
+    uint64_t writer_no_progress_sleep_count;
     uint64_t dropped_perf_samples;
+    uint64_t dropped_diag_events;
     uint32_t receive_integrity_ok, storage_integrity_ok;
 } StoragePerfSample;
 
@@ -79,6 +83,8 @@ int storage_ipc_read_control(int fd, StorageControlMessage *msg);
 int storage_ipc_write_event(int fd, const StorageWorkerEvent *event);
 int storage_ipc_try_write_perf(int fd, const StorageWorkerEvent *event,
                                _Atomic uint64_t *dropped_perf_samples);
+int storage_ipc_try_write_diag(int fd, const StorageWorkerEvent *event,
+                               _Atomic uint64_t *dropped_diag_events);
 int storage_ipc_write_event_deadline(int fd, const StorageWorkerEvent *event,
                                      uint64_t deadline_us);
 int storage_ipc_validate_event(const StorageWorkerEvent *event);
