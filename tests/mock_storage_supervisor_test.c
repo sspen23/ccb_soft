@@ -184,6 +184,22 @@ static void test_final_and_aggregate(void)
     assert(storage_supervisor_result_status(&s) == STORAGE_TASK_FAILED);
 }
 
+static void test_diag_after_final_is_best_effort(void)
+{
+    StorageTaskSupervisor s;
+    StorageWorkerEvent value;
+
+    storage_supervisor_init(&s, 1u);
+    value = event(STORAGE_WORKER_FINAL_RESULT, 0u);
+    assert(handle_final(&s, &value) == 0);
+    assert(storage_supervisor_result_status(&s) == STORAGE_TASK_SUCCESS);
+
+    value = event(STORAGE_WORKER_DIAG_EVENT, 0u);
+    assert(storage_supervisor_handle_event(&s, &value) == 0);
+    assert(storage_supervisor_result_status(&s) == STORAGE_TASK_SUCCESS);
+    assert(!s.first_fatal);
+}
+
 static void test_result_failure_reasons(void)
 {
     StorageTaskSupervisor s;
@@ -253,6 +269,7 @@ int main(void)
     test_invalid_sequences();
     test_event_pipe_ownership();
     test_final_and_aggregate();
+    test_diag_after_final_is_best_effort();
     test_result_failure_reasons();
     test_one_channel_failure_rejects_aggregate();
     puts("mock_storage_supervisor_test: ok");

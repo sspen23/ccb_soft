@@ -113,7 +113,8 @@ int storage_supervisor_handle_event(StorageTaskSupervisor *s, const StorageWorke
         }
         break;
     case STORAGE_WORKER_DIAG_EVENT:
-        if ((s->final_seen_mask & b) != 0u) {
+        if ((s->running_mask & b) == 0u && (s->fatal_seen_mask & b) == 0u &&
+            (s->final_seen_mask & b) == 0u) {
             fail(s, e->channel, "invalid_diag_sequence");
             return -1;
         }
