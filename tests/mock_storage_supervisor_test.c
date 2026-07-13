@@ -229,6 +229,23 @@ static void test_result_failure_reasons(void)
     assert_reason(&s, "split_channel_byte_mismatch");
 }
 
+static void test_one_channel_failure_rejects_aggregate(void)
+{
+    StorageTaskSupervisor s;
+    StorageWorkerEvent value;
+
+    storage_supervisor_init(&s, 3u);
+    value = event(STORAGE_WORKER_FINAL_RESULT, 0u);
+    assert(handle_final(&s, &value) == 0);
+    assert(storage_supervisor_result_status(&s) == STORAGE_TASK_ACTIVE);
+    value = event(STORAGE_WORKER_FINAL_RESULT, 1u);
+    value.result.storage_integrity_ok = false;
+    assert(handle_final(&s, &value) == 0);
+    assert(s.aggregate_ready);
+    assert(storage_supervisor_result_status(&s) == STORAGE_TASK_FAILED);
+    assert_reason(&s, "storage_integrity_failed");
+}
+
 int main(void)
 {
     test_worker_exit_without_final();
@@ -237,6 +254,7 @@ int main(void)
     test_event_pipe_ownership();
     test_final_and_aggregate();
     test_result_failure_reasons();
+    test_one_channel_failure_rejects_aggregate();
     puts("mock_storage_supervisor_test: ok");
     return 0;
 }

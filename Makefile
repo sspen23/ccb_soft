@@ -29,6 +29,7 @@ SRCS := \
 	src/ccb_storage_supervisor.c \
 	src/ccb_storage_task.c \
 	src/ccb_storage_perf.c \
+	src/ccb_storage_commit.c \
 	src/ccb_commands.c \
 	src/ccb_tcp_transfer.c
 
@@ -48,6 +49,9 @@ mock-bd-test:
 	/tmp/mock_bd_ring_test
 
 storage-host-tests:
+	$(CC) $(CFLAGS) -Wformat=2 -Iinclude tests/mock_storage_commit_test.c \
+		src/ccb_storage_commit.c -o /tmp/mock_storage_commit_test
+	/tmp/mock_storage_commit_test
 	$(CC) $(CFLAGS) -Wformat=2 -Iinclude tests/mock_storage_ipc_test.c \
 		src/ccb_storage_ipc.c -o /tmp/mock_storage_ipc_test
 	/tmp/mock_storage_ipc_test

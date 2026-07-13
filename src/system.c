@@ -35,6 +35,7 @@
 #include "ccb_storage_supervisor.h"
 #include "ccb_storage_task.h"
 #include "ccb_storage_perf.h"
+#include "ccb_storage_commit.h"
 #include "ccb_tcp_transfer.h"
 #include "debug_uart.h"
 
@@ -117,6 +118,7 @@ Task transfer_task = {
 };
 LastTaskContext g_last_task = {0};
 static StorageTaskSupervisor g_storage_supervisor;
+static StorageCommitState g_storage_commit_state;
 
 static void poll_task_output(Task *task);
 static void drain_storage_events(Task *task, bool report_eof);
@@ -125,6 +127,7 @@ static void finalize_storage_task(Task *task, int exit_code);
 static void storage_try_send_pending_stops(void);
 static void storage_finish_worker_exit(Task *task, int exit_code, int signal_number);
 static void storage_handle_worker_exit(Task *task, int status);
+static int storage_commit_supervised_results(const char *task_id);
 
 static void storage_supervisor_emit_aggregate(void)
 {
@@ -137,12 +140,21 @@ static void storage_supervisor_emit_aggregate(void)
         bytes[i] = g_storage_supervisor.final_result[i].file_bytes;
         if (task_id[0] == '\0' && storage_tasks[i].task_id[0] != '\0') task_id = storage_tasks[i].task_id;
     }
+    if (status == STORAGE_TASK_SUCCESS && storage_commit_supervised_results(task_id) != 0) {
+        storage_supervisor_protocol_fail(&g_storage_supervisor, NUM_CHANNELS,
+                                         g_storage_commit_state.reason);
+        status = STORAGE_TASK_FAILED;
+    } else if (status == STORAGE_TASK_FAILED && task_id[0] != '\0') {
+        (void)task_update_status(task_id, TASK_FAILED);
+    }
     printf("storage_capture_complete task=%s status=%s ch0_bytes=%" PRIu64
            " ch1_bytes=%" PRIu64 " ch2_bytes=%" PRIu64 " integrity_ok=%u reason=%s\n",
            task_id,
            status == STORAGE_TASK_SUCCESS ? "success" : "failed", bytes[0], bytes[1], bytes[2],
            status == STORAGE_TASK_SUCCESS ? 1u : 0u,
-           status == STORAGE_TASK_SUCCESS ? "none" : g_storage_supervisor.fatal_reason);
+           status == STORAGE_TASK_SUCCESS ? "none" :
+               (g_storage_commit_state.attempted && !g_storage_commit_state.success
+                    ? g_storage_commit_state.reason : g_storage_supervisor.fatal_reason));
     g_storage_supervisor.aggregate_emitted = true;
 }
 
@@ -884,62 +896,6 @@ void check_task(Task *task)
 
 /* ================== storage worker helpers ================== */
 
-static int parse_token_u64(const char *text, const char *key, uint64_t *out_value)
-{
-    const char *p = text;
-    const char *last = NULL;
-    char *end = NULL;
-    uint64_t v;
-
-    if (!text || !key || !out_value) {
-        return -1;
-    }
-
-    while ((p = strstr(p, key)) != NULL) {
-        last = p;
-        p += strlen(key);
-    }
-    if (!last) {
-        return -1;
-    }
-
-    errno = 0;
-    v = strtoull(last + strlen(key), &end, 0);
-    if (errno != 0 || end == (last + strlen(key))) {
-        return -1;
-    }
-    *out_value = v;
-    return 0;
-}
-
-static int parse_token_double(const char *text, const char *key, double *out_value)
-{
-    const char *p = text;
-    const char *last = NULL;
-    char *end = NULL;
-    double v;
-
-    if (!text || !key || !out_value) {
-        return -1;
-    }
-
-    while ((p = strstr(p, key)) != NULL) {
-        last = p;
-        p += strlen(key);
-    }
-    if (!last) {
-        return -1;
-    }
-
-    errno = 0;
-    v = strtod(last + strlen(key), &end);
-    if (errno != 0 || end == (last + strlen(key))) {
-        return -1;
-    }
-    *out_value = v;
-    return 0;
-}
-
 
 static int metadata_delete_file(int channel_id, const char *task_id, int file_index)
 {
@@ -1273,7 +1229,10 @@ static uint8_t wait_storage_workers_finished_after_stop(const char *task_id, int
         ++waited_ms;
     }
 
-    if (storage_any_error()) {
+    storage_supervisor_emit_aggregate();
+    if (!g_storage_supervisor.aggregate_emitted ||
+        storage_supervisor_result_status(&g_storage_supervisor) != STORAGE_TASK_SUCCESS ||
+        !g_storage_commit_state.success) {
         LOG_ERROR("STORAGE", "One or more storage workers failed after stop: task=%s",
                   task_id ? task_id : "");
         dbg_printf("[DBG][STORAGE] stop wait failed task=%s\n", task_id ? task_id : "");
@@ -1287,9 +1246,6 @@ static uint8_t wait_storage_workers_finished_after_stop(const char *task_id, int
                task_id ? task_id : "",
                (unsigned)waited_ms,
                stop_requested);
-    if (task_id && task_id[0] != '\0') {
-        (void)task_update_status(task_id, TASK_COMPLETED);
-    }
     return ACK_SUCCESS;
 }
 
@@ -1365,6 +1321,170 @@ static const char *file_type_name_from_proto(uint32_t proto_file_type)
     default:
         return "UNKNOWN";
     }
+}
+
+typedef struct {
+    FileEntry metadata_backup[NUM_CHANNELS][MAX_FILES_TOTAL];
+    bool metadata_backup_valid[NUM_CHANNELS];
+} StorageCommitContext;
+
+static int storage_commit_db_begin(void *ctx)
+{
+    (void)ctx;
+    return file_db_begin();
+}
+
+static int storage_commit_record_exists(void *ctx, const FileRecord *record)
+{
+    FileRecord existing;
+    (void)ctx;
+    memset(&existing, 0, sizeof(existing));
+    return file_query_by_index(record->task_id, record->file_index, &existing) == 0 ? 1 : 0;
+}
+
+static int storage_commit_metadata_write(void *opaque, const StorageCommitItem *item)
+{
+    StorageCommitContext *ctx = opaque;
+    ChannelRuntime rt;
+    FileEntry table[MAX_FILES_TOTAL];
+
+    if (!ctx || !item || item->channel >= NUM_CHANNELS ||
+        item->metadata_slot >= MAX_FILES_TOTAL || !find_channel((int)item->channel)) return -1;
+    memset(&rt, 0, sizeof(rt));
+    rt.cfg = find_channel((int)item->channel);
+    if (metadata_read(&rt, table) != 0) return -1;
+    memcpy(ctx->metadata_backup[item->channel], table, sizeof(table));
+    ctx->metadata_backup_valid[item->channel] = true;
+    if (table[item->metadata_slot].valid == 1u) return -1;
+    table[item->metadata_slot] = item->metadata;
+    return metadata_write(&rt, table);
+}
+
+static int storage_commit_metadata_rollback(void *opaque, const StorageCommitItem *item)
+{
+    StorageCommitContext *ctx = opaque;
+    ChannelRuntime rt;
+
+    if (!ctx || !item || item->channel >= NUM_CHANNELS ||
+        !ctx->metadata_backup_valid[item->channel] || !find_channel((int)item->channel)) return -1;
+    memset(&rt, 0, sizeof(rt));
+    rt.cfg = find_channel((int)item->channel);
+    if (metadata_write(&rt, ctx->metadata_backup[item->channel]) != 0) return -1;
+    ctx->metadata_backup_valid[item->channel] = false;
+    return 0;
+}
+
+static int storage_commit_record_insert(void *ctx, const FileRecord *record)
+{
+    (void)ctx;
+    return file_add(record);
+}
+
+static int storage_commit_record_count(void *ctx, const char *task_id, int *count)
+{
+    (void)ctx;
+    *count = file_count_by_task(task_id);
+    return *count < 0 ? -1 : 0;
+}
+
+static int storage_commit_total_update(void *ctx, const char *task_id, int count)
+{
+    (void)ctx;
+    return task_update_total_files(task_id, count);
+}
+
+static int storage_commit_status_update(void *ctx, const char *task_id, TaskStatus status)
+{
+    (void)ctx;
+    return task_update_status(task_id, status);
+}
+
+static int storage_commit_db_commit(void *ctx)
+{
+    (void)ctx;
+    return file_db_commit();
+}
+
+static int storage_commit_db_rollback(void *ctx)
+{
+    (void)ctx;
+    return file_db_rollback();
+}
+
+static int storage_commit_supervised_results(const char *task_id)
+{
+    StorageCommitContext ctx;
+    StorageCommitItem items[NUM_CHANNELS];
+    StorageCommitOps ops;
+    size_t count = 0u;
+    uint32_t channel;
+
+    memset(&ctx, 0, sizeof(ctx));
+    memset(items, 0, sizeof(items));
+    memset(&ops, 0, sizeof(ops));
+    for (channel = 0u; channel < NUM_CHANNELS; ++channel) {
+        const Task *task;
+        const PlannedFile *planned;
+        const WriteResult *result;
+        StorageCommitItem *item;
+
+        if ((g_storage_supervisor.target_channel_mask & (1u << channel)) == 0u) continue;
+        task = &storage_tasks[channel];
+        planned = &task->planned_file;
+        result = &g_storage_supervisor.final_result[channel];
+        if (!task->has_planned_file || planned->channel_id != (int)channel ||
+            result->channel_id != (int)channel || result->metadata_slot >= MAX_FILES_TOTAL ||
+            result->file_index > UINT16_MAX || result->sector_count > UINT32_MAX ||
+            strcmp(task->task_id, task_id) != 0 || strcmp(result->task_no, task_id) != 0) {
+            snprintf(g_storage_commit_state.reason, sizeof(g_storage_commit_state.reason),
+                     "%s", "provisional_result_mismatch");
+            g_storage_commit_state.attempted = true;
+            g_storage_commit_state.success = false;
+            (void)task_update_status(task_id, TASK_FAILED);
+            return -1;
+        }
+        item = &items[count++];
+        item->channel = channel;
+        item->metadata_slot = result->metadata_slot;
+        memcpy(item->metadata.task_no, task_id,
+               strlen(task_id) < sizeof(item->metadata.task_no)
+                   ? strlen(task_id) : sizeof(item->metadata.task_no));
+        item->metadata.file_cnt = 1u;
+        item->metadata.file_type = (uint8_t)planned->proto_file_type_code;
+        item->metadata.file_index = (uint16_t)result->file_index;
+        item->metadata.file_size_bytes = result->file_bytes > UINT32_MAX
+                                             ? UINT32_MAX : (uint32_t)result->file_bytes;
+        item->metadata.start_lba = result->start_lba;
+        item->metadata.sector_count = (uint32_t)result->sector_count;
+        item->metadata.valid = 1u;
+
+        snprintf(item->record.task_id, sizeof(item->record.task_id), "%s", task_id);
+        item->record.overpass_time = task->overpass_time;
+        item->record.file_index = (int)result->file_index;
+        snprintf(item->record.file_type, sizeof(item->record.file_type), "%s",
+                 file_type_name_from_proto((uint32_t)planned->proto_file_type_code));
+        item->record.channel_id = (int)channel;
+        item->record.proto_file_type_code = planned->proto_file_type_code;
+        item->record.calibration_type = planned->calibration_type;
+        item->record.start_sector = result->start_lba;
+        item->record.sector_count = result->sector_count;
+        item->record.file_size = result->file_bytes;
+        snprintf(item->record.filename, sizeof(item->record.filename), "%s_%s_%u.bin",
+                 task_id, item->record.file_type, (unsigned)result->file_index);
+    }
+
+    ops.ctx = &ctx;
+    ops.db_begin = storage_commit_db_begin;
+    ops.record_exists = storage_commit_record_exists;
+    ops.metadata_write = storage_commit_metadata_write;
+    ops.metadata_rollback = storage_commit_metadata_rollback;
+    ops.record_insert = storage_commit_record_insert;
+    ops.record_count = storage_commit_record_count;
+    ops.task_total_update = storage_commit_total_update;
+    ops.task_status_update = storage_commit_status_update;
+    ops.db_commit = storage_commit_db_commit;
+    ops.db_rollback = storage_commit_db_rollback;
+    return storage_commit_run_once(&g_storage_commit_state, task_id, items, count, &ops);
 }
 
 static void append_task_output(Task *task, const char *buf, size_t len)
@@ -2012,242 +2132,19 @@ static int start_storage_workers_barrier(const char *task_id)
 
 static void finalize_storage_task(Task *task, int exit_code)
 {
-    PlannedFile planned;
-    uint64_t start_lba = 0u;
-    uint64_t sector_count = 0u;
-    uint64_t dma_received_bytes = 0u;
-    uint64_t file_bytes = 0u;
-    uint64_t ssd_sector_bytes = 0u;
-    uint64_t elapsed_ms = 0u;
-    uint64_t nvme_write_ms = 0u;
-    uint64_t effective_file_index = 0u;
-    uint64_t data_persisted = 0u;
-    uint64_t integrity_ok = 0u;
-    uint64_t dma_stop_recovered = 0u;
-    uint64_t nvme_cmd_count = 0u;
-    uint64_t nvme_cmd_size_bytes = 0u;
-    uint64_t nvme_max_dts_bytes = 0u;
-    uint64_t nvme_qd_effective = 0u;
-    uint64_t nvme_active_qd_max = 0u;
-    double nvme_active_qd_avg = 0.0;
-    uint64_t ring_full_count = 0u;
-    uint64_t ring_full_total_ms = 0u;
-    uint64_t max_ddr_busy_slots = 0u;
-    uint64_t max_ddr_buffered_bytes = 0u;
-    uint64_t ready_q_max = 0u;
-    uint64_t ready_q_avg = 0u;
-    uint64_t writer_idle_ms = 0u;
-    uint64_t writer_active_ms = 0u;
-    uint64_t dma_no_free_slot_count = 0u;
-    uint64_t dma_harvest_batch_avg = 0u;
-    uint64_t dma_harvest_batch_max = 0u;
-    uint64_t submit_stall_count = 0u;
-    uint64_t submit_stall_max_us = 0u;
-    uint64_t writer_rt_enabled = 0u;
-    uint64_t writer_rt_prio = 0u;
-    uint64_t writer_empty_wait_us = 0u;
-    uint64_t writer_drain_active_us = 0u;
-    uint64_t ready_q_nonempty_us = 0u;
-    uint64_t writer_drain_loop_count = 0u;
-    uint64_t writer_slots_per_drain_loop = 0u;
+    const WriteResult *result;
+    bool success;
 
-    if (!task || !task->has_planned_file) {
-        return;
-    }
-
-    planned = task->planned_file;
-    if (!task->final_result_seen) {
-        task->state = ERROR;
-        task->has_planned_file = false;
-        (void)task_update_status(task->task_id, TASK_FAILED);
-        (void)request_storage_stop_all();
-        return;
-    }
-    {
-        const WriteResult *r = &task->final_result;
-        bool ok = exit_code == 0 && r->data_persisted && r->receive_integrity_ok &&
-                  r->storage_integrity_ok && r->integrity_ok &&
-                  r->dma_received_bytes == r->nvme_completed_bytes &&
-                  r->nvme_completed_bytes == r->file_bytes;
-        if (!ok) {
-            task->state = ERROR;
-            task->has_planned_file = false;
-            (void)task_update_status(task->task_id, TASK_FAILED);
-            (void)request_storage_stop_all();
-            return;
-        }
-        planned.start_lba = r->start_lba;
-        planned.sector_count = r->sector_count;
-        planned.file_index = (int)r->file_index;
-        task->state = IDLE;
-        task->has_planned_file = false;
-        return;
-    }
-
-    /* Legacy stdout parser retained below for source history only; unreachable. */
-    if (exit_code != 0 ||
-        (task->final_result_seen &&
-         (!task->final_status_success || !task->final_integrity_ok ||
-          !task->final_data_persisted))) {
-        (void)parse_token_u64(task->output, "data_persisted=", &data_persisted);
-        (void)parse_token_u64(task->output, "integrity_ok=", &integrity_ok);
-        (void)parse_token_u64(task->output, "dma_stop_recovered=", &dma_stop_recovered);
-        task->state = ERROR;
-        task->has_planned_file = false;
-        (void)task_update_status(task->task_id, TASK_FAILED);
-        (void)request_storage_stop_all();
-        LOG_ERROR("STORAGE",
-                  "Storage worker failed: task=%s ch=%d idx=%d exit=%d output=%s",
-                  task->task_id,
-                  planned.channel_id,
-                  planned.file_index,
-                  exit_code != 0 ? exit_code : 1,
-                  task->output);
-        dbg_printf("[DBG][STORAGE] worker failed task=%s ch=%d idx=%d exit=%d"
-                   " data_persisted=%" PRIu64 " integrity_ok=%" PRIu64
-                   " dma_stop_recovered=%" PRIu64 " output=%s\n",
-                   task->task_id,
-                   planned.channel_id,
-                   planned.file_index,
-                   exit_code != 0 ? exit_code : 1,
-                   data_persisted,
-                   integrity_ok,
-                   dma_stop_recovered,
-                   task->output);
-        return;
-    }
-
-    if (parse_token_u64(task->output, "start_lba=", &start_lba) == 0) {
-        planned.start_lba = start_lba;
-    }
-    if (parse_token_u64(task->output, "sectors=", &sector_count) == 0) {
-        planned.sector_count = sector_count;
-    }
-    if (parse_token_u64(task->output, "effective_file_index=", &effective_file_index) == 0 &&
-        effective_file_index <= INT_MAX) {
-        planned.file_index = (int)effective_file_index;
-    }
-    (void)parse_token_u64(task->output, "dma_received_bytes=", &dma_received_bytes);
-    (void)parse_token_u64(task->output, "file_bytes=", &file_bytes);
-    (void)parse_token_u64(task->output, "ssd_sector_bytes=", &ssd_sector_bytes);
-    (void)parse_token_u64(task->output, "elapsed_ms=", &elapsed_ms);
-    (void)parse_token_u64(task->output, "nvme_write_ms=", &nvme_write_ms);
-    (void)parse_token_u64(task->output, "nvme_cmd_count=", &nvme_cmd_count);
-    (void)parse_token_u64(task->output, "nvme_cmd_size_bytes=", &nvme_cmd_size_bytes);
-    (void)parse_token_u64(task->output, "nvme_max_dts_bytes=", &nvme_max_dts_bytes);
-    (void)parse_token_u64(task->output, "nvme_qd_effective=", &nvme_qd_effective);
-    (void)parse_token_u64(task->output, "nvme_active_qd_max=", &nvme_active_qd_max);
-    (void)parse_token_double(task->output, "nvme_active_qd_avg=", &nvme_active_qd_avg);
-    (void)parse_token_u64(task->output, "ring_full_count=", &ring_full_count);
-    (void)parse_token_u64(task->output, "ring_full_total_ms=", &ring_full_total_ms);
-    (void)parse_token_u64(task->output, "max_ddr_busy_slots=", &max_ddr_busy_slots);
-    (void)parse_token_u64(task->output, "max_ddr_buffered_bytes=", &max_ddr_buffered_bytes);
-    (void)parse_token_u64(task->output, "final_ready_q_max=", &ready_q_max);
-    (void)parse_token_u64(task->output, "final_ready_q_avg=", &ready_q_avg);
-    (void)parse_token_u64(task->output, "final_writer_idle_ms=", &writer_idle_ms);
-    (void)parse_token_u64(task->output, "final_writer_active_ms=", &writer_active_ms);
-    (void)parse_token_u64(task->output, "final_dma_no_free_slot_count=", &dma_no_free_slot_count);
-    (void)parse_token_u64(task->output, "final_dma_harvest_batch_avg=", &dma_harvest_batch_avg);
-    (void)parse_token_u64(task->output, "final_dma_harvest_batch_max=", &dma_harvest_batch_max);
-    (void)parse_token_u64(task->output, "submit_stall_count=", &submit_stall_count);
-    (void)parse_token_u64(task->output, "submit_stall_max_us=", &submit_stall_max_us);
-    (void)parse_token_u64(task->output, "writer_rt_enabled=", &writer_rt_enabled);
-    (void)parse_token_u64(task->output, "writer_rt_prio=", &writer_rt_prio);
-    (void)parse_token_u64(task->output, "writer_empty_wait_us=", &writer_empty_wait_us);
-    (void)parse_token_u64(task->output, "writer_drain_active_us=", &writer_drain_active_us);
-    (void)parse_token_u64(task->output, "ready_q_nonempty_us=", &ready_q_nonempty_us);
-    (void)parse_token_u64(task->output, "writer_drain_loop_count=", &writer_drain_loop_count);
-    (void)parse_token_u64(task->output, "writer_slots_per_drain_loop=", &writer_slots_per_drain_loop);
-
-    task->state = IDLE;
-    task->has_planned_file = false;
-    LOG_INFO("STORAGE",
-             "Storage worker completed: task=%s ch=%d idx=%d lba=0x%08" PRIx64
-             " sectors=%" PRIu64 " dma_received_bytes=%" PRIu64
-             " file_bytes=%" PRIu64 " ssd_sector_bytes=%" PRIu64
-             " elapsed_ms=%" PRIu64 " nvme_write_ms=%" PRIu64,
-             task->task_id,
-             planned.channel_id,
-             planned.file_index,
-             planned.start_lba,
-             planned.sector_count,
-             dma_received_bytes,
-             file_bytes,
-             ssd_sector_bytes,
-             elapsed_ms,
-             nvme_write_ms);
-    printf("storage_worker_done task=%s channel=%d file_index=%d dma_received_bytes=%" PRIu64
-           " file_bytes=%" PRIu64 " ssd_sector_bytes=%" PRIu64
-           " start_lba=0x%08" PRIx64 " sectors=%" PRIu64
-           " elapsed_ms=%" PRIu64 " nvme_write_ms=%" PRIu64
-           " nvme_cmd_count=%" PRIu64 " nvme_cmd_size_bytes=%" PRIu64
-           " nvme_max_dts_bytes=%" PRIu64
-           " nvme_qd_effective=%" PRIu64 " nvme_active_qd_max=%" PRIu64
-           " nvme_active_qd_avg=%.3f"
-           " ring_full_count=%" PRIu64 " ring_full_total_ms=%" PRIu64
-           " max_ddr_busy_slots=%" PRIu64 " max_ddr_buffered_bytes=%" PRIu64
-           " ready_q_max=%" PRIu64 " ready_q_avg=%" PRIu64
-           " writer_idle_ms=%" PRIu64 " writer_active_ms=%" PRIu64
-           " dma_no_free_slot_count=%" PRIu64
-           " dma_harvest_batch_avg=%" PRIu64 " dma_harvest_batch_max=%" PRIu64
-           " submit_stall_count=%" PRIu64 " submit_stall_max_us=%" PRIu64
-           " writer_rt_enabled=%" PRIu64 " writer_rt_prio=%" PRIu64
-           " writer_empty_wait_us=%" PRIu64 " writer_drain_active_us=%" PRIu64
-           " ready_q_nonempty_us=%" PRIu64
-           " writer_drain_loop_count=%" PRIu64
-           " writer_slots_per_drain_loop=%" PRIu64 "\n",
-           task->task_id,
-           planned.channel_id,
-           planned.file_index,
-           dma_received_bytes,
-           file_bytes,
-           ssd_sector_bytes,
-           planned.start_lba,
-           planned.sector_count,
-           elapsed_ms,
-           nvme_write_ms,
-           nvme_cmd_count,
-           nvme_cmd_size_bytes,
-           nvme_max_dts_bytes,
-           nvme_qd_effective,
-           nvme_active_qd_max,
-           nvme_active_qd_avg,
-           ring_full_count,
-           ring_full_total_ms,
-           max_ddr_busy_slots,
-           max_ddr_buffered_bytes,
-           ready_q_max,
-           ready_q_avg,
-           writer_idle_ms,
-           writer_active_ms,
-           dma_no_free_slot_count,
-           dma_harvest_batch_avg,
-           dma_harvest_batch_max,
-           submit_stall_count,
-           submit_stall_max_us,
-           writer_rt_enabled,
-           writer_rt_prio,
-           writer_empty_wait_us,
-           writer_drain_active_us,
-           ready_q_nonempty_us,
-           writer_drain_loop_count,
-           writer_slots_per_drain_loop);
-    dbg_printf("[DBG][STORAGE] completed task=%s ch=%d idx=%d lba=0x%08" PRIx64
-               " sectors=%" PRIu64 " dma_received=%" PRIu64
-               " file_bytes=%" PRIu64 " ssd_sector_bytes=%" PRIu64
-               " elapsed_ms=%" PRIu64 " nvme_write_ms=%" PRIu64 "\n",
-               task->task_id,
-               planned.channel_id,
-               planned.file_index,
-               planned.start_lba,
-               planned.sector_count,
-               dma_received_bytes,
-               file_bytes,
-               ssd_sector_bytes,
-               elapsed_ms,
-               nvme_write_ms);
+    if (!task || !task->has_planned_file) return;
+    result = &task->final_result;
+    success = task->final_result_seen && exit_code == 0 && result->data_persisted &&
+              result->receive_integrity_ok && result->storage_integrity_ok &&
+              result->integrity_ok &&
+              result->dma_received_bytes == result->nvme_completed_bytes &&
+              result->nvme_completed_bytes == result->file_bytes;
+    task->state = success ? IDLE : ERROR;
+    if (!success) (void)request_storage_stop_all();
 }
-
 static int ensure_task_for_standalone_storage(const char *task_id, time_t *out_overpass)
 {
     TaskInfo info;
@@ -3521,7 +3418,7 @@ static uint8_t start_storage_for_last_task(uint8_t *failure_type)
         (void)task_update_status(g_last_task.task_id, TASK_FAILED);
         return ACK_INVALID_PARAM;
     }
-    { uint32_t mask = 0u; for (i = 0; i < planned_count; ++i) mask |= 1u << planned[i].channel_id; storage_supervisor_init(&g_storage_supervisor, mask); }
+    { uint32_t mask = 0u; for (i = 0; i < planned_count; ++i) mask |= 1u << planned[i].channel_id; storage_supervisor_init(&g_storage_supervisor, mask); storage_commit_state_reset(&g_storage_commit_state); }
     for (i = 0; i < planned_count; ++i) {
         if (!find_channel(planned[i].channel_id)) {
             if (failure_type) {
@@ -4330,22 +4227,6 @@ static int run_storage_worker_main(int argc, char **argv)
         fprintf(stderr, "Failed to initialize logger\n");
         return 1;
     }
-    if (file_list_init(FILELIST_DB_PATH) != 0) {
-        char cwd[PATH_MAX];
-        logger_close();
-        fprintf(stderr, "Failed to initialize file list database path=%s cwd=%s\n",
-                FILELIST_DB_PATH,
-                get_current_working_dir(cwd, sizeof(cwd)));
-        return 1;
-    }
-
-    if (advance_duplicate_file_index_from_db(&args) != 0) {
-        file_list_close();
-        logger_close();
-        fprintf(stderr, "Failed to allocate next file index for task=%s\n", args.task_no);
-        return 1;
-    }
-
     install_storage_worker_signal_handlers();
 
     dbg_printf("[DBG][WORKER] execute_write start ch=%d mode=%s size=%" PRIu64 " task=%s idx=%u dry=%u\n",
@@ -4355,18 +4236,7 @@ static int run_storage_worker_main(int argc, char **argv)
                args.task_no,
                (unsigned)args.file_index,
                gopt.dry_run ? 1u : 0u);
-    rc = execute_write_with_result(&args, gopt, &result);
-    if (rc == 0 && result.data_persisted && result.receive_integrity_ok &&
-        result.storage_integrity_ok && result.integrity_ok &&
-        result.dma_received_bytes == result.nvme_completed_bytes &&
-        result.nvme_completed_bytes == result.file_bytes &&
-        record_storage_result_to_db(&args, &result) != 0) {
-        (void)task_update_status(args.task_no, TASK_FAILED);
-        rc = -1;
-    }
-    if (rc != 0) {
-        (void)task_update_status(args.task_no, TASK_FAILED);
-    }
+    rc = execute_write_with_result_mode(&args, gopt, &result, STORAGE_WRITE_SUPERVISED);
     {
         StorageWorkerEvent event;
         const char *fd_text = getenv("SRC_REAL_STORAGE_EVENT_FD");
@@ -4407,7 +4277,6 @@ static int run_storage_worker_main(int argc, char **argv)
                args.task_no,
                (unsigned)result.file_index,
                result.data_persisted ? 1u : 0u);
-    file_list_close();
     logger_close();
     return (rc == 0) ? 0 : 1;
 }

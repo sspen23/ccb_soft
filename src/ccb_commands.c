@@ -2663,7 +2663,8 @@ static int flush_slot_to_nvme(ChannelRuntime *rt,
     return 0;
 }
 
-int execute_write_with_result(const ParsedArgs *args, GlobalOptions gopt, WriteResult *result) {
+int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
+                                   WriteResult *result, StorageWriteMode mode) {
     const ChannelConfig *cfg = find_channel(args->channel_id);
     ChannelRuntime rt;
     FileEntry table[MAX_FILES_TOTAL];
@@ -3621,7 +3622,7 @@ int execute_write_with_result(const ParsedArgs *args, GlobalOptions gopt, WriteR
         goto out;
     }
 
-    {
+    if (storage_write_mode_commits_locally(mode)) {
         FileEntry e;
         memset(&e, 0, sizeof(e));
         memcpy(e.task_no, args->task_no, strlen(args->task_no));
@@ -3633,30 +3634,31 @@ int execute_write_with_result(const ParsedArgs *args, GlobalOptions gopt, WriteR
         e.sector_count = (uint32_t)total_sectors;
         e.valid = 1u;
         table[metadata_slot] = e;
-    }
-
-    if (metadata_write(&rt, table) != 0) {
-        dbg_printf("[DBG][WRITE] metadata_write failed ch=%d task=%s idx=%u\n",
-                   cfg->id, args->task_no, (unsigned)effective_file_index);
-        goto out;
+        if (metadata_write(&rt, table) != 0) {
+            dbg_printf("[DBG][WRITE] metadata_write failed ch=%d task=%s idx=%u\n",
+                       cfg->id, args->task_no, (unsigned)effective_file_index);
+            goto out;
+        }
     }
     data_persisted = true;
 
-    printf("metadata_write_done backend=ramfs channel=%d name=%s slot=%d task=%s file_index=%u size=%" PRIu64
-           " metadata_size_saturated=%u start_lba=0x%08" PRIx64
-           " sectors=%" PRIu64 " file_type=%u chunks=%u continuous=%u\n",
-           cfg->id,
-           cfg->name,
-           metadata_slot,
-           args->task_no,
-           (unsigned)effective_file_index,
-           bytes_written,
-           bytes_written > UINT32_MAX ? 1u : 0u,
-           start_lba,
-           total_sectors,
-           (unsigned)(args->has_proto_file_type ? args->proto_file_type : cfg->file_type),
-           chunks,
-           bounded ? 0u : 1u);
+    if (storage_write_mode_commits_locally(mode)) {
+        printf("metadata_write_done backend=ramfs channel=%d name=%s slot=%d task=%s file_index=%u size=%" PRIu64
+               " metadata_size_saturated=%u start_lba=0x%08" PRIx64
+               " sectors=%" PRIu64 " file_type=%u chunks=%u continuous=%u\n",
+               cfg->id,
+               cfg->name,
+               metadata_slot,
+               args->task_no,
+               (unsigned)effective_file_index,
+               bytes_written,
+               bytes_written > UINT32_MAX ? 1u : 0u,
+               start_lba,
+               total_sectors,
+               (unsigned)(args->has_proto_file_type ? args->proto_file_type : cfg->file_type),
+               chunks,
+               bounded ? 0u : 1u);
+    }
     {
         uint64_t nvme_cmd_count = __atomic_load_n(&rt.nvme_cmd_count, __ATOMIC_ACQUIRE);
         uint64_t nvme_cmd_bytes_total = __atomic_load_n(&rt.nvme_cmd_bytes_total, __ATOMIC_ACQUIRE);
@@ -4217,6 +4219,10 @@ out:
     }
     channel_runtime_close(&rt);
     return rc;
+}
+
+int execute_write_with_result(const ParsedArgs *args, GlobalOptions gopt, WriteResult *result) {
+    return execute_write_with_result_mode(args, gopt, result, STORAGE_WRITE_STANDALONE);
 }
 
 int execute_write(const ParsedArgs *args, GlobalOptions gopt) {

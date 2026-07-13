@@ -32,9 +32,21 @@ typedef struct {
     char task_no[12];
 } WriteResult;
 
+typedef enum {
+    STORAGE_WRITE_STANDALONE = 0,
+    STORAGE_WRITE_SUPERVISED
+} StorageWriteMode;
+
+static inline bool storage_write_mode_commits_locally(StorageWriteMode mode)
+{
+    return mode == STORAGE_WRITE_STANDALONE;
+}
+
 /* Execute one write acquisition + SSD persist flow. */
 int execute_write(const ParsedArgs *args, GlobalOptions gopt);
 int execute_write_with_result(const ParsedArgs *args, GlobalOptions gopt, WriteResult *result);
+int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
+                                   WriteResult *result, StorageWriteMode mode);
 int execute_ddr_pattern_store_with_result(const ParsedArgs *args, GlobalOptions gopt, WriteResult *result);
 int execute_ssd_lba_wrap_test(const ParsedArgs *args, GlobalOptions gopt);
 int execute_ssd_continuous_pattern_test(const ParsedArgs *args, GlobalOptions gopt);
