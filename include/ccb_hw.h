@@ -12,6 +12,7 @@ int ddr_addr_validate(const ChannelConfig *cfg, uint64_t cpu_addr, uint64_t size
 /* Build/release mapped runtime state for one channel. */
 int channel_runtime_open(ChannelRuntime *rt, const ChannelConfig *cfg, GlobalOptions gopt);
 void channel_runtime_close(ChannelRuntime *rt);
+uint32_t nvme_default_qd_for_channel(int channel_id);
 void storage_print_pcie_link_status(ChannelRuntime *rt, const char *reason);
 
 /* Configure data path source and probe NVMe host capabilities. */

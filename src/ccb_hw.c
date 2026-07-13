@@ -38,7 +38,7 @@
 #define NVME_CMD_KIB_DEFAULT 256u
 #define NVME_CMD_KIB_HIGH_DEFAULT 1024u
 #define NVME_CMD_KIB_MAX 4096u
-#define NVME_QD_DEFAULT 8u
+#define NVME_QD_DEFAULT 4u
 #define NVME_QD_HIGH_DEFAULT 8u
 #define NVME_QD_SAFETY_MAX 32u
 #define NVME_PENDING_CAPACITY 32u
@@ -353,11 +353,15 @@ static uint32_t channel_default_nvme_cmd_kib(const ChannelRuntime *rt) {
     return NVME_CMD_KIB_DEFAULT;
 }
 
-static uint32_t channel_default_nvme_qd(const ChannelRuntime *rt) {
-    if (rt && (rt->cfg->id == HIGH_I_CHANNEL_ID || rt->cfg->id == HIGH_Q_CHANNEL_ID)) {
+uint32_t nvme_default_qd_for_channel(int channel_id) {
+    if (channel_id == HIGH_I_CHANNEL_ID || channel_id == HIGH_Q_CHANNEL_ID) {
         return NVME_QD_HIGH_DEFAULT;
     }
     return NVME_QD_DEFAULT;
+}
+
+static uint32_t channel_default_nvme_qd(const ChannelRuntime *rt) {
+    return nvme_default_qd_for_channel(rt && rt->cfg ? rt->cfg->id : -1);
 }
 
 static const char *channel_env(const ChannelRuntime *rt, const char *prefix, char *buf, size_t buf_size) {

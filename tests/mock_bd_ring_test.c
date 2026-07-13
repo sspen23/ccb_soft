@@ -49,6 +49,10 @@ int main(void)
     DmaHarvestItem harvested[4];
     uint32_t harvested_count = 0u;
 
+    assert(nvme_default_qd_for_channel(HIGH_I_CHANNEL_ID) == 8u);
+    assert(nvme_default_qd_for_channel(HIGH_Q_CHANNEL_ID) == 8u);
+    assert(nvme_default_qd_for_channel(LOW_SPEED_CHANNEL_ID) == 4u);
+
     init_runtime(&rt, &cfg, desc, dma_regs);
     memset(state, STORAGE_SLOT_DMA_WRITABLE, sizeof(state));
     assert(dma_get_bd_snapshot(&rt, state, &snapshot) == 0);
