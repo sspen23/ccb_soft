@@ -13,8 +13,16 @@ typedef struct {
     unsigned callbacks;
     unsigned fail_callback;
     int sq_full_once;
+    unsigned poll_count;
+    unsigned release_after_polls;
+    int release_on_yield;
+    uint16_t delayed_cid;
+    unsigned yield_count;
+    unsigned sleep_count;
     uint64_t now_us;
 } Mock;
+
+static void queue_completion(Mock *mock, uint16_t cid, int error);
 
 static int submit(void *opaque, uint16_t cid, uint64_t lba, uint32_t sectors, uint64_t ddr_addr)
 {
@@ -33,6 +41,11 @@ static int submit(void *opaque, uint16_t cid, uint64_t lba, uint32_t sectors, ui
 static int poll_completion(void *opaque, NvmeCompletion *completion)
 {
     Mock *mock = opaque;
+    ++mock->poll_count;
+    if (mock->release_after_polls != 0u && mock->poll_count >= mock->release_after_polls &&
+        mock->completion_count == 0u) {
+        queue_completion(mock, mock->delayed_cid, 0);
+    }
     if (mock->completion_index >= mock->completion_count) return 0;
     *completion = mock->completions[mock->completion_index++];
     return 1;
@@ -47,7 +60,17 @@ static uint64_t monotonic_us(void *opaque)
 static void sleep_us(void *opaque, uint32_t us)
 {
     Mock *mock = opaque;
+    ++mock->sleep_count;
     mock->now_us += us;
+}
+
+static void yield_cpu(void *opaque)
+{
+    Mock *mock = opaque;
+    ++mock->yield_count;
+    if (mock->release_on_yield && mock->completion_count == 0u) {
+        queue_completion(mock, mock->delayed_cid, 0);
+    }
 }
 
 static int done(void *opaque, const NvmeWriteSlotReq *req)
@@ -86,7 +109,7 @@ static NvmeWriteSlotReq request(uint32_t slot, uint64_t sectors)
 
 static NvmeCrossSlotEngine *engine(ChannelRuntime *rt, Mock *mock)
 {
-    NvmeCrossSlotOps ops = { submit, poll_completion, monotonic_us, sleep_us };
+    NvmeCrossSlotOps ops = { submit, poll_completion, monotonic_us, sleep_us, yield_cpu };
     NvmeCrossSlotConfig value = config();
     memset(rt, 0, sizeof(*rt));
     rt->nvme_qd_effective = 4u;
@@ -172,6 +195,7 @@ static void test_capacity_sq_full_and_callback(void)
     ChannelRuntime rt;
     Mock mock;
     NvmeCrossSlotEngine *value;
+    NvmeCrossSlotStats stats;
     NvmeWriteSlotReq a = request(4u, 1u), b = request(5u, 1u), c = request(6u, 1u);
 
     memset(&mock, 0, sizeof(mock)); value = engine(&rt, &mock);
@@ -181,9 +205,12 @@ static void test_capacity_sq_full_and_callback(void)
     assert(nvme_cross_slot_engine_add(value, &c) == 1);
     mock.sq_full_once = 1;
     assert(nvme_cross_slot_engine_step(value, 300u, done, &mock) == 0);
-    assert(mock.submitted_count == 0u);
+    assert(mock.submitted_count == 2u);
+    nvme_cross_slot_engine_get_stats(value, &stats);
+    assert(stats.sq_full_wait_count == 1u && stats.submit_mmio_count >= 3u);
     assert(nvme_cross_slot_engine_active(value) == 2u);
     assert(nvme_cross_slot_engine_step(value, 300u, done, &mock) == 0);
+    assert(mock.submitted_count == 2u);
     queue_completion(&mock, mock.submitted[0], 0);
     queue_completion(&mock, mock.submitted[1], 0);
     assert(nvme_cross_slot_engine_step(value, 300u, done, &mock) == 0);
@@ -199,11 +226,76 @@ static void test_capacity_sq_full_and_callback(void)
     nvme_cross_slot_engine_destroy(value);
 }
 
+static void test_stall_policy_and_stats(void)
+{
+    ChannelRuntime rt;
+    Mock mock;
+    NvmeCrossSlotEngine *value;
+    NvmeCrossSlotStats stats;
+    NvmeWriteSlotReq req = request(7u, 1u);
+
+    memset(&mock, 0, sizeof(mock));
+    value = engine(&rt, &mock);
+    assert(nvme_cross_slot_engine_add(value, &req) == 0);
+    mock.delayed_cid = 1u;
+    mock.release_after_polls = 2u;
+    assert(nvme_cross_slot_engine_step(value, 300u, done, &mock) == 0);
+    nvme_cross_slot_engine_get_stats(value, &stats);
+    assert(mock.callbacks == 1u && stats.cq_empty_wait_count > 0u);
+    assert(stats.completion_process_count == 1u && stats.submit_mmio_count == 1u);
+    nvme_cross_slot_engine_destroy(value);
+
+    memset(&mock, 0, sizeof(mock));
+    value = engine(&rt, &mock);
+    assert(nvme_cross_slot_engine_add(value, &req) == 0);
+    mock.delayed_cid = 1u;
+    mock.release_on_yield = 1;
+    assert(nvme_cross_slot_engine_step(value, 300u, done, &mock) == 0);
+    assert(mock.yield_count > 0u && mock.callbacks == 1u);
+    nvme_cross_slot_engine_destroy(value);
+
+    memset(&mock, 0, sizeof(mock));
+    value = engine(&rt, &mock);
+    assert(nvme_cross_slot_engine_add(value, &req) == 0);
+    assert(nvme_cross_slot_engine_step(value, 25u, done, &mock) == 0);
+    nvme_cross_slot_engine_get_stats(value, &stats);
+    assert(mock.sleep_count > 0u && stats.no_progress_sleep_count > 0u);
+    assert(mock.submitted_count == 1u);
+    assert(nvme_cross_slot_engine_step(value, 25u, done, &mock) == 0);
+    assert(mock.submitted_count == 1u);
+    nvme_cross_slot_engine_destroy(value);
+}
+
+static void test_no_progress_timeout(void)
+{
+    ChannelRuntime rt;
+    Mock mock;
+    NvmeCrossSlotEngine *value;
+    NvmeCrossSlotConfig value_config = config();
+    NvmeCrossSlotOps ops = { submit, poll_completion, monotonic_us, sleep_us, yield_cpu };
+    NvmeWriteSlotReq req = request(8u, 1u);
+
+    value_config.busy_poll_us = 0u;
+    value_config.empty_sleep_us = 1u;
+    value_config.no_progress_timeout_us = 3u;
+    memset(&mock, 0, sizeof(mock));
+    memset(&rt, 0, sizeof(rt));
+    rt.nvme_qd_effective = 4u;
+    rt.nvme_cmd_sectors = 1u;
+    value = nvme_cross_slot_engine_create_with_ops_config(&rt, &value_config, &ops, &mock);
+    assert(value && nvme_cross_slot_engine_add(value, &req) == 0);
+    assert(nvme_cross_slot_engine_step(value, 300u, done, &mock) != 0);
+    assert(strcmp(nvme_cross_slot_engine_last_error(value), "no_progress_timeout") == 0);
+    nvme_cross_slot_engine_destroy(value);
+}
+
 int main(void)
 {
     test_multislot_out_of_order_and_budget();
     test_completion_failures();
     test_capacity_sq_full_and_callback();
+    test_stall_policy_and_stats();
+    test_no_progress_timeout();
     puts("mock_nvme_cross_slot_test: ok");
     return 0;
 }

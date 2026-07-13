@@ -2164,8 +2164,34 @@ struct NvmeCrossSlotEngine {
     uint32_t global_inflight;
     uint32_t rr_index;
     bool completed_cid_seen[UINT16_MAX + 1u];
+    uint64_t sq_full_start_us;
+    uint64_t cq_empty_start_us;
+    uint64_t no_progress_start_us;
+    NvmeCrossSlotStats stats;
     char last_error[64];
 };
+
+static void cross_slot_update_max(uint64_t *value, uint64_t sample)
+{
+    if (sample > *value) *value = sample;
+}
+
+static void cross_slot_record_cq_empty(NvmeCrossSlotEngine *e, uint64_t now_us)
+{
+    if (e->cq_empty_start_us == 0u) {
+        e->cq_empty_start_us = now_us;
+        ++e->stats.cq_empty_wait_count;
+    }
+    cross_slot_update_max(&e->stats.cq_empty_wait_max_us, now_us - e->cq_empty_start_us);
+}
+
+static void cross_slot_clear_cq_empty(NvmeCrossSlotEngine *e, uint64_t now_us)
+{
+    if (e->cq_empty_start_us != 0u) {
+        cross_slot_update_max(&e->stats.cq_empty_wait_max_us, now_us - e->cq_empty_start_us);
+        e->cq_empty_start_us = 0u;
+    }
+}
 
 static int cross_slot_fail(NvmeCrossSlotEngine *e, const char *reason)
 {
@@ -2237,11 +2263,12 @@ static int cross_slot_real_poll(void *opaque, NvmeCompletion *out)
 { return nvme_try_poll_cq((ChannelRuntime *)opaque, out); }
 static uint64_t cross_slot_real_time(void *opaque) { (void)opaque; return wall_time_us(); }
 static void cross_slot_real_sleep(void *opaque, uint32_t us) { (void)opaque; usleep(us); }
+static void cross_slot_real_yield(void *opaque) { (void)opaque; sched_yield(); }
 
 NvmeCrossSlotEngine *nvme_cross_slot_engine_create(ChannelRuntime *rt)
 {
     NvmeCrossSlotOps ops = { cross_slot_real_submit, cross_slot_real_poll,
-                             cross_slot_real_time, cross_slot_real_sleep };
+                             cross_slot_real_time, cross_slot_real_sleep, cross_slot_real_yield };
     return nvme_cross_slot_engine_create_with_ops(rt, &ops, rt);
 }
 
@@ -2249,7 +2276,7 @@ NvmeCrossSlotEngine *nvme_cross_slot_engine_create_with_config(
     ChannelRuntime *rt, const NvmeCrossSlotConfig *config)
 {
     NvmeCrossSlotOps ops = { cross_slot_real_submit, cross_slot_real_poll,
-                             cross_slot_real_time, cross_slot_real_sleep };
+                             cross_slot_real_time, cross_slot_real_sleep, cross_slot_real_yield };
     return nvme_cross_slot_engine_create_with_ops_config(rt, config, &ops, rt);
 }
 
@@ -2298,6 +2325,12 @@ bool nvme_cross_slot_engine_can_accept(const NvmeCrossSlotEngine *engine)
 { return engine && engine->active_count < engine->config.max_active_slots; }
 const char *nvme_cross_slot_engine_last_error(const NvmeCrossSlotEngine *engine)
 { return engine ? engine->last_error : "invalid_engine"; }
+void nvme_cross_slot_engine_get_stats(const NvmeCrossSlotEngine *engine,
+                                      NvmeCrossSlotStats *out)
+{
+    if (out) memset(out, 0, sizeof(*out));
+    if (engine && out) *out = engine->stats;
+}
 
 int nvme_cross_slot_engine_add(NvmeCrossSlotEngine *e, const NvmeWriteSlotReq *req)
 {
@@ -2325,23 +2358,38 @@ int nvme_cross_slot_engine_step(NvmeCrossSlotEngine *e, uint32_t budget_us,
     uint64_t start_us;
     uint64_t command_limit;
     uint32_t qd;
+    uint32_t effective_budget;
     if (!e || !e->rt) return -1;
     qd = e->config.target_qd;
     command_limit = e->rt->nvme_cmd_sectors ? e->rt->nvme_cmd_sectors : 512u;
+    effective_budget = budget_us != 0u ? budget_us : e->config.writer_budget_us;
     start_us = e->ops.monotonic_us(e->ops_opaque);
     while (e->active_count > 0u) {
         uint32_t i, pops = 0u;
         bool progress = false;
-        uint32_t effective_budget = budget_us != 0u ? budget_us : e->config.writer_budget_us;
         if (cross_slot_validate(e) != 0) return -1;
+        /* CQ first: completions may free QD before refill. */
         while (pops < e->config.cq_batch && e->global_inflight > 0u) {
-            NvmeCompletion cpl; int prc = e->ops.poll_completion(e->ops_opaque, &cpl);
+            NvmeCompletion cpl;
+            int prc = e->ops.poll_completion(e->ops_opaque, &cpl);
+            uint64_t poll_end_us = e->ops.monotonic_us(e->ops_opaque);
             if (prc < 0) return cross_slot_fail(e, "completion_poll_failed");
-            if (prc > 0 && cross_slot_handle_completion(e, &cpl) != 0) return -1;
-            if (prc == 0) break;
+            if (prc == 0) {
+                cross_slot_record_cq_empty(e, poll_end_us);
+                break;
+            }
+            cross_slot_clear_cq_empty(e, poll_end_us);
+            {
+                uint64_t process_start_us = poll_end_us;
+                if (cross_slot_handle_completion(e, &cpl) != 0) return -1;
+                ++e->stats.completion_process_count;
+                cross_slot_update_max(&e->stats.completion_process_max_us,
+                                      e->ops.monotonic_us(e->ops_opaque) - process_start_us);
+            }
             progress = true;
             ++pops;
         }
+        /* Only fully drained contexts may invoke the slot callback. */
         for (i = 0u; i < NVME_PENDING_CAPACITY; ++i) {
             NvmeSlotWriteContext *ctx = &e->contexts[i];
             if (e->active[i] && ctx->next_submit_sector == ctx->total_sectors &&
@@ -2353,6 +2401,7 @@ int nvme_cross_slot_engine_step(NvmeCrossSlotEngine *e, uint32_t budget_us,
                 --e->active_count; progress = true;
             }
         }
+        /* Refill after processing CQ and completed contexts. */
         while (e->global_inflight < qd) {
             bool done[NVME_PENDING_CAPACITY];
             int index;
@@ -2370,15 +2419,97 @@ int nvme_cross_slot_engine_step(NvmeCrossSlotEngine *e, uint32_t budget_us,
             p->slot_offset = ctx->next_submit_sector * NVME_SECTOR_BYTES;
             p->lba = ctx->base_lba + ctx->next_submit_sector; p->ddr_addr = ctx->base_ddr_addr + p->slot_offset;
             p->sectors = sectors; p->bytes = sectors * NVME_SECTOR_BYTES;
-            src = e->ops.submit(e->ops_opaque, cid, p->lba, sectors, p->ddr_addr);
-            if (src == 1) { p->valid = false; break; }
+            {
+                uint64_t submit_start_us = e->ops.monotonic_us(e->ops_opaque);
+                src = e->ops.submit(e->ops_opaque, cid, p->lba, sectors, p->ddr_addr);
+                uint64_t submit_end_us = e->ops.monotonic_us(e->ops_opaque);
+                ++e->stats.submit_mmio_count;
+                cross_slot_update_max(&e->stats.submit_mmio_max_us,
+                                      submit_end_us - submit_start_us);
+                if (src == 1) {
+                    if (e->sq_full_start_us == 0u) {
+                        e->sq_full_start_us = submit_end_us;
+                        ++e->stats.sq_full_wait_count;
+                    }
+                    cross_slot_update_max(&e->stats.sq_full_wait_max_us,
+                                          submit_end_us - e->sq_full_start_us);
+                    p->valid = false;
+                    break;
+                }
+                if (e->sq_full_start_us != 0u) {
+                    cross_slot_update_max(&e->stats.sq_full_wait_max_us,
+                                          submit_end_us - e->sq_full_start_us);
+                    e->sq_full_start_us = 0u;
+                }
+            }
             if (src != 0) { p->valid = false; return cross_slot_fail(e, "submit_failed"); }
             e->completed_cid_seen[cid] = false;
             ctx->next_submit_sector += sectors; ++ctx->submitted_cmds; ++ctx->inflight_cmds;
             ++e->global_inflight; progress = true;
         }
-        if (!progress || (effective_budget != 0u &&
-            e->ops.monotonic_us(e->ops_opaque) - start_us >= effective_budget)) break;
+        if (progress) {
+            e->no_progress_start_us = 0u;
+            if (effective_budget == 0u ||
+                e->ops.monotonic_us(e->ops_opaque) - start_us < effective_budget) continue;
+            if (e->ops.yield_cpu) e->ops.yield_cpu(e->ops_opaque); else sched_yield();
+            break;
+        }
+        {
+            uint64_t now_us = e->ops.monotonic_us(e->ops_opaque);
+            uint64_t busy_deadline_us = now_us + e->config.busy_poll_us;
+            bool busy_progress = false;
+
+            if (e->no_progress_start_us == 0u) e->no_progress_start_us = now_us;
+            while (e->global_inflight > 0u && e->ops.monotonic_us(e->ops_opaque) < busy_deadline_us) {
+                NvmeCompletion cpl;
+                int prc = e->ops.poll_completion(e->ops_opaque, &cpl);
+                uint64_t poll_end_us = e->ops.monotonic_us(e->ops_opaque);
+                if (prc < 0) return cross_slot_fail(e, "completion_poll_failed");
+                if (prc == 0) {
+                    cross_slot_record_cq_empty(e, poll_end_us);
+                    continue;
+                }
+                cross_slot_clear_cq_empty(e, poll_end_us);
+                {
+                    uint64_t process_start_us = poll_end_us;
+                    if (cross_slot_handle_completion(e, &cpl) != 0) return -1;
+                    ++e->stats.completion_process_count;
+                    cross_slot_update_max(&e->stats.completion_process_max_us,
+                                          e->ops.monotonic_us(e->ops_opaque) - process_start_us);
+                }
+                busy_progress = true;
+                break;
+            }
+            if (busy_progress) {
+                e->no_progress_start_us = 0u;
+                continue;
+            }
+            if (e->ops.yield_cpu) e->ops.yield_cpu(e->ops_opaque); else sched_yield();
+            if (e->global_inflight > 0u) {
+                NvmeCompletion cpl;
+                int prc = e->ops.poll_completion(e->ops_opaque, &cpl);
+                if (prc < 0) return cross_slot_fail(e, "completion_poll_failed");
+                if (prc > 0) {
+                    uint64_t process_start_us = e->ops.monotonic_us(e->ops_opaque);
+                    if (cross_slot_handle_completion(e, &cpl) != 0) return -1;
+                    ++e->stats.completion_process_count;
+                    cross_slot_update_max(&e->stats.completion_process_max_us,
+                                          e->ops.monotonic_us(e->ops_opaque) - process_start_us);
+                    e->no_progress_start_us = 0u;
+                    continue;
+                }
+                cross_slot_record_cq_empty(e, e->ops.monotonic_us(e->ops_opaque));
+            }
+            if (e->config.empty_sleep_us != 0u) {
+                e->ops.sleep_us(e->ops_opaque, e->config.empty_sleep_us);
+                ++e->stats.no_progress_sleep_count;
+            }
+            now_us = e->ops.monotonic_us(e->ops_opaque);
+            if (e->config.no_progress_timeout_us != 0u &&
+                now_us - e->no_progress_start_us >= e->config.no_progress_timeout_us)
+                return cross_slot_fail(e, "no_progress_timeout");
+            if (effective_budget != 0u && now_us - start_us >= effective_budget) break;
+        }
     }
     return 0;
 }

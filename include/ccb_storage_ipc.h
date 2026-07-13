@@ -42,6 +42,9 @@ typedef struct {
     uint64_t submit_stall_count, submit_stall_max_us;
     uint64_t writer_schedule_gap_count, writer_schedule_gap_max_us;
     uint64_t sq_full_wait_count, sq_full_wait_max_us, cq_empty_wait_count, cq_empty_wait_max_us;
+    uint64_t submit_mmio_count, submit_mmio_max_us;
+    uint64_t completion_process_count, completion_process_max_us;
+    uint64_t no_progress_sleep_count;
     uint64_t dropped_perf_samples;
     uint32_t receive_integrity_ok, storage_integrity_ok;
 } StoragePerfSample;

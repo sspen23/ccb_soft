@@ -21,11 +21,16 @@ int main(void)
     e.perf.writer_schedule_gap_max_us = 12u; e.perf.sq_full_wait_count = 13u;
     e.perf.sq_full_wait_max_us = 14u; e.perf.cq_empty_wait_count = 15u;
     e.perf.cq_empty_wait_max_us = 16u; e.perf.dropped_perf_samples = 17u;
+    e.perf.submit_mmio_count = 18u; e.perf.submit_mmio_max_us = 19u;
+    e.perf.completion_process_count = 20u; e.perf.completion_process_max_us = 21u;
+    e.perf.no_progress_sleep_count = 22u;
     e.perf.receive_integrity_ok = 1u; e.perf.storage_integrity_ok = 1u;
     assert(storage_perf_log_event(&e, "task") == 0);
     storage_perf_log_close(); f = fopen("/tmp/mock_storage_perf.log", "r"); assert(f);
     assert(fgets(line, sizeof(line), f) && strstr(line, "storage_perf task=task"));
-    assert(fgets(line, sizeof(line), f) && strstr(line, "free_slots=6") && strstr(line, "dropped_perf_samples=17")); fclose(f);
+    assert(fgets(line, sizeof(line), f) && strstr(line, "free_slots=6") &&
+           strstr(line, "submit_mmio_count=18") && strstr(line, "no_progress_sleep_count=22") &&
+           strstr(line, "dropped_perf_samples=17")); fclose(f);
     storage_ipc_make_event(&e, STORAGE_WORKER_FATAL, 1u, -3, 9u, "fatal_reason");
     assert(storage_perf_log_event(&e, "task") == 0);
     storage_ipc_make_event(&e, STORAGE_WORKER_FINAL_RESULT, 1u, 0, 9u, "final_reason");

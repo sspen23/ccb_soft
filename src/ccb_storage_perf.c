@@ -25,7 +25,7 @@ int storage_perf_log_event(const StorageWorkerEvent *e, const char *task)
     switch (e->type) {
     case STORAGE_WORKER_PERF_SAMPLE:
         n = snprintf(line, sizeof(line),
-                     "storage_perf task=%s channel=%u ts_us=%llu window_start_us=%llu window_end_us=%llu dma_bytes_delta=%llu nvme_bytes_delta=%llu dma_writable=%u completed_unharvested=%u ready_slots=%u nvme_busy_slots=%u requeue_pending=%u free_slots=%u active_qd=%u active_qd_max=%u submit_stall_count=%llu submit_stall_max_us=%llu writer_schedule_gap_count=%llu writer_schedule_gap_max_us=%llu sq_full_wait_count=%llu sq_full_wait_max_us=%llu cq_empty_wait_count=%llu cq_empty_wait_max_us=%llu dropped_perf_samples=%llu receive_integrity_ok=%u storage_integrity_ok=%u\n",
+                     "storage_perf task=%s channel=%u ts_us=%llu window_start_us=%llu window_end_us=%llu dma_bytes_delta=%llu nvme_bytes_delta=%llu dma_writable=%u completed_unharvested=%u ready_slots=%u nvme_busy_slots=%u requeue_pending=%u free_slots=%u active_qd=%u active_qd_max=%u submit_stall_count=%llu submit_stall_max_us=%llu writer_schedule_gap_count=%llu writer_schedule_gap_max_us=%llu sq_full_wait_count=%llu sq_full_wait_max_us=%llu cq_empty_wait_count=%llu cq_empty_wait_max_us=%llu submit_mmio_count=%llu submit_mmio_max_us=%llu completion_process_count=%llu completion_process_max_us=%llu no_progress_sleep_count=%llu dropped_perf_samples=%llu receive_integrity_ok=%u storage_integrity_ok=%u\n",
                      task ? task : "", e->channel, (unsigned long long)e->timestamp_us,
                      (unsigned long long)e->perf.window_start_us,
                      (unsigned long long)e->perf.window_end_us,
@@ -43,6 +43,11 @@ int storage_perf_log_event(const StorageWorkerEvent *e, const char *task)
                      (unsigned long long)e->perf.sq_full_wait_max_us,
                      (unsigned long long)e->perf.cq_empty_wait_count,
                      (unsigned long long)e->perf.cq_empty_wait_max_us,
+                     (unsigned long long)e->perf.submit_mmio_count,
+                     (unsigned long long)e->perf.submit_mmio_max_us,
+                     (unsigned long long)e->perf.completion_process_count,
+                     (unsigned long long)e->perf.completion_process_max_us,
+                     (unsigned long long)e->perf.no_progress_sleep_count,
                      (unsigned long long)e->perf.dropped_perf_samples,
                      e->perf.receive_integrity_ok, e->perf.storage_integrity_ok);
         break;

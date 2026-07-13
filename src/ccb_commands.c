@@ -112,6 +112,15 @@ typedef struct {
     uint64_t writer_slots_drained;
     uint64_t writer_schedule_gap_count;
     uint64_t writer_schedule_gap_max_us;
+    uint64_t cross_sq_full_wait_count;
+    uint64_t cross_sq_full_wait_max_us;
+    uint64_t cross_cq_empty_wait_count;
+    uint64_t cross_cq_empty_wait_max_us;
+    uint64_t cross_submit_mmio_count;
+    uint64_t cross_submit_mmio_max_us;
+    uint64_t cross_completion_process_count;
+    uint64_t cross_completion_process_max_us;
+    uint64_t cross_no_progress_sleep_count;
     bool writer_rt_enabled;
     int writer_rt_policy;
     uint32_t writer_rt_prio;
@@ -285,10 +294,15 @@ static void storage_emit_perf_event(const ChannelRuntime *rt, const StorageProdu
     event.perf.submit_stall_max_us = __atomic_load_n(&rt->nvme_submit_stall_max_us, __ATOMIC_ACQUIRE);
     event.perf.writer_schedule_gap_count = __atomic_load_n(&q->writer_schedule_gap_count, __ATOMIC_ACQUIRE);
     event.perf.writer_schedule_gap_max_us = __atomic_load_n(&q->writer_schedule_gap_max_us, __ATOMIC_ACQUIRE);
-    event.perf.sq_full_wait_count = __atomic_load_n(&rt->nvme_submit_sq_full_count, __ATOMIC_ACQUIRE);
-    event.perf.sq_full_wait_max_us = __atomic_load_n(&rt->nvme_submit_stall_max_us, __ATOMIC_ACQUIRE);
-    event.perf.cq_empty_wait_count = __atomic_load_n(&rt->nvme_cq_empty_polls, __ATOMIC_ACQUIRE);
-    event.perf.cq_empty_wait_max_us = __atomic_load_n(&rt->nvme_cq_wait_total_us, __ATOMIC_ACQUIRE);
+    event.perf.sq_full_wait_count = __atomic_load_n(&q->cross_sq_full_wait_count, __ATOMIC_ACQUIRE);
+    event.perf.sq_full_wait_max_us = __atomic_load_n(&q->cross_sq_full_wait_max_us, __ATOMIC_ACQUIRE);
+    event.perf.cq_empty_wait_count = __atomic_load_n(&q->cross_cq_empty_wait_count, __ATOMIC_ACQUIRE);
+    event.perf.cq_empty_wait_max_us = __atomic_load_n(&q->cross_cq_empty_wait_max_us, __ATOMIC_ACQUIRE);
+    event.perf.submit_mmio_count = __atomic_load_n(&q->cross_submit_mmio_count, __ATOMIC_ACQUIRE);
+    event.perf.submit_mmio_max_us = __atomic_load_n(&q->cross_submit_mmio_max_us, __ATOMIC_ACQUIRE);
+    event.perf.completion_process_count = __atomic_load_n(&q->cross_completion_process_count, __ATOMIC_ACQUIRE);
+    event.perf.completion_process_max_us = __atomic_load_n(&q->cross_completion_process_max_us, __ATOMIC_ACQUIRE);
+    event.perf.no_progress_sleep_count = __atomic_load_n(&q->cross_no_progress_sleep_count, __ATOMIC_ACQUIRE);
     event.perf.dropped_perf_samples = atomic_load_explicit(&g_storage_dropped_perf_samples,
                                                             memory_order_relaxed);
     event.perf.receive_integrity_ok = stats->receive_integrity_ok ? 1u : 0u;
@@ -2080,6 +2094,27 @@ static int storage_cross_slot_done_cb(void *opaque, const NvmeWriteSlotReq *req)
     return storage_complete_slot(q, &item);
 }
 
+static void storage_cross_slot_update_stats(StorageWriteQueue *q,
+                                            const NvmeCrossSlotEngine *engine)
+{
+    NvmeCrossSlotStats stats;
+
+    if (!q || !engine) return;
+    nvme_cross_slot_engine_get_stats(engine, &stats);
+    __atomic_store_n(&q->cross_sq_full_wait_count, stats.sq_full_wait_count, __ATOMIC_RELEASE);
+    __atomic_store_n(&q->cross_sq_full_wait_max_us, stats.sq_full_wait_max_us, __ATOMIC_RELEASE);
+    __atomic_store_n(&q->cross_cq_empty_wait_count, stats.cq_empty_wait_count, __ATOMIC_RELEASE);
+    __atomic_store_n(&q->cross_cq_empty_wait_max_us, stats.cq_empty_wait_max_us, __ATOMIC_RELEASE);
+    __atomic_store_n(&q->cross_submit_mmio_count, stats.submit_mmio_count, __ATOMIC_RELEASE);
+    __atomic_store_n(&q->cross_submit_mmio_max_us, stats.submit_mmio_max_us, __ATOMIC_RELEASE);
+    __atomic_store_n(&q->cross_completion_process_count, stats.completion_process_count,
+                     __ATOMIC_RELEASE);
+    __atomic_store_n(&q->cross_completion_process_max_us, stats.completion_process_max_us,
+                     __ATOMIC_RELEASE);
+    __atomic_store_n(&q->cross_no_progress_sleep_count, stats.no_progress_sleep_count,
+                     __ATOMIC_RELEASE);
+}
+
 static void *storage_nvme_writer_thread(void *arg) {
     StorageWriteQueue *q = (StorageWriteQueue *)arg;
 
@@ -2173,10 +2208,22 @@ static void *storage_nvme_cross_slot_writer_thread(void *arg) {
         PendingDdrSlot item;
         NvmeWriteSlotReq req;
         int pop_rc;
+        bool wait_for_item = nvme_cross_slot_engine_active(engine) == 0u;
 
-        pop_rc = nvme_cross_slot_engine_can_accept(engine)
-                     ? storage_queue_pop(q, &item, nvme_cross_slot_engine_active(engine) == 0u)
-                     : 0;
+        if (nvme_cross_slot_engine_can_accept(engine)) {
+            uint64_t wait_start_us = wait_for_item ? storage_wall_time_us() : 0u;
+            pop_rc = storage_queue_pop(q, &item, wait_for_item);
+            if (wait_for_item && pop_rc > 0) {
+                uint64_t gap_us = storage_elapsed_us(wait_start_us);
+                if (gap_us >= 1000u) {
+                    (void)__atomic_add_fetch(&q->writer_schedule_gap_count, 1u, __ATOMIC_RELAXED);
+                    if (gap_us > __atomic_load_n(&q->writer_schedule_gap_max_us, __ATOMIC_RELAXED))
+                        __atomic_store_n(&q->writer_schedule_gap_max_us, gap_us, __ATOMIC_RELAXED);
+                }
+            }
+        } else {
+            pop_rc = 0;
+        }
         if (pop_rc < 0) {
             storage_mark_writer_error(q);
             break;
@@ -2192,8 +2239,10 @@ static void *storage_nvme_cross_slot_writer_thread(void *arg) {
             }
         }
         if (nvme_cross_slot_engine_step(engine, 0u, storage_cross_slot_done_cb, q) != 0) {
+            storage_cross_slot_update_stats(q, engine);
             storage_mark_writer_error(q); break;
         }
+        storage_cross_slot_update_stats(q, engine);
         if (pop_rc == 0 && nvme_cross_slot_engine_active(engine) == 0u) {
             storage_ring_event(&q->writer_event_ring, STORAGE_EVENT_STOP_DRAINED,
                                q->rt, 0u, 0u, false);
