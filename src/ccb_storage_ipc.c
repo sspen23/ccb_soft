@@ -104,6 +104,51 @@ int storage_ipc_write_control_deadline(int fd, const StorageControlMessage *msg,
 }
 int storage_ipc_read_control(int fd, StorageControlMessage *msg)
 { int rc = storage_ipc_read_full(fd, msg, sizeof(*msg)); return rc == 0 && !storage_ipc_control_valid(msg) ? -1 : rc; }
+
+void storage_ipc_control_reader_init(StorageControlReader *reader)
+{
+    if (reader) memset(reader, 0, sizeof(*reader));
+}
+
+int storage_ipc_read_control_deadline(int fd, StorageControlReader *reader,
+                                      StorageControlMessage *msg,
+                                      uint64_t deadline_us)
+{
+    struct pollfd pfd;
+
+    if (fd < 0 || !reader || !msg) { errno = EINVAL; return -1; }
+    while (reader->used < sizeof(*msg)) {
+        ssize_t n = read(fd, reader->bytes + reader->used,
+                         sizeof(*msg) - reader->used);
+        if (n > 0) {
+            reader->used += (uint16_t)n;
+            continue;
+        }
+        if (n == 0) {
+            if (reader->used == 0u) return 1;
+            errno = EPROTO;
+            return -1;
+        }
+        if (errno == EINTR) continue;
+        if (errno != EAGAIN && errno != EWOULDBLOCK) return -1;
+        if (storage_ipc_monotonic_us() >= deadline_us) { errno = ETIMEDOUT; return -1; }
+        pfd.fd = fd;
+        pfd.events = POLLIN | POLLHUP;
+        pfd.revents = 0;
+        {
+            uint64_t remaining = deadline_us - storage_ipc_monotonic_us();
+            int timeout_ms = (int)((remaining + 999u) / 1000u);
+            int rc = poll(&pfd, 1u, timeout_ms);
+            if (rc > 0) continue;
+            if (rc == 0) { errno = ETIMEDOUT; return -1; }
+            if (errno != EINTR) return -1;
+        }
+    }
+    memcpy(msg, reader->bytes, sizeof(*msg));
+    reader->used = 0u;
+    if (!storage_ipc_control_valid(msg)) { errno = EPROTO; return -1; }
+    return 0;
+}
 int storage_ipc_write_event(int fd, const StorageWorkerEvent *event)
 { return storage_ipc_validate_event(event) ? storage_ipc_write_full(fd, event, sizeof(*event)) : -1; }
 

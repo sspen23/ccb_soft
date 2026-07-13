@@ -18,6 +18,7 @@
 #include <sys/time.h>
 #include <sys/wait.h>
 #include <poll.h>
+#include <dirent.h>
 #ifdef __linux__
 #include <sys/mman.h>
 #endif
@@ -67,6 +68,8 @@
 #ifndef STORAGE_META_DIR
 #define STORAGE_META_DIR "/run/ccb_nvme_process_test"
 #endif
+
+#define STORAGE_SYNC_OUTBOX_DIR_DEFAULT DB_STORAGE_DIR "/storage_sync_pending"
 
 /* ================== Configuration ================== */
 
@@ -207,13 +210,15 @@ static void storage_supervisor_emit_aggregate(void)
            task_id,
            status == STORAGE_TASK_SUCCESS ? "success" : "failed", bytes[0], bytes[1], bytes[2],
            status == STORAGE_TASK_SUCCESS ? 1u : 0u,
-           status == STORAGE_TASK_SUCCESS ? "none" :
+           status == STORAGE_TASK_SUCCESS && g_storage_commit_state.sync_pending ? "sync_pending" :
+               (status == STORAGE_TASK_SUCCESS ? "none" :
                (g_storage_commit_state.attempted && !g_storage_commit_state.success
-                    ? g_storage_commit_state.reason : g_storage_supervisor.fatal_reason),
+                    ? g_storage_commit_state.reason : g_storage_supervisor.fatal_reason)),
            secondary_reason,
-           status == STORAGE_TASK_SUCCESS ? "none" :
+           status == STORAGE_TASK_SUCCESS && g_storage_commit_state.sync_pending ? "sync_pending" :
+               (status == STORAGE_TASK_SUCCESS ? "none" :
                (g_storage_commit_state.attempted && !g_storage_commit_state.success
-                    ? g_storage_commit_state.reason : g_storage_supervisor.fatal_reason));
+                    ? g_storage_commit_state.reason : g_storage_supervisor.fatal_reason)));
     g_storage_supervisor.aggregate_emitted = true;
 }
 
@@ -464,6 +469,91 @@ static uint8_t sync_filelist_db_to_flash(void)
     dbg_printf("[DBG][FLASH] filelist DB synced runtime=%s flash=%s\n",
                FILELIST_DB_PATH, flash_path);
     return ACK_SUCCESS;
+}
+
+static const char *storage_sync_outbox_dir(void)
+{
+    const char *value = getenv("SRC_REAL_STORAGE_SYNC_OUTBOX_DIR");
+    return value && value[0] != '\0' ? value : STORAGE_SYNC_OUTBOX_DIR_DEFAULT;
+}
+
+static int storage_sync_outbox_path(const char *task_id, char *path, size_t size)
+{
+    size_t i;
+    if (!task_id || task_id[0] == '\0' || !path) return -1;
+    for (i = 0u; task_id[i] != '\0'; ++i) {
+        if (!((task_id[i] >= 'A' && task_id[i] <= 'Z') ||
+              (task_id[i] >= 'a' && task_id[i] <= 'z') ||
+              (task_id[i] >= '0' && task_id[i] <= '9') ||
+              task_id[i] == '_' || task_id[i] == '-')) return -1;
+    }
+    return snprintf(path, size, "%s/%s.pending", storage_sync_outbox_dir(), task_id) <
+           (int)size ? 0 : -1;
+}
+
+static int storage_sync_outbox_mark_pending(const char *task_id)
+{
+    char path[PATH_MAX];
+    int fd;
+    size_t length;
+    size_t used = 0u;
+    if (mkdir(storage_sync_outbox_dir(), 0755) != 0 && errno != EEXIST) return -1;
+    if (storage_sync_outbox_path(task_id, path, sizeof(path)) != 0) return -1;
+    fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return -1;
+    length = strlen(task_id);
+    while (used < length) {
+        ssize_t n = write(fd, task_id + used, length - used);
+        if (n > 0) { used += (size_t)n; continue; }
+        if (n < 0 && errno == EINTR) continue;
+        break;
+    }
+    if (used != length || write(fd, "\n", 1u) != 1 || fsync(fd) != 0) {
+        int saved_errno = errno;
+        (void)close(fd);
+        errno = saved_errno;
+        return -1;
+    }
+    if (close(fd) != 0) return -1;
+    return 0;
+}
+
+static int storage_sync_outbox_mark_complete(const char *task_id)
+{
+    char path[PATH_MAX];
+    if (storage_sync_outbox_path(task_id, path, sizeof(path)) != 0) return -1;
+    return unlink(path) == 0 || errno == ENOENT ? 0 : -1;
+}
+
+static void storage_sync_outbox_retry(void)
+{
+    DIR *dir = opendir(storage_sync_outbox_dir());
+    struct dirent *entry;
+    bool pending = false;
+    if (!dir) return;
+    while ((entry = readdir(dir)) != NULL) {
+        size_t n = strlen(entry->d_name);
+        if (n > strlen(".pending") &&
+            strcmp(entry->d_name + n - strlen(".pending"), ".pending") == 0) {
+            pending = true;
+            break;
+        }
+    }
+    (void)closedir(dir);
+    if (!pending) return;
+    if (sync_filelist_db_to_flash() != ACK_SUCCESS) return;
+    dir = opendir(storage_sync_outbox_dir());
+    if (!dir) return;
+    while ((entry = readdir(dir)) != NULL) {
+        size_t n = strlen(entry->d_name);
+        if (n > strlen(".pending") &&
+            strcmp(entry->d_name + n - strlen(".pending"), ".pending") == 0) {
+            char path[PATH_MAX];
+            if (snprintf(path, sizeof(path), "%s/%s", storage_sync_outbox_dir(),
+                         entry->d_name) < (int)sizeof(path)) (void)unlink(path);
+        }
+    }
+    (void)closedir(dir);
 }
 
 static int copy_file_path(const char *src_path, const char *dst_path)
@@ -1473,6 +1563,18 @@ static int storage_commit_flash_sync(void *ctx)
     return sync_filelist_db_to_flash() == ACK_SUCCESS ? 0 : -1;
 }
 
+static int storage_commit_sync_mark_pending(void *ctx, const char *task_id)
+{
+    (void)ctx;
+    return storage_sync_outbox_mark_pending(task_id);
+}
+
+static int storage_commit_sync_mark_complete(void *ctx, const char *task_id)
+{
+    (void)ctx;
+    return storage_sync_outbox_mark_complete(task_id);
+}
+
 static int storage_commit_supervised_results(const char *task_id)
 {
     StorageCommitContext ctx;
@@ -1547,6 +1649,8 @@ static int storage_commit_supervised_results(const char *task_id)
     ops.db_commit = storage_commit_db_commit;
     ops.db_rollback = storage_commit_db_rollback;
     ops.flash_sync = storage_commit_flash_sync;
+    ops.sync_mark_pending = storage_commit_sync_mark_pending;
+    ops.sync_mark_complete = storage_commit_sync_mark_complete;
     return storage_commit_run_once(&g_storage_commit_state, task_id, items, count, &ops);
 }
 
@@ -4793,6 +4897,9 @@ int main(int argc, char **argv)
         logger_close();
         return -1;
     }
+    /* Retry only replica publication.  The outbox never replays metadata or
+     * database inserts, so a restart cannot duplicate committed records. */
+    storage_sync_outbox_retry();
 
     LOG_INFO("SYSTEM", "System starting up");
     LOG_INFO("SYSTEM", "UART device: %s", serial_dev);

@@ -24,6 +24,13 @@ typedef struct {
     uint64_t timestamp_us;
 } StorageControlMessage;
 
+/* A control pipe is a byte stream.  Keep incomplete frames here so a
+ * nonblocking ARM/RUN wait never consumes and loses a partial message. */
+typedef struct {
+    uint8_t bytes[sizeof(StorageControlMessage)];
+    uint16_t used;
+} StorageControlReader;
+
 typedef enum {
     STORAGE_WORKER_READY = 1,
     STORAGE_WORKER_ARMED = 2,
@@ -82,6 +89,13 @@ int storage_ipc_write_control(int fd, const StorageControlMessage *msg);
 int storage_ipc_write_control_deadline(int fd, const StorageControlMessage *msg,
                                        uint64_t deadline_us);
 int storage_ipc_read_control(int fd, StorageControlMessage *msg);
+void storage_ipc_control_reader_init(StorageControlReader *reader);
+/* Returns 0 for one complete message, 1 for EOF before any byte, and -1 for
+ * timeout/protocol/I/O failure.  errno is ETIMEDOUT, EPROTO, or the I/O error.
+ * The reader retains a partial message across ETIMEDOUT/EAGAIN. */
+int storage_ipc_read_control_deadline(int fd, StorageControlReader *reader,
+                                      StorageControlMessage *msg,
+                                      uint64_t deadline_us);
 int storage_ipc_write_event(int fd, const StorageWorkerEvent *event);
 int storage_ipc_try_write_perf(int fd, const StorageWorkerEvent *event,
                                _Atomic uint64_t *dropped_perf_samples);

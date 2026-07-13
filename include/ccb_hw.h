@@ -2,10 +2,14 @@
 #define CCB_HW_H
 
 #include "ccb_types.h"
+#include "ccb_storage_pipeline.h"
 #include <stdio.h>
 
 /* Utility conversion helpers. */
 uint64_t bytes_to_sectors(uint64_t bytes);
+/* nvme_max_lba is kept as an exclusive capacity limit in software. */
+bool nvme_lba_range_valid(const ChannelRuntime *rt, uint64_t start_lba,
+                          uint64_t sectors);
 uint64_t cpu_to_hw_addr(const ChannelConfig *cfg, uint64_t cpu_addr);
 int ddr_addr_validate(const ChannelConfig *cfg, uint64_t cpu_addr, uint64_t size);
 
@@ -94,6 +98,17 @@ typedef enum {
     NVME_CROSS_SLOT_QUIESCED,
     NVME_CROSS_SLOT_FAILED
 } NvmeCrossSlotState;
+/* submit() result contract.  Only ACCEPTED owns the CID normally.  An
+ * ACCEPTANCE_UNKNOWN result follows a posted doorbell timeout: the engine
+ * retains the CID as inflight and must drain or obtain a confirmed reset
+ * before the buffer/CID may be reused. */
+typedef enum {
+    NVME_SUBMIT_ACCEPTED = 0,
+    NVME_SUBMIT_RETRY_SQ_FULL = 1,
+    NVME_SUBMIT_NOT_ACCEPTED = -1,
+    NVME_SUBMIT_STOPPED = -2,
+    NVME_SUBMIT_ACCEPTANCE_UNKNOWN = -3
+} NvmeSubmitResult;
 typedef struct {
     int (*submit)(void *opaque, uint16_t cid, uint64_t lba, uint32_t sectors, uint64_t ddr_addr);
     int (*poll_completion)(void *opaque, NvmeCompletion *out);
@@ -197,6 +212,10 @@ uint64_t dma_requeue_after_stop_count(const ChannelRuntime *rt);
 int dma_get_bd_snapshot(ChannelRuntime *rt,
                         const uint8_t *software_slot_state,
                         DmaBdSnapshot *out);
+/* O(1) normal-path snapshot.  Descriptor memory is deliberately not scanned;
+ * callers must pass the queue-maintained six-state counts under its lock. */
+int dma_get_bd_snapshot_o1(ChannelRuntime *rt, const StorageSlotCounts *counts,
+                           DmaBdSnapshot *out);
 bool dma_s2mm_tail_incomplete(const ChannelRuntime *rt);
 int dma_quiesce_s2mm(ChannelRuntime *rt, uint64_t deadline_us, DmaStopReport *report);
 DmaStopResult dma_quiesce_s2mm_with_state(ChannelRuntime *rt, uint64_t deadline_us,

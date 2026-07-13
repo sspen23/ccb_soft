@@ -37,6 +37,25 @@ int main(void)
     assert(storage_ipc_try_write_diag(p[1], &e, &dropped_diag) == 1);
     assert(atomic_load(&dropped_diag) == 1u);
     close(p[0]); close(p[1]);
+    /* ARM/RUN reader preserves a partial nonblocking control frame across a
+     * deadline instead of losing the consumed prefix. */
+    assert(pipe(p) == 0);
+    assert(fcntl(p[0], F_SETFL, fcntl(p[0], F_GETFL, 0) | O_NONBLOCK) == 0);
+    storage_ipc_make_control(&c, STORAGE_CTRL_RUN, 7u);
+    {
+        StorageControlReader reader;
+        storage_ipc_control_reader_init(&reader);
+        assert(write(p[1], &c, sizeof(c) / 2u) == (ssize_t)(sizeof(c) / 2u));
+        assert(storage_ipc_read_control_deadline(p[0], &reader, &out,
+                                                 storage_ipc_monotonic_us()) != 0);
+        assert(write(p[1], (const uint8_t *)&c + sizeof(c) / 2u,
+                     sizeof(c) - sizeof(c) / 2u) ==
+               (ssize_t)(sizeof(c) - sizeof(c) / 2u));
+        assert(storage_ipc_read_control_deadline(p[0], &reader, &out,
+                                                 storage_ipc_monotonic_us() + 100000u) == 0);
+        assert(out.type == STORAGE_CTRL_RUN);
+    }
+    close(p[0]); close(p[1]);
     assert(pipe(p) == 0);
     storage_ipc_make_event(&e, STORAGE_WORKER_FATAL, 0u, -1, 1u, "fatal");
     assert(storage_ipc_write_event_deadline(p[1], &e, storage_ipc_monotonic_us() + 100000u) == 0);

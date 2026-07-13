@@ -21,6 +21,7 @@ typedef struct {
     unsigned sleep_count;
     uint64_t now_us;
     unsigned fail_submit_call;
+    unsigned unknown_submit_call;
     unsigned reset_calls;
     int reset_result;
 } Mock;
@@ -40,6 +41,9 @@ static int submit(void *opaque, uint16_t cid, uint64_t lba, uint32_t sectors, ui
     if (mock->fail_submit_call != 0u &&
         mock->submitted_count + 1u == mock->fail_submit_call) return -1;
     mock->submitted[mock->submitted_count++] = cid;
+    if (mock->unknown_submit_call != 0u &&
+        mock->submitted_count == mock->unknown_submit_call)
+        return NVME_SUBMIT_ACCEPTANCE_UNKNOWN;
     return 0;
 }
 
@@ -341,7 +345,7 @@ static void test_abort_reset_and_submit_failure(void)
     value = engine(&rt, &mock);
     assert(nvme_cross_slot_engine_add(value, &req) == 0);
     assert(nvme_cross_slot_engine_step(value, 300u, done, &mock) != 0);
-    assert(strcmp(nvme_cross_slot_engine_last_error(value), "submit_failed") == 0);
+    assert(strcmp(nvme_cross_slot_engine_last_error(value), "submit_not_accepted") == 0);
     assert(nvme_cross_slot_engine_inflight(value) == 1u);
     assert(nvme_cross_slot_engine_drain_abort(value, mock.now_us + 2u) == 0);
     assert(mock.reset_calls == 1u && nvme_cross_slot_engine_is_quiesced(value));
@@ -412,6 +416,7 @@ static void test_payload_media_validation(void)
     assert(nvme_cross_slot_engine_add(value, &req) != 0);
     assert(strcmp(nvme_cross_slot_engine_last_error(value),
                   "payload_media_mismatch") == 0);
+    assert(nvme_cross_slot_engine_drain_abort(value, mock.now_us + 10u) == 0);
     nvme_cross_slot_engine_destroy(value);
 }
 
@@ -427,6 +432,31 @@ static void test_slot_range_validation(void)
     assert(value);
     assert(nvme_cross_slot_engine_add(value, &req) != 0);
     assert(strcmp(nvme_cross_slot_engine_last_error(value), "slot_range_overflow") == 0);
+    assert(nvme_cross_slot_engine_drain_abort(value, mock.now_us + 10u) == 0);
+    nvme_cross_slot_engine_destroy(value);
+}
+
+static void test_submit_acceptance_unknown_retains_cid_until_completion(void)
+{
+    ChannelRuntime rt;
+    Mock mock;
+    NvmeCrossSlotEngine *value;
+    NvmeWriteSlotReq req = request(15u, 1u);
+
+    memset(&mock, 0, sizeof(mock));
+    mock.unknown_submit_call = 1u;
+    value = engine(&rt, &mock);
+    assert(value && nvme_cross_slot_engine_add(value, &req) == 0);
+    assert(nvme_cross_slot_engine_step(value, 300u, done, &mock) != 0);
+    assert(strcmp(nvme_cross_slot_engine_last_error(value), "submit_accept_timeout") == 0);
+    assert(nvme_cross_slot_engine_inflight(value) == 1u);
+    assert(mock.submitted_count == 1u);
+    /* The delayed CQ entry consumes the same retained CID; no resubmit/CID
+     * reuse is possible while the engine is aborting. */
+    queue_completion(&mock, mock.submitted[0], 0);
+    assert(nvme_cross_slot_engine_drain_abort(value, mock.now_us + 100u) == 0);
+    assert(nvme_cross_slot_engine_is_quiesced(value));
+    assert(mock.submitted_count == 1u);
     nvme_cross_slot_engine_destroy(value);
 }
 
@@ -442,6 +472,7 @@ int main(void)
     test_duplicate_active_is_fatal_even_when_full();
     test_payload_media_validation();
     test_slot_range_validation();
+    test_submit_acceptance_unknown_retains_cid_until_completion();
     puts("mock_nvme_cross_slot_test: ok");
     return 0;
 }

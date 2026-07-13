@@ -85,6 +85,21 @@ int main(void)
            snapshot.ready_slots + snapshot.nvme_busy_slots +
            snapshot.requeue_pending + snapshot.free_slots == snapshot.total_slots);
 
+    {
+        StorageSlotCounts counts = {
+            .total = 4u, .dma_writable = 0u, .completed_unharvested = 1u,
+            .ready = 1u, .nvme_busy = 1u, .requeue_pending = 1u, .free_count = 0u,
+        };
+        /* Normal capture snapshots use maintained counts and do not inspect
+         * the descriptor array; the full scan above remains an audit path. */
+        memset(desc, 0, sizeof(desc));
+        assert(dma_get_bd_snapshot_o1(&rt, &counts, &snapshot) == 0);
+        assert(snapshot.completed_unharvested == 1u && snapshot.ready_slots == 1u &&
+               snapshot.nvme_busy_slots == 1u && snapshot.requeue_pending == 1u);
+        counts.free_count = 1u;
+        assert(dma_get_bd_snapshot_o1(&rt, &counts, &snapshot) != 0);
+    }
+
     state[3] = 0xffu;
     assert(dma_get_bd_snapshot(&rt, state, &snapshot) != 0);
 

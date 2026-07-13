@@ -108,19 +108,28 @@ int storage_commit_run_once(StorageCommitState *state, const char *task_id,
                                 transaction_open, "db_commit_failed");
     }
     transaction_open = false;
-    /* Flash is a post-commit side effect.  At this point the database
-     * transaction is already durable, so a flash failure must not pretend
-     * that an SQLite rollback restored the committed records.  Keep the
-     * complete primary-store result, report the side-effect failure, and
-     * let the caller retry synchronization without publishing success. */
+    /* Flash is a post-commit replica side effect.  DB/metadata are already
+     * committed, so failure must be durable pending work, never a fake
+     * rollback or TASK_FAILED transition. */
     if (ops->flash_sync && ops->flash_sync(ops->ctx) != 0) {
-        set_reason(state, "flash_sync_failed");
-        if (!ops->task_status_update ||
-            ops->task_status_update(ops->ctx, task_id, TASK_FAILED) != 0) {
-            set_reason(state, "task_failed_update_failed");
+        if (!ops->sync_mark_pending || ops->sync_mark_pending(ops->ctx, task_id) != 0) {
+            set_reason(state, "sync_outbox_persist_failed");
+            return -1;
         }
-        state->success = false;
-        return -1;
+        state->success = true;
+        state->sync_pending = true;
+        set_reason(state, "sync_pending");
+        return 0;
+    }
+    if (ops->sync_mark_complete && ops->sync_mark_complete(ops->ctx, task_id) != 0) {
+        if (!ops->sync_mark_pending || ops->sync_mark_pending(ops->ctx, task_id) != 0) {
+            set_reason(state, "sync_outbox_persist_failed");
+            return -1;
+        }
+        state->success = true;
+        state->sync_pending = true;
+        set_reason(state, "sync_pending");
+        return 0;
     }
     state->success = true;
     set_reason(state, "none");

@@ -29,11 +29,14 @@ typedef struct {
     int (*db_commit)(void *ctx);
     int (*db_rollback)(void *ctx);
     int (*flash_sync)(void *ctx);
+    int (*sync_mark_pending)(void *ctx, const char *task_id);
+    int (*sync_mark_complete)(void *ctx, const char *task_id);
 } StorageCommitOps;
 
 typedef struct {
     bool attempted;
     bool success;
+    bool sync_pending;
     char reason[STORAGE_COMMIT_REASON_SIZE];
 } StorageCommitState;
 

@@ -298,6 +298,8 @@ static int storage_env_flag_enabled(const char *name);
 static bool storage_env_string_is(const char *name, const char *expected);
 static bool storage_text_output_enabled(void);
 static bool storage_should_emit_text_format(const char *fmt);
+static uint64_t storage_timeout_us(const char *us_name, const char *ms_name,
+                                   uint64_t fallback_us);
 
 static uint64_t storage_wall_time_us(void) {
     struct timespec ts;
@@ -459,7 +461,8 @@ static void storage_maybe_dump_event_rings(const StorageWriteQueue *q,
     storage_defer_event_ring_dump(&q->writer_event_ring);
 }
 
-static int storage_wait_start_gate(ChannelRuntime *rt, uint64_t *start_skew_us, const char **gate_mode)
+static int storage_wait_start_gate(ChannelRuntime *rt, uint64_t *start_skew_us,
+                                   const char **gate_mode, const char **failure_reason)
 {
     const char *value = getenv("SRC_REAL_START_FD");
     char *end = NULL;
@@ -469,15 +472,62 @@ static int storage_wait_start_gate(ChannelRuntime *rt, uint64_t *start_skew_us, 
 
     int control_fd = storage_env_fd("SRC_REAL_STORAGE_CONTROL_FD");
     StorageControlMessage msg;
+    StorageControlReader reader;
     if (start_skew_us) *start_skew_us = 0u;
     if (gate_mode) *gate_mode = "standalone_immediate";
+    if (failure_reason) *failure_reason = "start_gate_failed";
     if (control_fd >= 0) {
-        if (storage_emit_event(STORAGE_WORKER_READY, rt, 0, 0u, "ready") != 0) return -1;
-        if (storage_ipc_read_control(control_fd, &msg) != 0 || msg.type != STORAGE_CTRL_ARM) return -1;
-        if (dma_start_s2mm_ring(rt) != 0) return -1;
-        if (storage_emit_event(STORAGE_WORKER_ARMED, rt, 0, 0u, "armed") != 0) return -1;
-        if (storage_ipc_read_control(control_fd, &msg) != 0 || msg.type != STORAGE_CTRL_RUN) return -1;
-        { int flags = fcntl(control_fd, F_GETFL, 0); if (flags >= 0) (void)fcntl(control_fd, F_SETFL, flags | O_NONBLOCK); }
+        uint64_t timeout_us = storage_timeout_us("SRC_REAL_STORAGE_ARM_TIMEOUT_US", NULL,
+            storage_timeout_us("SRC_REAL_STORAGE_START_TIMEOUT_US", NULL,
+                               rt->gopt.timeout_us ? rt->gopt.timeout_us : DEFAULT_TIMEOUT_US));
+        uint64_t deadline_us;
+        int flags = fcntl(control_fd, F_GETFL, 0);
+        storage_ipc_control_reader_init(&reader);
+        if (flags < 0 || fcntl(control_fd, F_SETFL, flags | O_NONBLOCK) != 0) {
+            if (failure_reason) *failure_reason = "control_fd_nonblocking_failed";
+            return -1;
+        }
+        if (storage_emit_event(STORAGE_WORKER_READY, rt, 0, 0u, "ready") != 0) {
+            if (failure_reason) *failure_reason = "ready_event_send_failed";
+            return -1;
+        }
+        deadline_us = storage_ipc_monotonic_us() + timeout_us;
+        if (storage_ipc_read_control_deadline(control_fd, &reader, &msg, deadline_us) != 0) {
+            if (failure_reason) *failure_reason = errno == ETIMEDOUT ? "arm_wait_timeout" :
+                                                errno == EPROTO ? "arm_control_protocol_error" :
+                                                "arm_control_eof_or_io_error";
+            return -1;
+        }
+        if (msg.type == STORAGE_CTRL_STOP) {
+            g_storage_control_stop_latched = true;
+            if (failure_reason) *failure_reason = "stop_before_arm";
+            return -1;
+        }
+        if (msg.type != STORAGE_CTRL_ARM) {
+            if (failure_reason) *failure_reason = "invalid_arm_sequence";
+            return -1;
+        }
+        if (dma_start_s2mm_ring(rt) != 0) { if (failure_reason) *failure_reason = "dma_start_failed"; return -1; }
+        if (storage_emit_event(STORAGE_WORKER_ARMED, rt, 0, 0u, "armed") != 0) {
+            if (failure_reason) *failure_reason = "armed_event_send_failed";
+            return -1;
+        }
+        timeout_us = storage_timeout_us("SRC_REAL_STORAGE_RUN_TIMEOUT_US", NULL,
+            storage_timeout_us("SRC_REAL_STORAGE_START_TIMEOUT_US", NULL,
+                               rt->gopt.timeout_us ? rt->gopt.timeout_us : DEFAULT_TIMEOUT_US));
+        deadline_us = storage_ipc_monotonic_us() + timeout_us;
+        if (storage_ipc_read_control_deadline(control_fd, &reader, &msg, deadline_us) != 0) {
+            if (failure_reason) *failure_reason = errno == ETIMEDOUT ? "run_wait_timeout" :
+                                                errno == EPROTO ? "run_control_protocol_error" :
+                                                "run_control_eof_or_io_error";
+            return -1;
+        }
+        if (msg.type == STORAGE_CTRL_STOP) {
+            g_storage_control_stop_latched = true;
+            if (failure_reason) *failure_reason = "stop_before_run";
+            return -1;
+        }
+        if (msg.type != STORAGE_CTRL_RUN) { if (failure_reason) *failure_reason = "invalid_run_sequence"; return -1; }
         if (gate_mode) *gate_mode = "software_two_phase_barrier";
         if (start_skew_us) {
             uint64_t now_us = storage_wall_time_us();
@@ -487,7 +537,7 @@ static int storage_wait_start_gate(ChannelRuntime *rt, uint64_t *start_skew_us, 
     }
     if (!value || value[0] == '\0') return 0;
     fd = strtol(value, &end, 10);
-    if (end == value || *end != '\0' || fd < 0 || fd > INT_MAX) return -1;
+    if (end == value || *end != '\0' || fd < 0 || fd > INT_MAX) { if (failure_reason) *failure_reason = "invalid_start_fd"; return -1; }
     while (used < sizeof(parent_start_us)) {
         ssize_t n = read((int)fd, (uint8_t *)&parent_start_us + used,
                          sizeof(parent_start_us) - used);
@@ -496,6 +546,7 @@ static int storage_wait_start_gate(ChannelRuntime *rt, uint64_t *start_skew_us, 
         } else if (n < 0 && errno == EINTR) {
             continue;
         } else {
+            if (failure_reason) *failure_reason = "start_barrier_io_error";
             return -1;
         }
     }
@@ -776,6 +827,18 @@ uint32_t storage_cross_slot_active_slots_for_channel(int channel_id)
     return fallback;
 }
 
+static const char *storage_cross_slot_active_source(int channel_id)
+{
+    char name[80];
+    snprintf(name, sizeof(name), "SRC_REAL_MAX_ACTIVE_CH%d", channel_id);
+    if (getenv(name)) return "channel_new";
+    snprintf(name, sizeof(name), "SRC_REAL_CROSS_SLOT_BATCH_CH%d", channel_id);
+    if (getenv(name)) return "channel_legacy";
+    if (getenv("SRC_REAL_MAX_ACTIVE")) return "global_new";
+    if (getenv("SRC_REAL_CROSS_SLOT_BATCH")) return "global_legacy";
+    return "default";
+}
+
 uint32_t storage_cross_slot_default_target_qd(int channel_id)
 {
     return channel_id == 2 ? 4u : 8u;
@@ -832,6 +895,27 @@ static uint32_t storage_cross_slot_param(const ChannelConfig *cfg,
         if (getenv(name)) return storage_env_u32_limit(name, fallback, max_value);
     }
     return fallback;
+}
+
+static const char *storage_cross_slot_param_source(const ChannelConfig *cfg,
+                                                   const char *short_name,
+                                                   const char *old_suffix)
+{
+    char name[96];
+    if (!cfg || !short_name) return "default";
+    snprintf(name, sizeof(name), "SRC_REAL_%s_CH%d", short_name, cfg->id);
+    if (getenv(name)) return "channel_new";
+    snprintf(name, sizeof(name), "SRC_REAL_%s", short_name);
+    if (getenv(name)) return "global_new";
+    if (old_suffix) {
+        snprintf(name, sizeof(name), "SRC_REAL_CH%d_%s", cfg->id, old_suffix);
+        if (getenv(name)) return "channel_legacy";
+        snprintf(name, sizeof(name), "SRC_REAL_NVME_CROSS_SLOT_%s_CH%d", old_suffix, cfg->id);
+        if (getenv(name)) return "channel_legacy";
+        snprintf(name, sizeof(name), "SRC_REAL_NVME_CROSS_SLOT_%s", old_suffix);
+        if (getenv(name)) return "global_legacy";
+    }
+    return "default";
 }
 
 static int storage_env_flag_enabled(const char *name)
@@ -932,7 +1016,7 @@ static uint32_t storage_writer_rt_prio(const ChannelRuntime *rt)
     if (getenv(name)) {
         return storage_env_u32_limit(name, 0u, 99u);
     }
-    return 60u;
+    return 61u;
 }
 
 static uint32_t storage_producer_rt_prio(const ChannelRuntime *rt)
@@ -1505,7 +1589,7 @@ static int storage_local_queue_push_batch(StorageWriteQueue *q, const PendingDdr
             items[i].sectors != expected_sectors ||
             items[i].start_lba > UINT64_MAX - items[i].sectors ||
             (q->rt->nvme_max_lba != 0u &&
-             items[i].start_lba + items[i].sectors > q->rt->nvme_max_lba) ||
+             !nvme_lba_range_valid(q->rt, items[i].start_lba, items[i].sectors)) ||
             items[i].hw_addr != expected_hw_addr ||
             items[i].hw_addr > UINT64_MAX - items[i].media_bytes) goto bad;
         ddr_end = items[i].hw_addr + items[i].media_bytes;
@@ -1786,7 +1870,7 @@ static int storage_capture_bd_snapshot(StorageProducerStats *stats,
         return 0;
     }
     pthread_mutex_lock(&q->lock);
-    rc = dma_get_bd_snapshot((ChannelRuntime *)rt, q->slot_state, out);
+    rc = dma_get_bd_snapshot_o1((ChannelRuntime *)rt, &q->slot_counts, out);
     pthread_mutex_unlock(&q->lock);
     if (rc != 0) {
         storage_record_failure(stats, "slot_ownership_invariant_failed");
@@ -2053,7 +2137,7 @@ static void storage_stats_print_periodic(StorageProducerStats *stats,
     storage_stats_finish_harvest_batch(stats);
     storage_queue_snapshot(q, &snapshot);
     pthread_mutex_lock(&q->lock);
-    if (dma_get_bd_snapshot((ChannelRuntime *)rt, q->slot_state, &bd_snapshot) != 0) {
+    if (dma_get_bd_snapshot_o1((ChannelRuntime *)rt, &q->slot_counts, &bd_snapshot) != 0) {
         memset(&bd_snapshot, 0, sizeof(bd_snapshot));
     }
     pthread_mutex_unlock(&q->lock);
@@ -2816,6 +2900,15 @@ static int storage_zero_tail_padding(ChannelRuntime *rt, const PendingDdrSlot *i
     if (media_bytes < item->bytes) return -1;
     pad = media_bytes - item->bytes;
     if (pad == 0u || rt->gopt.dry_run) return 0;
+    /* /dev/mem MAP_SHARED|O_SYNC does not, by itself, prove cache
+     * maintenance to an FPGA NVMe DMA master on every supported SoC.  The
+     * platform integration must explicitly attest coherence (or provide a
+     * cache-clean implementation) before we write a padded sector. */
+    if (!storage_env_flag_enabled("SRC_REAL_DDR_PADDING_DEVICE_COHERENT")) {
+        (void)snprintf(rt->nvme_last_error, sizeof(rt->nvme_last_error),
+                       "unaligned_payload_not_safely_paddable");
+        return -1;
+    }
     if (buffer_offset > rt->cfg->ddr_cpu_size ||
         media_bytes > rt->cfg->ddr_cpu_size - buffer_offset ||
         !rt->ddr.valid || buffer_offset > rt->ddr.size ||
@@ -3131,6 +3224,7 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
     bool pipeline_threaded_mode;
     bool fast_pipeline_enabled;
     bool auto_idle_enabled;
+    bool require_nonempty_payload;
     uint64_t start_skew_us = 0u;
     const char *start_gate_mode = "standalone_immediate";
 
@@ -3163,6 +3257,14 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                                    ? storage_env_u32_limit(
                                          "SRC_REAL_SUPERVISED_CHANNEL_COUNT", 1u, 3u)
                                    : 1u;
+    require_nonempty_payload = mode == STORAGE_WRITE_SUPERVISED &&
+                               supervised_channel_count == NUM_CHANNELS &&
+                               !storage_env_flag_enabled("SRC_REAL_ALLOW_ZERO_BYTE_CAPTURE");
+    if (require_nonempty_payload && first_dma_timeout_us == 0u) {
+        /* A production 0xAA capture must identify a missing input before
+         * STOP.  Thirty seconds is deliberately independent of idle-done. */
+        first_dma_timeout_us = 30000000ull;
+    }
     /* A supervised task is ended by the shared STOP/barrier.  In particular
      * ch2 must not auto-complete and cascade a stop while ch0/ch1 are still
      * waiting for their first input.  The idle policy is retained only for a
@@ -3315,7 +3417,8 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                        cfg->id, start_lba, requested_sectors);
             goto out;
         }
-        if (rt.nvme_max_lba > 0u && (start_lba + requested_sectors) > rt.nvme_max_lba) {
+        if (rt.nvme_max_lba > 0u &&
+            !nvme_lba_range_valid(&rt, start_lba, requested_sectors)) {
             fprintf(stderr,
                     "Requested SSD range exceeds max LBA: start=0x%08" PRIx64 " sectors=%" PRIu64
                     " max=0x%08" PRIx64 "\n",
@@ -3434,6 +3537,26 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                       storage_env_flag_enabled("SRC_REAL_ENABLE_STORAGE_STATS") ? 1u : 0u,
                       storage_env_flag_enabled("SRC_REAL_SLOT_WRITE_PERF") ? 1u : 0u,
                       (unsigned)storage_slot_perf_interval());
+    storage_emit_line("storage_cross_slot_effective_config channel=%d enabled=%u"
+                      " max_active=%u target_qd=%u cq_batch=%u writer_budget_us=%u"
+                      " busy_poll_us=%u empty_sleep_us=%u no_progress_timeout_us=%u"
+                      " max_active_source=%s target_qd_source=%s cq_batch_source=%s budget_source=%s"
+                      " busy_poll_source=%s empty_sleep_source=%s no_progress_source=%s",
+                      cfg->id, cross_slot_qd ? 1u : 0u,
+                      (unsigned)cross_slot_config.max_active_slots,
+                      (unsigned)cross_slot_config.target_qd,
+                      (unsigned)cross_slot_config.cq_batch,
+                      (unsigned)cross_slot_config.writer_budget_us,
+                      (unsigned)cross_slot_config.busy_poll_us,
+                      (unsigned)cross_slot_config.empty_sleep_us,
+                      (unsigned)cross_slot_config.no_progress_timeout_us,
+                      storage_cross_slot_active_source(cfg->id),
+                      storage_cross_slot_param_source(cfg, "TARGET_QD", "TARGET_QD"),
+                      storage_cross_slot_param_source(cfg, "CQ_BATCH", "CQ_BATCH"),
+                      storage_cross_slot_param_source(cfg, "WRITER_BUDGET_US", "WRITER_BUDGET_US"),
+                      storage_cross_slot_param_source(cfg, "BUSY_POLL_US", "BUSY_POLL_US"),
+                      storage_cross_slot_param_source(cfg, "EMPTY_SLEEP_US", "EMPTY_SLEEP_US"),
+                      storage_cross_slot_param_source(cfg, "NO_PROGRESS_TIMEOUT_US", "NO_PROGRESS_TIMEOUT_US"));
     storage_emit_line("storage_stop_config channel=%d compat_timeout_us=%" PRIu64
                       " dma_quiesce_timeout_us=%" PRIu64
                       " stop_harvest_timeout_us=%" PRIu64
@@ -3448,6 +3571,11 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                       auto_idle_enabled ? 1u : 0u,
                       auto_idle_enabled ? (unsigned)dma_idle_done_ms : 0u,
                       auto_idle_enabled ? "standalone_single_channel" : "supervised_barrier");
+    storage_emit_line("storage_zero_payload_policy channel=%d require_nonempty=%u first_dma_timeout_us=%" PRIu64
+                      " allow_zero_env=%u",
+                      cfg->id, require_nonempty_payload ? 1u : 0u,
+                      first_dma_timeout_us,
+                      storage_env_flag_enabled("SRC_REAL_ALLOW_ZERO_BYTE_CAPTURE") ? 1u : 0u);
     if (first_dma_timeout_us != 0u)
         storage_emit_line("storage_first_dma_timeout channel=%d timeout_us=%" PRIu64,
                           cfg->id, first_dma_timeout_us);
@@ -3465,9 +3593,14 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                       cfg->id, args->task_no, (unsigned)effective_file_index,
                       getenv("SRC_REAL_START_FD") ? "software_barrier" : "standalone_immediate");
     dma_started = true;
-    if (storage_wait_start_gate(&rt, &start_skew_us, &start_gate_mode) != 0) {
-        storage_record_failure(&producer_stats, "start_gate_failed");
+    {
+        const char *gate_failure_reason = "start_gate_failed";
+        if (storage_wait_start_gate(&rt, &start_skew_us, &start_gate_mode,
+                                    &gate_failure_reason) != 0) {
+        storage_record_failure(&producer_stats, gate_failure_reason);
+        (void)storage_emit_event(STORAGE_WORKER_FATAL, &rt, -1, 0u, gate_failure_reason);
         goto out;
+        }
     }
     if (storage_queue_enable_run(&write_queue) != 0) {
         storage_record_failure(&producer_stats, "writer_enable_failed");
@@ -3546,7 +3679,7 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                 DmaBdSnapshot first_snapshot;
                 memset(&first_snapshot, 0, sizeof(first_snapshot));
                 pthread_mutex_lock(&write_queue.lock);
-                (void)dma_get_bd_snapshot(&rt, write_queue.slot_state, &first_snapshot);
+                (void)dma_get_bd_snapshot_o1(&rt, &write_queue.slot_counts, &first_snapshot);
                 pthread_mutex_unlock(&write_queue.lock);
                 /* A completed BD may already be visible while the producer
                  * is between polling iterations.  It satisfies the first
@@ -4058,6 +4191,10 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                             : !strict_end_to_end;
         bool storage_integrity_ok = !tail_incomplete && !dma_stop_failed &&
                                     dma_received_bytes == bytes_written;
+        if (require_nonempty_payload && dma_received_bytes == 0u) {
+            storage_record_failure(&producer_stats, "zero_payload_not_allowed");
+            storage_integrity_ok = false;
+        }
         bool integrity_ok = producer_stats.receive_integrity_ok && end_to_end_ok &&
                             !producer_stats.integrity_risk_ring_full && storage_integrity_ok;
         final_integrity_ok = integrity_ok;
@@ -4076,6 +4213,8 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
             integrity_risk = "dma_file_byte_mismatch";
         } else if (dma_stop_failed) {
             integrity_risk = "dma_stop_recovery_failed";
+        } else if (require_nonempty_payload && dma_received_bytes == 0u) {
+            integrity_risk = "zero_payload_not_allowed";
         }
 
         if (storage_env_flag_enabled("SRC_REAL_LEGACY_RESULT_LINE")) {
