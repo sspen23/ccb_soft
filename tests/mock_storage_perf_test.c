@@ -38,7 +38,13 @@ int main(void)
     assert(storage_perf_log_event(&e, "task") == 0);
     storage_ipc_make_event(&e, STORAGE_WORKER_FINAL_RESULT, 1u, 0, 9u, "final_reason");
     e.result.dma_received_bytes = e.result.nvme_completed_bytes = e.result.file_bytes = 9u;
+    e.result.dma_observed_bytes = 11u;
+    e.result.dma_harvested_payload_bytes = 9u;
+    e.result.queued_payload_bytes = 9u;
     e.result.nvme_media_bytes = 10u; e.result.nvme_padding_bytes = 1u;
+    e.result.tail_unqueued_bytes = 2u;
+    e.result.stop_epoch = 77u;
+    e.result.submit_count = e.result.completion_count = 4u;
     snprintf(e.result.integrity_risk, sizeof(e.result.integrity_risk), "%s", "primary_reason");
     snprintf(e.result.secondary_reason, sizeof(e.result.secondary_reason), "%s", "secondary_reason");
     assert(storage_perf_log_event(&e, "task") == 0);
@@ -49,7 +55,10 @@ int main(void)
     while (fgets(line, sizeof(line), f)) { if (strstr(line, "storage_fatal")) break; }
     assert(strstr(line, "fatal_reason"));
     assert(fgets(line, sizeof(line), f) && strstr(line, "storage_final"));
-    assert(strstr(line, "nvme_media_bytes=10") && strstr(line, "primary_reason=primary_reason") &&
+    assert(strstr(line, "nvme_media_bytes=10") &&
+           strstr(line, "dma_observed_bytes=11") &&
+           strstr(line, "tail_unqueued_bytes=2") && strstr(line, "stop_epoch=77") &&
+           strstr(line, "primary_reason=primary_reason") &&
            strstr(line, "secondary_reason=secondary_reason"));
     assert(fgets(line, sizeof(line), f) && strstr(line, "storage_diag")); fclose(f);
     storage_perf_log_close();

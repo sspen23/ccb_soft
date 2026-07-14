@@ -90,6 +90,9 @@ typedef struct {
     uint64_t ready_q_nonempty_us;
     uint64_t writer_drain_loop_count;
     uint64_t writer_slots_drained;
+    uint64_t queued_slot_count;
+    uint64_t completed_slot_count;
+    uint64_t recycled_slot_count;
     uint64_t writer_schedule_gap_count;
     uint64_t writer_schedule_gap_max_us;
     uint64_t writer_no_progress_sleep_count;
@@ -125,6 +128,9 @@ typedef struct {
     uint64_t ready_q_nonempty_us;
     uint64_t writer_drain_loop_count;
     uint64_t writer_slots_drained;
+    uint64_t queued_slot_count;
+    uint64_t completed_slot_count;
+    uint64_t recycled_slot_count;
     uint64_t writer_schedule_gap_count;
     uint64_t writer_schedule_gap_max_us;
     uint64_t cross_sq_full_wait_count;
@@ -429,6 +435,35 @@ static void storage_emit_perf_event(const ChannelRuntime *rt, const StorageProdu
     event.perf.receive_integrity_ok = stats->receive_integrity_ok ? 1u : 0u;
     event.perf.storage_integrity_ok = (!q->error && !stats->integrity_risk_ring_full) ? 1u : 0u;
     (void)storage_ipc_try_write_perf(fd, &event, &g_storage_dropped_perf_samples);
+}
+
+static void storage_emit_final_perf_window(ChannelRuntime *rt,
+                                           StorageProducerStats *stats,
+                                           StorageWriteQueue *q,
+                                           uint64_t received_bytes,
+                                           uint64_t now_us)
+{
+    DmaBdSnapshot bd_snapshot;
+    uint64_t nvme_bytes;
+    uint64_t dma_delta;
+    uint64_t nvme_delta;
+
+    if (!rt || !stats || !q || stats->perf_window_start_us == 0u) return;
+    memset(&bd_snapshot, 0, sizeof(bd_snapshot));
+    pthread_mutex_lock(&q->lock);
+    (void)dma_get_bd_snapshot_o1(rt, &q->slot_counts, &bd_snapshot);
+    pthread_mutex_unlock(&q->lock);
+    nvme_bytes = __atomic_load_n(&rt->nvme_write_bytes_done, __ATOMIC_ACQUIRE);
+    dma_delta = received_bytes >= stats->perf_window_received_bytes
+                    ? received_bytes - stats->perf_window_received_bytes : 0u;
+    nvme_delta = nvme_bytes >= stats->perf_window_nvme_bytes
+                     ? nvme_bytes - stats->perf_window_nvme_bytes : 0u;
+    storage_emit_perf_event(rt, stats, q, &bd_snapshot,
+                            stats->perf_window_start_us, now_us,
+                            dma_delta, nvme_delta);
+    stats->perf_window_start_us = now_us;
+    stats->perf_window_received_bytes = received_bytes;
+    stats->perf_window_nvme_bytes = nvme_bytes;
 }
 
 static void storage_emit_diag_event(const ChannelRuntime *rt, const StorageEventRecord *record)
@@ -1721,7 +1756,8 @@ static int storage_local_queue_push_batch(StorageWriteQueue *q, const PendingDdr
         batch_bytes += items[i].bytes;
         for (j = 0u; j < i; ++j) if (items[j].slot == items[i].slot) goto bad;
     }
-    if (q->buffered_bytes > UINT64_MAX - batch_bytes) goto bad;
+    if (q->buffered_bytes > UINT64_MAX - batch_bytes ||
+        q->queued_slot_count > UINT64_MAX - item_count) goto bad;
     /* All validation is complete. No operation below may fail. */
     tail = q->tail;
     for (i = 0u; i < item_count; ++i) {
@@ -1740,6 +1776,7 @@ static int storage_local_queue_push_batch(StorageWriteQueue *q, const PendingDdr
     q->count += item_count;
     q->busy_count += item_count;
     q->buffered_bytes += batch_bytes;
+    q->queued_slot_count += item_count;
     if (q->busy_count > q->max_busy_count) q->max_busy_count = q->busy_count;
     if (q->buffered_bytes > q->max_buffered_bytes) q->max_buffered_bytes = q->buffered_bytes;
     storage_queue_record_depth_locked(q);
@@ -1915,6 +1952,9 @@ static void storage_queue_snapshot(StorageWriteQueue *q, StorageQueueSnapshot *o
     out->ready_q_nonempty_us = q->ready_q_nonempty_us;
     out->writer_drain_loop_count = q->writer_drain_loop_count;
     out->writer_slots_drained = q->writer_slots_drained;
+    out->queued_slot_count = q->queued_slot_count;
+    out->completed_slot_count = q->completed_slot_count;
+    out->recycled_slot_count = q->recycled_slot_count;
     out->writer_schedule_gap_count = q->writer_schedule_gap_count;
     out->writer_schedule_gap_max_us = q->writer_schedule_gap_max_us;
     out->writer_no_progress_sleep_count = q->writer_no_progress_sleep_count;
@@ -2446,8 +2486,16 @@ static int storage_complete_slot(StorageWriteQueue *q, const PendingDdrSlot *ite
                 (unsigned)item->slot);
         return -1;
     }
+    if (__atomic_load_n(&q->bytes_written, __ATOMIC_RELAXED) >
+            UINT64_MAX - item->bytes ||
+        q->completed_slot_count == UINT64_MAX) {
+        q->error = true;
+        pthread_mutex_unlock(&q->lock);
+        return -1;
+    }
     (void)__atomic_add_fetch(&q->bytes_written, item->bytes, __ATOMIC_RELEASE);
     ++q->chunks;
+    ++q->completed_slot_count;
     q->slot_busy[item->slot] = false;
     if (q->busy_count > 0u) {
         --q->busy_count;
@@ -2463,6 +2511,11 @@ static int storage_complete_slot(StorageWriteQueue *q, const PendingDdrSlot *ite
         pthread_mutex_unlock(&q->lock); return -1;
     }
     if (should_requeue) {
+        if (q->recycled_slot_count == UINT64_MAX) {
+            q->error = true;
+            pthread_mutex_unlock(&q->lock);
+            return -1;
+        }
         /* Keep the queue lock through the DMA requeue.  storage_queue_latch_stop
          * takes the same lock, so a stop either linearizes before this call or
          * after it; it can never observe a post-latch requeue race. */
@@ -2483,6 +2536,7 @@ static int storage_complete_slot(StorageWriteQueue *q, const PendingDdrSlot *ite
             pthread_mutex_unlock(&q->lock);
             return -1;
         }
+        ++q->recycled_slot_count;
     }
     pthread_mutex_unlock(&q->lock);
     if (!should_requeue && q->rt && dma_requeue_after_stop_count(q->rt) != 0u) {
@@ -3364,6 +3418,12 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
     uint64_t queued_payload_bytes = 0u;
     uint64_t tail_unqueued_bytes = 0u;
     uint64_t completed_unharvested_bytes = 0u;
+    uint64_t stop_request_us = 0u;
+    uint64_t packet_boundary_us = 0u;
+    uint64_t dma_quiesced_us = 0u;
+    uint64_t producer_done_us = 0u;
+    uint64_t writer_drained_us = 0u;
+    uint64_t final_us = 0u;
     uint64_t bytes_captured = 0u;
     uint64_t bytes_written = 0u;
     uint64_t next_queue_lba = 0u;
@@ -3395,6 +3455,7 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
     bool stop_harvest_stable = false;
     bool stop_tail_seen = false;
     bool stop_failed_phase_sent = false;
+    bool final_perf_emitted = false;
     bool bounded;
     bool cross_slot_qd;
     uint64_t requested_size;
@@ -3967,6 +4028,7 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                 }
                 (void)storage_stop_state_latch(
                     &stop_state, storage_wall_time_us() + stop_timeouts.stop_harvest_us);
+                stop_request_us = storage_wall_time_us();
                 (void)storage_stop_state_advance(&stop_state,
                                                  STORAGE_STOP_WAIT_BOUNDARY);
                 if (storage_emit_stop_phase(&rt, STORAGE_WORKER_STOP_REQUESTED,
@@ -4091,6 +4153,7 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                                 "packet_boundary_event_send_failed");
                             goto out;
                         }
+                        if (!boundary_timed_out) packet_boundary_us = storage_wall_time_us();
                         (void)storage_queue_latch_stop(&write_queue);
                         (void)storage_stop_state_advance(
                             &stop_state, STORAGE_STOP_DMA_QUIESCING);
@@ -4114,6 +4177,7 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                             dma_stop_result = quiesce_result;
                         }
                         dma_quiesced = true;
+                        dma_quiesced_us = storage_wall_time_us();
                         if (storage_emit_stop_phase(
                                 &rt, STORAGE_WORKER_DMA_QUIESCED,
                                 dma_received_bytes,
@@ -4504,6 +4568,7 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
         storage_record_failure(&producer_stats, "tail_descriptor_incomplete");
     }
     (void)storage_stop_state_advance(&stop_state, STORAGE_STOP_PRODUCER_DONE);
+    producer_done_us = storage_wall_time_us();
     storage_queue_finish(&write_queue);
     (void)storage_stop_state_advance(&stop_state, STORAGE_STOP_WRITER_DRAINING);
     dma_stop_attempted = true;
@@ -4522,6 +4587,7 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
         goto out;
     }
     writer_started = false;
+    writer_drained_us = storage_wall_time_us();
     if (storage_emit_stop_phase(&rt, STORAGE_WORKER_WRITER_DRAINED,
                                 dma_received_bytes, "writer_drained") != 0) {
         storage_record_failure(&producer_stats,
@@ -4553,6 +4619,9 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
     storage_maybe_dump_event_rings(&write_queue, &rt, false, manual_stop_seen);
     storage_stats_finish_harvest_batch(&producer_stats);
     storage_queue_snapshot(&write_queue, &final_queue_snapshot);
+    storage_emit_final_perf_window(&rt, &producer_stats, &write_queue,
+                                   dma_received_bytes, storage_wall_time_us());
+    final_perf_emitted = true;
     if (final_queue_snapshot.completed_unharvested_slots >
         UINT64_MAX / (uint64_t)rt.dma_desc_bytes) {
         completed_unharvested_bytes = UINT64_MAX;
@@ -4568,6 +4637,7 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
     (void)storage_queue_buffered_bytes(&write_queue, &max_buffered_bytes);
     storage_queue_destroy(&write_queue);
     write_queue_ready = false;
+    final_us = storage_wall_time_us();
     if (storage_emit_stop_phase(&rt, STORAGE_WORKER_FINALIZED,
                                 dma_received_bytes, "finalized") != 0) {
         storage_record_failure(&producer_stats, "finalized_event_send_failed");
@@ -4651,6 +4721,8 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                                          ? producer_stats.dma_harvest_batch_total /
                                                producer_stats.dma_harvest_batches
                                          : 0u;
+        StorageDrainInvariant drain_invariant;
+        bool drain_invariant_ok;
         snprintf(expected_name, sizeof(expected_name),
                  "SRC_REAL_EXPECTED_BYTES_CH%d", cfg->id);
         expected_available = storage_env_u64(expected_name, &expected_bytes) != 0;
@@ -4658,14 +4730,26 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                             ? expected_bytes == dma_received_bytes &&
                                   expected_bytes == nvme_payload_bytes_done
                             : !strict_end_to_end;
+        memset(&drain_invariant, 0, sizeof(drain_invariant));
+        drain_invariant.dma_harvested_payload_bytes =
+            dma_harvested_payload_bytes;
+        drain_invariant.queued_payload_bytes = queued_payload_bytes;
+        drain_invariant.nvme_completed_payload_bytes = nvme_payload_bytes_done;
+        drain_invariant.file_bytes = bytes_written;
+        drain_invariant.tail_unqueued_bytes = tail_unqueued_bytes;
+        drain_invariant.completed_unharvested =
+            final_queue_snapshot.completed_unharvested_slots;
+        drain_invariant.ready_count = final_queue_snapshot.ready_depth_current;
+        drain_invariant.active_count = final_queue_snapshot.nvme_busy_slots;
+        drain_invariant.global_inflight =
+            __atomic_load_n(&rt.nvme_active_qd_current, __ATOMIC_ACQUIRE);
+        drain_invariant.submit_count = nvme_cmd_count;
+        drain_invariant.completion_count =
+            __atomic_load_n(&rt.nvme_cq_completed, __ATOMIC_ACQUIRE);
+        drain_invariant_ok = storage_drain_invariant_ok(&drain_invariant);
         bool storage_integrity_ok = !tail_incomplete && !dma_stop_failed &&
-                                    tail_unqueued_bytes == 0u &&
                                     completed_unharvested_bytes == 0u &&
-                                    final_queue_snapshot.ready_depth_current == 0u &&
-                                    final_queue_snapshot.nvme_busy_slots == 0u &&
-                                    queued_payload_bytes == bytes_written &&
-                                    queued_payload_bytes == nvme_payload_bytes_done &&
-                                    dma_harvested_payload_bytes == queued_payload_bytes;
+                                    drain_invariant_ok;
         if (require_nonempty_payload && dma_received_bytes == 0u) {
             storage_record_failure(&producer_stats, "zero_payload_not_allowed");
             storage_integrity_ok = false;
@@ -4674,6 +4758,54 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                             !producer_stats.integrity_risk_ring_full && storage_integrity_ok;
         final_integrity_ok = integrity_ok;
         const char *integrity_risk = "none";
+
+        storage_emit_line(drain_invariant_ok ? STORAGE_LOG_SUMMARY
+                                             : STORAGE_LOG_ALWAYS_CRITICAL,
+                          "storage_drain_invariants channel=%d stop_epoch=%" PRIu64
+                          " stop_request_us=%" PRIu64 " packet_boundary_us=%" PRIu64
+                          " dma_quiesced_us=%" PRIu64
+                          " last_bd_complete_us=%" PRIu64
+                          " last_bd_harvest_us=%" PRIu64
+                          " producer_done_us=%" PRIu64
+                          " writer_drained_us=%" PRIu64 " final_us=%" PRIu64
+                          " dma_observed_bytes=%" PRIu64
+                          " dma_harvested_payload_bytes=%" PRIu64
+                          " queued_payload_bytes=%" PRIu64
+                          " nvme_completed_payload_bytes=%" PRIu64
+                          " nvme_completed_media_bytes=%" PRIu64
+                          " tail_unqueued_bytes=%" PRIu64
+                          " padding_bytes=%" PRIu64
+                          " harvested_bd_count=%" PRIu64
+                          " queued_slot_count=%" PRIu64
+                          " completed_slot_count=%" PRIu64
+                          " recycled_slot_count=%" PRIu64
+                          " ready_count=%u active_count=%u global_inflight=%u"
+                          " submit_count=%" PRIu64 " completion_count=%" PRIu64
+                          " completed_unharvested=%u free_dma_bd=%u"
+                          " ring_occupied_bytes=%" PRIu64 " invariant_ok=%u",
+                          cfg->id, g_storage_stop_epoch, stop_request_us,
+                          packet_boundary_us, dma_quiesced_us,
+                          producer_stats.last_dma_desc_us,
+                          producer_stats.last_dma_desc_us,
+                          producer_done_us, writer_drained_us, final_us,
+                          dma_observed_bytes, dma_harvested_payload_bytes,
+                          queued_payload_bytes, nvme_payload_bytes_done,
+                          nvme_write_bytes_done, tail_unqueued_bytes,
+                          nvme_write_bytes_done >= nvme_payload_bytes_done
+                              ? nvme_write_bytes_done - nvme_payload_bytes_done : 0u,
+                          producer_stats.dma_desc_completed_count,
+                          final_queue_snapshot.queued_slot_count,
+                          final_queue_snapshot.completed_slot_count,
+                          final_queue_snapshot.recycled_slot_count,
+                          drain_invariant.ready_count,
+                          drain_invariant.active_count,
+                          drain_invariant.global_inflight,
+                          drain_invariant.submit_count,
+                          drain_invariant.completion_count,
+                          drain_invariant.completed_unharvested,
+                          final_queue_snapshot.free_slots,
+                          final_queue_snapshot.buffered_bytes,
+                          drain_invariant_ok ? 1u : 0u);
 
         if (producer_stats.integrity_risk_ring_full) {
             integrity_risk = "dma_bd_exhausted_no_upstream_backpressure";
@@ -4907,6 +5039,28 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                                              ? nvme_write_bytes_done - nvme_payload_bytes_done : 0u;
             result->tail_unqueued_bytes = tail_unqueued_bytes;
             result->completed_unharvested_bytes = completed_unharvested_bytes;
+            result->stop_epoch = g_storage_stop_epoch;
+            result->stop_request_us = stop_request_us;
+            result->packet_boundary_us = packet_boundary_us;
+            result->dma_quiesced_us = dma_quiesced_us;
+            result->last_bd_complete_us = producer_stats.last_dma_desc_us;
+            result->last_bd_harvest_us = producer_stats.last_dma_desc_us;
+            result->producer_done_us = producer_done_us;
+            result->writer_drained_us = writer_drained_us;
+            result->final_us = final_us;
+            result->harvested_bd_count = producer_stats.dma_desc_completed_count;
+            result->queued_slot_count = final_queue_snapshot.queued_slot_count;
+            result->completed_slot_count = final_queue_snapshot.completed_slot_count;
+            result->recycled_slot_count = final_queue_snapshot.recycled_slot_count;
+            result->final_ready_count = drain_invariant.ready_count;
+            result->final_active_count = drain_invariant.active_count;
+            result->final_global_inflight = drain_invariant.global_inflight;
+            result->submit_count = drain_invariant.submit_count;
+            result->completion_count = drain_invariant.completion_count;
+            result->final_completed_unharvested =
+                drain_invariant.completed_unharvested;
+            result->final_free_dma_bd = final_queue_snapshot.free_slots;
+            result->final_ring_occupied_bytes = final_queue_snapshot.buffered_bytes;
             result->file_bytes = bytes_written;
             result->expected_bytes = expected_bytes;
             result->expected_available = expected_available;
@@ -4961,6 +5115,7 @@ out:
                                    dma_received_bytes);
     if (dma_started && !dma_stop_attempted) {
         if (stop_state.state == STORAGE_STOP_NONE) {
+            if (stop_request_us == 0u) stop_request_us = storage_wall_time_us();
             (void)storage_stop_state_latch(
                 &stop_state, storage_wall_time_us() + stop_timeouts.stop_harvest_us);
             (void)storage_stop_state_advance(&stop_state, STORAGE_STOP_WAIT_BOUNDARY);
@@ -5173,7 +5328,10 @@ out:
             (void)storage_stop_state_advance(
                 &stop_state, STORAGE_STOP_HARVESTING);
         }
-        if (writer_started) storage_queue_finish(&write_queue);
+        if (writer_started) {
+            if (producer_done_us == 0u) producer_done_us = storage_wall_time_us();
+            storage_queue_finish(&write_queue);
+        }
         if (stop_state.state == STORAGE_STOP_HARVESTING) {
             (void)storage_stop_state_advance(
                 &stop_state, STORAGE_STOP_PRODUCER_DONE);
@@ -5182,6 +5340,7 @@ out:
         }
         dma_stop_attempted = true;
     } else if (writer_started) {
+        if (producer_done_us == 0u) producer_done_us = storage_wall_time_us();
         storage_queue_finish(&write_queue);
     }
     if (writer_started) {
@@ -5198,6 +5357,8 @@ out:
         } else {
             writer_started = false;
         }
+        if (!writer_started && writer_drained_us == 0u)
+            writer_drained_us = storage_wall_time_us();
         bytes_written = write_queue.bytes_written;
         chunks = write_queue.chunks;
         nvme_write_us = write_queue.nvme_write_us;
@@ -5228,6 +5389,21 @@ out:
         (void)storage_stop_state_advance(&stop_state, STORAGE_STOP_FINALIZING);
     }
     if (write_queue_ready) {
+        storage_queue_snapshot(&write_queue, &final_queue_snapshot);
+        if (final_queue_snapshot.completed_unharvested_slots >
+            UINT64_MAX / (uint64_t)rt.dma_desc_bytes) {
+            completed_unharvested_bytes = UINT64_MAX;
+        } else {
+            completed_unharvested_bytes =
+                (uint64_t)final_queue_snapshot.completed_unharvested_slots *
+                (uint64_t)rt.dma_desc_bytes;
+        }
+        if (!final_perf_emitted && capture_start_us != 0u) {
+            storage_emit_final_perf_window(&rt, &producer_stats, &write_queue,
+                                           dma_received_bytes,
+                                           storage_wall_time_us());
+            final_perf_emitted = true;
+        }
         storage_maybe_dump_event_rings(&write_queue, &rt,
                                        rc != 0 || write_queue.error, manual_stop_seen);
         if (write_queue.nvme_engine_quiesced &&
@@ -5237,6 +5413,7 @@ out:
         }
     }
     if (rc != 0) {
+        if (final_us == 0u) final_us = storage_wall_time_us();
         if (result) {
             result->channel_id = cfg ? cfg->id : args->channel_id;
             result->metadata_slot = metadata_slot >= 0 ? (uint32_t)metadata_slot : 0u;
@@ -5258,6 +5435,31 @@ out:
                                              ? result->nvme_media_bytes - result->nvme_completed_bytes : 0u;
             result->tail_unqueued_bytes = tail_unqueued_bytes;
             result->completed_unharvested_bytes = completed_unharvested_bytes;
+            result->stop_epoch = g_storage_stop_epoch;
+            result->stop_request_us = stop_request_us;
+            result->packet_boundary_us = packet_boundary_us;
+            result->dma_quiesced_us = dma_quiesced_us;
+            result->last_bd_complete_us = producer_stats.last_dma_desc_us;
+            result->last_bd_harvest_us = producer_stats.last_dma_desc_us;
+            result->producer_done_us = producer_done_us;
+            result->writer_drained_us = writer_drained_us;
+            result->final_us = final_us;
+            result->harvested_bd_count = producer_stats.dma_desc_completed_count;
+            result->queued_slot_count = final_queue_snapshot.queued_slot_count;
+            result->completed_slot_count = final_queue_snapshot.completed_slot_count;
+            result->recycled_slot_count = final_queue_snapshot.recycled_slot_count;
+            result->final_ready_count = final_queue_snapshot.ready_depth_current;
+            result->final_active_count = final_queue_snapshot.nvme_busy_slots;
+            result->final_global_inflight =
+                __atomic_load_n(&rt.nvme_active_qd_current, __ATOMIC_ACQUIRE);
+            result->submit_count =
+                __atomic_load_n(&rt.nvme_cmd_count, __ATOMIC_ACQUIRE);
+            result->completion_count =
+                __atomic_load_n(&rt.nvme_cq_completed, __ATOMIC_ACQUIRE);
+            result->final_completed_unharvested =
+                final_queue_snapshot.completed_unharvested_slots;
+            result->final_free_dma_bd = final_queue_snapshot.free_slots;
+            result->final_ring_occupied_bytes = final_queue_snapshot.buffered_bytes;
             result->file_bytes = bytes_written;
             result->dma_bd_exhaustion_count = producer_stats.dma_no_free_slot_count;
             result->dma_error_count = producer_stats.dma_error_count;

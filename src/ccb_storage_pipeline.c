@@ -83,6 +83,23 @@ StorageStopTailDisposition storage_stop_tail_disposition(bool stop_active,
     return STORAGE_STOP_TAIL_QUEUE;
 }
 
+bool storage_drain_invariant_ok(const StorageDrainInvariant *invariant)
+{
+    if (!invariant || invariant->completion_count > invariant->submit_count)
+        return false;
+    return invariant->dma_harvested_payload_bytes ==
+               invariant->queued_payload_bytes &&
+           invariant->queued_payload_bytes ==
+               invariant->nvme_completed_payload_bytes &&
+           invariant->nvme_completed_payload_bytes == invariant->file_bytes &&
+           invariant->tail_unqueued_bytes == 0u &&
+           invariant->completed_unharvested == 0u &&
+           invariant->ready_count == 0u && invariant->active_count == 0u &&
+           invariant->global_inflight == 0u &&
+           invariant->submit_count - invariant->completion_count ==
+               invariant->global_inflight;
+}
+
 void storage_run_state_init(StorageRunState *state)
 {
     if (state) memset(state, 0, sizeof(*state));

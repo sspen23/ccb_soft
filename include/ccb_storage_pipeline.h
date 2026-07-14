@@ -35,6 +35,20 @@ typedef enum {
 } StorageStopTailDisposition;
 
 typedef struct {
+    uint64_t dma_harvested_payload_bytes;
+    uint64_t queued_payload_bytes;
+    uint64_t nvme_completed_payload_bytes;
+    uint64_t file_bytes;
+    uint64_t tail_unqueued_bytes;
+    uint32_t completed_unharvested;
+    uint32_t ready_count;
+    uint32_t active_count;
+    uint32_t global_inflight;
+    uint64_t submit_count;
+    uint64_t completion_count;
+} StorageDrainInvariant;
+
+typedef struct {
     bool writer_enabled;
     bool writer_run_ready;
     bool writer_schedule_failed;
@@ -118,6 +132,7 @@ StorageStopTailDisposition storage_stop_tail_disposition(bool stop_active,
                                                          uint64_t payload_bytes,
                                                          uint64_t media_bytes,
                                                          bool padding_coherent);
+bool storage_drain_invariant_ok(const StorageDrainInvariant *invariant);
 void storage_run_state_init(StorageRunState *state);
 int storage_run_state_enable_writer(StorageRunState *state);
 int storage_run_state_set_writer_ready(StorageRunState *state, bool success);

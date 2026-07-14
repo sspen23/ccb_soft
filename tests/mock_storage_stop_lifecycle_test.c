@@ -55,6 +55,15 @@ static void test_unaligned_tail_does_not_abort_full_prefix(void)
 static void test_stop_is_idempotent_and_inflight_blocks_finish(void)
 {
     StorageStopState stop;
+    StorageDrainInvariant invariant = {
+        .dma_harvested_payload_bytes = 4096u,
+        .queued_payload_bytes = 4096u,
+        .nvme_completed_payload_bytes = 4096u,
+        .file_bytes = 4096u,
+        .submit_count = 7u,
+        .completion_count = 6u,
+        .global_inflight = 1u,
+    };
     uint64_t submitted = 7u;
     uint64_t completed = 6u;
     uint64_t global_inflight = 1u;
@@ -64,9 +73,18 @@ static void test_stop_is_idempotent_and_inflight_blocks_finish(void)
     assert(!storage_stop_state_latch(&stop, 2000u));
     assert(submitted - completed == global_inflight);
     assert(global_inflight != 0u);
+    assert(!storage_drain_invariant_ok(&invariant));
     ++completed;
     --global_inflight;
     assert(submitted == completed && global_inflight == 0u);
+    invariant.completion_count = 7u;
+    invariant.global_inflight = 0u;
+    assert(storage_drain_invariant_ok(&invariant));
+    invariant.completed_unharvested = 1u;
+    assert(!storage_drain_invariant_ok(&invariant));
+    invariant.completed_unharvested = 0u;
+    invariant.ready_count = 1u;
+    assert(!storage_drain_invariant_ok(&invariant));
 }
 
 int main(void)

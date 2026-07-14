@@ -26,7 +26,7 @@ static int storage_perf_open(void)
 }
 int storage_perf_log_event(const StorageWorkerEvent *e, const char *task)
 {
-    char line[1024]; int n; int fd;
+    char line[4096]; int n; int fd;
     if (!e || (fd = storage_perf_open()) < 0) return -1;
     switch (e->type) {
     case STORAGE_WORKER_PERF_SAMPLE:
@@ -67,13 +67,54 @@ int storage_perf_log_event(const StorageWorkerEvent *e, const char *task)
                      e->error_code, (unsigned long long)e->received_bytes, e->reason);
         break;
     case STORAGE_WORKER_FINAL_RESULT:
-        n = snprintf(line, sizeof(line), "storage_final task=%s channel=%u ts_us=%llu error=%d dma_bytes=%llu nvme_bytes=%llu nvme_media_bytes=%llu nvme_padding_bytes=%llu file_bytes=%llu persisted=%u receive_integrity_ok=%u storage_integrity_ok=%u integrity_ok=%u primary_reason=%s secondary_reason=%s reason=%s\n",
+        n = snprintf(line, sizeof(line), "storage_final task=%s channel=%u ts_us=%llu error=%d"
+                     " dma_bytes=%llu dma_observed_bytes=%llu"
+                     " dma_harvested_payload_bytes=%llu queued_payload_bytes=%llu"
+                     " nvme_bytes=%llu nvme_media_bytes=%llu nvme_padding_bytes=%llu"
+                     " tail_unqueued_bytes=%llu completed_unharvested_bytes=%llu"
+                     " file_bytes=%llu stop_epoch=%llu stop_request_us=%llu"
+                     " packet_boundary_us=%llu dma_quiesced_us=%llu"
+                     " last_bd_complete_us=%llu last_bd_harvest_us=%llu"
+                     " producer_done_us=%llu writer_drained_us=%llu final_us=%llu"
+                     " harvested_bd_count=%llu queued_slot_count=%llu"
+                     " completed_slot_count=%llu recycled_slot_count=%llu"
+                     " ready_count=%u active_count=%u global_inflight=%u"
+                     " submit_count=%llu completion_count=%llu"
+                     " completed_unharvested=%u free_dma_bd=%u ring_occupied_bytes=%llu"
+                     " persisted=%u receive_integrity_ok=%u storage_integrity_ok=%u"
+                     " integrity_ok=%u primary_reason=%s secondary_reason=%s reason=%s\n",
                      task ? task : "", e->channel, (unsigned long long)e->timestamp_us,
                      e->error_code, (unsigned long long)e->result.dma_received_bytes,
+                     (unsigned long long)e->result.dma_observed_bytes,
+                     (unsigned long long)e->result.dma_harvested_payload_bytes,
+                     (unsigned long long)e->result.queued_payload_bytes,
                      (unsigned long long)e->result.nvme_completed_bytes,
                      (unsigned long long)e->result.nvme_media_bytes,
                      (unsigned long long)e->result.nvme_padding_bytes,
-                     (unsigned long long)e->result.file_bytes, e->result.data_persisted ? 1u : 0u,
+                     (unsigned long long)e->result.tail_unqueued_bytes,
+                     (unsigned long long)e->result.completed_unharvested_bytes,
+                     (unsigned long long)e->result.file_bytes,
+                     (unsigned long long)e->result.stop_epoch,
+                     (unsigned long long)e->result.stop_request_us,
+                     (unsigned long long)e->result.packet_boundary_us,
+                     (unsigned long long)e->result.dma_quiesced_us,
+                     (unsigned long long)e->result.last_bd_complete_us,
+                     (unsigned long long)e->result.last_bd_harvest_us,
+                     (unsigned long long)e->result.producer_done_us,
+                     (unsigned long long)e->result.writer_drained_us,
+                     (unsigned long long)e->result.final_us,
+                     (unsigned long long)e->result.harvested_bd_count,
+                     (unsigned long long)e->result.queued_slot_count,
+                     (unsigned long long)e->result.completed_slot_count,
+                     (unsigned long long)e->result.recycled_slot_count,
+                     e->result.final_ready_count, e->result.final_active_count,
+                     e->result.final_global_inflight,
+                     (unsigned long long)e->result.submit_count,
+                     (unsigned long long)e->result.completion_count,
+                     e->result.final_completed_unharvested,
+                     e->result.final_free_dma_bd,
+                     (unsigned long long)e->result.final_ring_occupied_bytes,
+                     e->result.data_persisted ? 1u : 0u,
                      e->result.receive_integrity_ok ? 1u : 0u,
                      e->result.storage_integrity_ok ? 1u : 0u,
                      e->result.integrity_ok ? 1u : 0u,
