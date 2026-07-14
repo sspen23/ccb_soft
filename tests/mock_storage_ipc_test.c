@@ -54,19 +54,25 @@ int main(void)
            out.type == STORAGE_CTRL_STOP && out.stop_epoch == 1234u);
     c.magic = 0u; assert(storage_ipc_write_control(p[1], &c) != 0);
     storage_ipc_make_event(&e, STORAGE_WORKER_READY, 0u, STORAGE_ERR_NONE, 0u, "ready");
+    assert(e.payload_size == sizeof(WorkerReadyPayload));
     assert(storage_ipc_write_event(p[1], &e) == 0);
     assert(storage_ipc_read_event(p[0], &eo) == 0 && eo.type == STORAGE_WORKER_READY);
     storage_ipc_make_event(&e, STORAGE_WORKER_STOP_PHASE, 0u, STORAGE_ERR_NONE, 0u, "phase");
-    e.stop_epoch = 1234u;
-    e.stop_phase = STORAGE_WORKER_STOP_REQUESTED;
+    e.payload.phase.stop_epoch = 1234u;
+    e.payload.phase.stop_phase = STORAGE_WORKER_STOP_REQUESTED;
+    assert(e.payload_size == sizeof(WorkerPhasePayload));
     assert(storage_ipc_write_event(p[1], &e) == 0);
     assert(storage_ipc_read_event(p[0], &eo) == 0 &&
-           eo.stop_epoch == 1234u && eo.stop_phase == STORAGE_WORKER_STOP_REQUESTED);
+           eo.payload.phase.stop_epoch == 1234u &&
+           eo.payload.phase.stop_phase == STORAGE_WORKER_STOP_REQUESTED);
     assert(strcmp(storage_ipc_stop_phase_name(STORAGE_WORKER_FINALIZED),
                   "finalized") == 0);
     e.size--;
     assert(storage_ipc_write_event(p[1], &e) != 0);
     e.size = sizeof(e);
+    e.payload_size--;
+    assert(storage_ipc_write_event(p[1], &e) != 0);
+    e.payload_size = sizeof(WorkerPhasePayload);
     e.version++; assert(storage_ipc_write_event(p[1], &e) != 0);
     assert(write(p[1], &e, sizeof(e)) == (ssize_t)sizeof(e));
     assert(storage_ipc_read_event_raw(p[0], &eo) == 0);

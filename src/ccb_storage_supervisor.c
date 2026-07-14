@@ -111,19 +111,24 @@ int storage_supervisor_handle_event(StorageTaskSupervisor *s, const StorageWorke
                 return -1;
             }
         s->fatal_seen_mask |= b;
-        fail(s, e->channel, e->error_code, e->reason);
+        fail(s, e->channel, e->payload.fatal.error_code,
+             e->payload.fatal.reason);
         break;
     case STORAGE_WORKER_FINAL_RESULT:
         if (s->final_seen_mask & b) {
             fail(s, e->channel, STORAGE_ERR_IPC_SEQUENCE, "duplicate_final");
             return -1;
         }
-        if ((e->error_code == 0 && (s->drained_mask & b) == 0u) ||
-            (e->error_code != 0 && (s->fatal_seen_mask & b) == 0u)) {
+        if ((e->payload.final.error_code == STORAGE_ERR_NONE &&
+             (s->drained_mask & b) == 0u) ||
+            (e->payload.final.error_code != STORAGE_ERR_NONE &&
+             (s->fatal_seen_mask & b) == 0u)) {
             fail(s, e->channel, STORAGE_ERR_IPC_SEQUENCE, "invalid_final_sequence");
             return -1;
         }
-        s->final_seen_mask |= b; s->final_result[e->channel] = e->result; break;
+        s->final_seen_mask |= b;
+        s->final_result[e->channel] = e->payload.final.result;
+        break;
     case STORAGE_WORKER_PERF_SAMPLE:
         if ((s->running_mask & b) == 0u || (s->final_seen_mask & b) != 0u) {
             fail(s, e->channel, STORAGE_ERR_IPC_SEQUENCE, "invalid_perf_sequence");
@@ -139,30 +144,30 @@ int storage_supervisor_handle_event(StorageTaskSupervisor *s, const StorageWorke
         break;
     case STORAGE_WORKER_STOP_PHASE:
         if ((s->running_mask & b) == 0u || (s->final_seen_mask & b) != 0u ||
-            e->stop_epoch == 0u ||
-            e->stop_phase < STORAGE_WORKER_STOP_REQUESTED ||
-            e->stop_phase > STORAGE_WORKER_FAILED_FATAL) {
+            e->payload.phase.stop_epoch == 0u ||
+            e->payload.phase.stop_phase < STORAGE_WORKER_STOP_REQUESTED ||
+            e->payload.phase.stop_phase > STORAGE_WORKER_FAILED_FATAL) {
             fail(s, e->channel, STORAGE_ERR_IPC_SEQUENCE, "invalid_stop_phase_event");
             return -1;
         }
-        if (s->stop_epoch == 0u) s->stop_epoch = e->stop_epoch;
-        if (s->stop_epoch != e->stop_epoch) {
+        if (s->stop_epoch == 0u) s->stop_epoch = e->payload.phase.stop_epoch;
+        if (s->stop_epoch != e->payload.phase.stop_epoch) {
             fail(s, e->channel, STORAGE_ERR_IPC_SEQUENCE, "stop_epoch_mismatch");
             return -1;
         }
-        if (e->stop_phase == STORAGE_WORKER_FAILED_FATAL) {
+        if (e->payload.phase.stop_phase == STORAGE_WORKER_FAILED_FATAL) {
             if (s->stop_phase[e->channel] == STORAGE_WORKER_FAILED_FATAL) {
                 fail(s, e->channel, STORAGE_ERR_IPC_SEQUENCE, "duplicate_stop_phase");
                 return -1;
             }
-        } else if (e->stop_phase != s->stop_phase[e->channel] + 1u &&
+        } else if (e->payload.phase.stop_phase != s->stop_phase[e->channel] + 1u &&
                    !(s->stop_phase[e->channel] == STORAGE_WORKER_STOP_REQUESTED &&
-                     e->stop_phase == STORAGE_WORKER_DMA_QUIESCED &&
-                     e->error_code == STORAGE_ERR_STOP_BOUNDARY_TIMEOUT)) {
+                     e->payload.phase.stop_phase == STORAGE_WORKER_DMA_QUIESCED &&
+                     e->payload.phase.error_code == STORAGE_ERR_STOP_BOUNDARY_TIMEOUT)) {
             fail(s, e->channel, STORAGE_ERR_IPC_SEQUENCE, "invalid_stop_phase_sequence");
             return -1;
         }
-        s->stop_phase[e->channel] = e->stop_phase;
+        s->stop_phase[e->channel] = e->payload.phase.stop_phase;
         break;
     default:
         fail(s, e->channel, STORAGE_ERR_IPC, "event_type_invalid");

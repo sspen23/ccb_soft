@@ -177,17 +177,76 @@ void storage_ipc_make_event(StorageWorkerEvent *event, StorageWorkerEventType ty
                             uint32_t channel, StorageErrorCode error_code,
                             uint64_t received_bytes, const char *reason)
 {
+    WorkerReadyPayload *ready;
+
     memset(event, 0, sizeof(*event));
     event->magic = STORAGE_IPC_MAGIC;
     event->version = STORAGE_IPC_VERSION;
     event->size = sizeof(*event);
     event->type = (uint32_t)type;
     event->channel = channel;
+    event->payload_size = storage_ipc_event_payload_size(type);
     event->timestamp_us = storage_ipc_monotonic_us();
-    event->error_code = error_code;
-    event->received_bytes = received_bytes;
-    if (reason) {
-        (void)snprintf(event->reason, sizeof(event->reason), "%s", reason);
+
+    switch (type) {
+    case STORAGE_WORKER_READY:
+    case STORAGE_WORKER_ARMED:
+    case STORAGE_WORKER_RUNNING:
+    case STORAGE_WORKER_DRAINED:
+        ready = &event->payload.ready;
+        ready->received_bytes = received_bytes;
+        if (reason) (void)snprintf(ready->reason, sizeof(ready->reason), "%s", reason);
+        break;
+    case STORAGE_WORKER_FATAL:
+        event->payload.fatal.error_code = error_code;
+        event->payload.fatal.received_bytes = received_bytes;
+        if (reason) {
+            (void)snprintf(event->payload.fatal.reason,
+                           sizeof(event->payload.fatal.reason), "%s", reason);
+        }
+        break;
+    case STORAGE_WORKER_FINAL_RESULT:
+        event->payload.final.error_code = error_code;
+        event->payload.final.received_bytes = received_bytes;
+        if (reason) {
+            (void)snprintf(event->payload.final.reason,
+                           sizeof(event->payload.final.reason), "%s", reason);
+        }
+        break;
+    case STORAGE_WORKER_STOP_PHASE:
+        event->payload.phase.error_code = error_code;
+        event->payload.phase.received_bytes = received_bytes;
+        if (reason) {
+            (void)snprintf(event->payload.phase.reason,
+                           sizeof(event->payload.phase.reason), "%s", reason);
+        }
+        break;
+    case STORAGE_WORKER_PERF_SAMPLE:
+    case STORAGE_WORKER_DIAG_EVENT:
+        break;
+    }
+}
+
+uint32_t storage_ipc_event_payload_size(StorageWorkerEventType type)
+{
+    switch (type) {
+    case STORAGE_WORKER_READY:
+    case STORAGE_WORKER_ARMED:
+    case STORAGE_WORKER_RUNNING:
+    case STORAGE_WORKER_DRAINED:
+        return sizeof(WorkerReadyPayload);
+    case STORAGE_WORKER_FATAL:
+        return sizeof(WorkerFatalPayload);
+    case STORAGE_WORKER_FINAL_RESULT:
+        return sizeof(WorkerFinalPayload);
+    case STORAGE_WORKER_PERF_SAMPLE:
+        return sizeof(StoragePerfSample);
+    case STORAGE_WORKER_DIAG_EVENT:
+        return sizeof(StorageEventRecord);
+    case STORAGE_WORKER_STOP_PHASE:
+        return sizeof(WorkerPhasePayload);
+    default:
+        return 0u;
     }
 }
 
@@ -200,22 +259,35 @@ static int storage_ipc_control_valid(const StorageControlMessage *msg)
 
 int storage_ipc_validate_event(const StorageWorkerEvent *event)
 {
+    uint32_t expected_payload_size;
+
     if (!event || event->magic != STORAGE_IPC_MAGIC ||
         event->version != STORAGE_IPC_VERSION || event->size != sizeof(*event) ||
-        event->type < STORAGE_WORKER_READY || event->type > STORAGE_WORKER_STOP_PHASE ||
-        !storage_error_code_valid(event->error_code))
+        event->type < STORAGE_WORKER_READY || event->type > STORAGE_WORKER_STOP_PHASE)
         return 0;
-    if (event->type == STORAGE_WORKER_FATAL)
-        return storage_error_class(event->error_code) == STORAGE_ERROR_FATAL;
-    if (event->type == STORAGE_WORKER_FINAL_RESULT)
-        return true;
-    if (event->type == STORAGE_WORKER_STOP_PHASE) {
-        if (event->stop_phase == STORAGE_WORKER_FAILED_FATAL)
-            return storage_error_class(event->error_code) == STORAGE_ERROR_FATAL;
-        return event->error_code == STORAGE_ERR_NONE ||
-               storage_error_class(event->error_code) == STORAGE_ERROR_DEFERRED;
+    expected_payload_size = storage_ipc_event_payload_size(
+        (StorageWorkerEventType)event->type);
+    if (event->payload_size != expected_payload_size) return 0;
+    if (event->type == STORAGE_WORKER_FATAL) {
+        return storage_error_code_valid(event->payload.fatal.error_code) &&
+               storage_error_class(event->payload.fatal.error_code) == STORAGE_ERROR_FATAL;
     }
-    return event->error_code == STORAGE_ERR_NONE;
+    if (event->type == STORAGE_WORKER_FINAL_RESULT) {
+        return storage_error_code_valid(event->payload.final.error_code);
+    }
+    if (event->type == STORAGE_WORKER_STOP_PHASE) {
+        const WorkerPhasePayload *phase = &event->payload.phase;
+
+        if (!storage_error_code_valid(phase->error_code) ||
+            phase->stop_phase < STORAGE_WORKER_STOP_REQUESTED ||
+            phase->stop_phase > STORAGE_WORKER_FAILED_FATAL)
+            return 0;
+        if (phase->stop_phase == STORAGE_WORKER_FAILED_FATAL)
+            return storage_error_class(phase->error_code) == STORAGE_ERROR_FATAL;
+        return phase->error_code == STORAGE_ERR_NONE ||
+               storage_error_class(phase->error_code) == STORAGE_ERROR_DEFERRED;
+    }
+    return true;
 }
 
 const char *storage_ipc_stop_phase_name(StorageWorkerStopPhase phase)

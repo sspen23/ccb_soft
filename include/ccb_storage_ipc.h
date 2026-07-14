@@ -7,7 +7,7 @@
 #include <stdatomic.h>
 
 #define STORAGE_IPC_MAGIC 0x53544732u
-#define STORAGE_IPC_VERSION 6u
+#define STORAGE_IPC_VERSION 7u
 
 typedef enum {
     STORAGE_CTRL_ARM = 1,
@@ -90,22 +90,50 @@ typedef struct {
 } StoragePerfSample;
 
 typedef struct {
+    uint64_t received_bytes;
+    char reason[64];
+} WorkerReadyPayload;
+
+typedef struct {
+    StorageErrorCode error_code;
+    uint32_t stop_phase;
+    uint64_t received_bytes;
+    uint64_t stop_epoch;
+    char reason[64];
+} WorkerPhasePayload;
+
+typedef struct {
+    StorageErrorCode error_code;
+    uint32_t reserved;
+    uint64_t received_bytes;
+    char reason[64];
+} WorkerFatalPayload;
+
+typedef struct {
+    StorageErrorCode error_code;
+    uint32_t reserved;
+    uint64_t received_bytes;
+    char reason[64];
+    WriteResult result;
+} WorkerFinalPayload;
+
+typedef struct {
     uint32_t magic;
     uint16_t version;
     uint16_t size;
     uint32_t type;
     uint32_t channel;
-    uint64_t timestamp_us;
-    StorageErrorCode error_code;
+    uint32_t payload_size;
     uint32_t reserved;
-    uint64_t received_bytes;
-    uint64_t stop_epoch;
-    uint32_t stop_phase;
-    uint32_t stop_reserved;
-    char reason[64];
-    StoragePerfSample perf;
-    StorageEventRecord diag;
-    WriteResult result;
+    uint64_t timestamp_us;
+    union {
+        WorkerReadyPayload ready;
+        WorkerPhasePayload phase;
+        WorkerFatalPayload fatal;
+        WorkerFinalPayload final;
+        StoragePerfSample perf;
+        StorageEventRecord diag;
+    } payload;
 } StorageWorkerEvent;
 
 _Static_assert(sizeof(StorageControlMessage) <= 4096u, "control must fit PIPE_BUF");
@@ -147,6 +175,7 @@ int storage_ipc_try_write_diag(int fd, const StorageWorkerEvent *event,
 int storage_ipc_write_event_deadline(int fd, const StorageWorkerEvent *event,
                                      uint64_t deadline_us);
 int storage_ipc_validate_event(const StorageWorkerEvent *event);
+uint32_t storage_ipc_event_payload_size(StorageWorkerEventType type);
 const char *storage_ipc_stop_phase_name(StorageWorkerStopPhase phase);
 int storage_ipc_read_event_raw(int fd, StorageWorkerEvent *event);
 int storage_ipc_read_event(int fd, StorageWorkerEvent *event);

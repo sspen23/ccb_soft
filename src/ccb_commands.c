@@ -411,8 +411,8 @@ static int storage_emit_stop_phase(const ChannelRuntime *rt,
                            rt && rt->cfg ? (uint32_t)rt->cfg->id : UINT32_MAX,
                            error_code,
                            bytes, reason);
-    event.stop_epoch = g_storage_stop_epoch;
-    event.stop_phase = (uint32_t)phase;
+    event.payload.phase.stop_epoch = g_storage_stop_epoch;
+    event.payload.phase.stop_phase = (uint32_t)phase;
     return storage_ipc_write_event_deadline(
         fd, &event, storage_ipc_monotonic_us() + STORAGE_EVENT_DEADLINE_US);
 }
@@ -427,36 +427,40 @@ static void storage_emit_perf_event(const ChannelRuntime *rt, const StorageProdu
     if (fd < 0 || !rt || !stats || !q || !bd) return;
     storage_ipc_make_event(&event, STORAGE_WORKER_PERF_SAMPLE, (uint32_t)rt->cfg->id,
                            STORAGE_ERR_NONE, dma_delta, "perf_sample");
-    event.perf.window_start_us = start_us; event.perf.window_end_us = end_us;
-    event.perf.dma_bytes_delta = dma_delta; event.perf.nvme_bytes_delta = nvme_delta;
-    event.perf.dma_writable = bd->dma_writable; event.perf.completed_unharvested = bd->completed_unharvested;
-    event.perf.ready_slots = bd->ready_slots; event.perf.nvme_busy_slots = bd->nvme_busy_slots;
-    event.perf.requeue_pending = bd->requeue_pending; event.perf.free_slots = bd->free_slots;
-    event.perf.active_qd = __atomic_load_n(&rt->nvme_active_qd_current, __ATOMIC_ACQUIRE);
-    event.perf.active_qd_max = __atomic_load_n(&rt->nvme_active_qd_max, __ATOMIC_ACQUIRE);
-    event.perf.submit_stall_count = __atomic_load_n(&rt->nvme_submit_stall_count, __ATOMIC_ACQUIRE);
-    event.perf.submit_stall_max_us = __atomic_load_n(&rt->nvme_submit_stall_max_us, __ATOMIC_ACQUIRE);
-    event.perf.writer_schedule_gap_count = __atomic_load_n(&q->writer_schedule_gap_count, __ATOMIC_ACQUIRE);
-    event.perf.writer_schedule_gap_max_us = __atomic_load_n(&q->writer_schedule_gap_max_us, __ATOMIC_ACQUIRE);
-    event.perf.sq_full_wait_count = __atomic_load_n(&q->cross_sq_full_wait_count, __ATOMIC_ACQUIRE);
-    event.perf.sq_full_wait_max_us = __atomic_load_n(&q->cross_sq_full_wait_max_us, __ATOMIC_ACQUIRE);
-    event.perf.cq_empty_wait_count = __atomic_load_n(&q->cross_cq_empty_wait_count, __ATOMIC_ACQUIRE);
-    event.perf.cq_empty_wait_max_us = __atomic_load_n(&q->cross_cq_empty_wait_max_us, __ATOMIC_ACQUIRE);
-    event.perf.submit_mmio_count = __atomic_load_n(&q->cross_submit_mmio_count, __ATOMIC_ACQUIRE);
-    event.perf.submit_mmio_max_us = __atomic_load_n(&q->cross_submit_mmio_max_us, __ATOMIC_ACQUIRE);
-    event.perf.completion_process_count = __atomic_load_n(&q->cross_completion_process_count, __ATOMIC_ACQUIRE);
-    event.perf.completion_process_max_us = __atomic_load_n(&q->cross_completion_process_max_us, __ATOMIC_ACQUIRE);
-    event.perf.queue_empty_wait_us = __atomic_load_n(&q->queue_empty_wait_us, __ATOMIC_ACQUIRE);
-    event.perf.writer_active_us = __atomic_load_n(&q->writer_active_us, __ATOMIC_ACQUIRE);
-    event.perf.no_progress_sleep_count = __atomic_load_n(&q->cross_no_progress_sleep_count, __ATOMIC_ACQUIRE);
-    event.perf.writer_no_progress_sleep_count =
+    event.payload.perf.window_start_us = start_us; event.payload.perf.window_end_us = end_us;
+    event.payload.perf.dma_bytes_delta = dma_delta; event.payload.perf.nvme_bytes_delta = nvme_delta;
+    event.payload.perf.dma_writable = bd->dma_writable;
+    event.payload.perf.completed_unharvested = bd->completed_unharvested;
+    event.payload.perf.ready_slots = bd->ready_slots;
+    event.payload.perf.nvme_busy_slots = bd->nvme_busy_slots;
+    event.payload.perf.requeue_pending = bd->requeue_pending;
+    event.payload.perf.free_slots = bd->free_slots;
+    event.payload.perf.active_qd = __atomic_load_n(&rt->nvme_active_qd_current, __ATOMIC_ACQUIRE);
+    event.payload.perf.active_qd_max = __atomic_load_n(&rt->nvme_active_qd_max, __ATOMIC_ACQUIRE);
+    event.payload.perf.submit_stall_count = __atomic_load_n(&rt->nvme_submit_stall_count, __ATOMIC_ACQUIRE);
+    event.payload.perf.submit_stall_max_us = __atomic_load_n(&rt->nvme_submit_stall_max_us, __ATOMIC_ACQUIRE);
+    event.payload.perf.writer_schedule_gap_count = __atomic_load_n(&q->writer_schedule_gap_count, __ATOMIC_ACQUIRE);
+    event.payload.perf.writer_schedule_gap_max_us = __atomic_load_n(&q->writer_schedule_gap_max_us, __ATOMIC_ACQUIRE);
+    event.payload.perf.sq_full_wait_count = __atomic_load_n(&q->cross_sq_full_wait_count, __ATOMIC_ACQUIRE);
+    event.payload.perf.sq_full_wait_max_us = __atomic_load_n(&q->cross_sq_full_wait_max_us, __ATOMIC_ACQUIRE);
+    event.payload.perf.cq_empty_wait_count = __atomic_load_n(&q->cross_cq_empty_wait_count, __ATOMIC_ACQUIRE);
+    event.payload.perf.cq_empty_wait_max_us = __atomic_load_n(&q->cross_cq_empty_wait_max_us, __ATOMIC_ACQUIRE);
+    event.payload.perf.submit_mmio_count = __atomic_load_n(&q->cross_submit_mmio_count, __ATOMIC_ACQUIRE);
+    event.payload.perf.submit_mmio_max_us = __atomic_load_n(&q->cross_submit_mmio_max_us, __ATOMIC_ACQUIRE);
+    event.payload.perf.completion_process_count = __atomic_load_n(&q->cross_completion_process_count, __ATOMIC_ACQUIRE);
+    event.payload.perf.completion_process_max_us = __atomic_load_n(&q->cross_completion_process_max_us, __ATOMIC_ACQUIRE);
+    event.payload.perf.queue_empty_wait_us = __atomic_load_n(&q->queue_empty_wait_us, __ATOMIC_ACQUIRE);
+    event.payload.perf.writer_active_us = __atomic_load_n(&q->writer_active_us, __ATOMIC_ACQUIRE);
+    event.payload.perf.no_progress_sleep_count = __atomic_load_n(&q->cross_no_progress_sleep_count, __ATOMIC_ACQUIRE);
+    event.payload.perf.writer_no_progress_sleep_count =
         __atomic_load_n(&q->writer_no_progress_sleep_count, __ATOMIC_ACQUIRE);
-    event.perf.dropped_perf_samples = atomic_load_explicit(&g_storage_dropped_perf_samples,
-                                                            memory_order_relaxed);
-    event.perf.dropped_diag_events = atomic_load_explicit(&g_storage_dropped_diag_events,
-                                                           memory_order_relaxed);
-    event.perf.receive_integrity_ok = stats->receive_integrity_ok ? 1u : 0u;
-    event.perf.storage_integrity_ok = (!q->error && !stats->integrity_risk_ring_full) ? 1u : 0u;
+    event.payload.perf.dropped_perf_samples = atomic_load_explicit(
+        &g_storage_dropped_perf_samples, memory_order_relaxed);
+    event.payload.perf.dropped_diag_events = atomic_load_explicit(
+        &g_storage_dropped_diag_events, memory_order_relaxed);
+    event.payload.perf.receive_integrity_ok = stats->receive_integrity_ok ? 1u : 0u;
+    event.payload.perf.storage_integrity_ok =
+        (!q->error && !stats->integrity_risk_ring_full) ? 1u : 0u;
     (void)storage_ipc_try_write_perf(fd, &event, &g_storage_dropped_perf_samples);
 }
 
@@ -498,7 +502,7 @@ static void storage_emit_diag_event(const ChannelRuntime *rt, const StorageEvent
     storage_ipc_make_event(&event, STORAGE_WORKER_DIAG_EVENT,
                            rt && rt->cfg ? (uint32_t)rt->cfg->id : record->channel,
                            STORAGE_ERR_NONE, 0u, "diag_event");
-    event.diag = *record;
+    event.payload.diag = *record;
     (void)storage_ipc_try_write_diag(fd, &event, &g_storage_dropped_diag_events);
 }
 

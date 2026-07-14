@@ -1850,11 +1850,13 @@ static void drain_storage_events(Task *task, bool report_eof)
             system_emit_line(STORAGE_LOG_SUMMARY,
                              "storage_worker_stop_phase task=%s channel=%u stop_epoch=%" PRIu64
                              " phase=%s bytes=%" PRIu64 " reason=%s",
-                             task->task_id, event.channel, event.stop_epoch,
+                             task->task_id, event.channel,
+                             event.payload.phase.stop_epoch,
                              storage_ipc_stop_phase_name(
-                                 (StorageWorkerStopPhase)event.stop_phase),
-                             event.received_bytes,
-                             event.reason[0] != '\0' ? event.reason : "none");
+                                 (StorageWorkerStopPhase)event.payload.phase.stop_phase),
+                             event.payload.phase.received_bytes,
+                             event.payload.phase.reason[0] != '\0'
+                                 ? event.payload.phase.reason : "none");
         }
         task->worker_event = event;
         task->worker_phase = event.type;
@@ -1868,12 +1870,14 @@ static void drain_storage_events(Task *task, bool report_eof)
                 continue;
             }
             task->final_result_seen = true;
-            task->final_result = event.result;
-            task->final_data_persisted = event.result.data_persisted;
-            task->final_integrity_ok = event.result.integrity_ok;
-            task->final_status_success = event.result.data_persisted && event.result.integrity_ok;
+            task->final_result = event.payload.final.result;
+            task->final_data_persisted = event.payload.final.result.data_persisted;
+            task->final_integrity_ok = event.payload.final.result.integrity_ok;
+            task->final_status_success = event.payload.final.result.data_persisted &&
+                                         event.payload.final.result.integrity_ok;
             task->final_receive_seen = true;
-            task->final_dma_received_bytes = event.result.dma_received_bytes;
+            task->final_dma_received_bytes =
+                event.payload.final.result.dma_received_bytes;
         } else if (event.type == STORAGE_WORKER_FATAL && !task->fatal_seen) {
             task->fatal_seen = true;
             task->first_fatal = event;
@@ -4610,7 +4614,7 @@ static int run_storage_worker_main(int argc, char **argv, bool supervised)
                                                       : STORAGE_ERR_INTERNAL),
                                        result.dma_received_bytes,
                                        rc == 0 ? "final" : "failed");
-                event.result = result;
+                event.payload.final.result = result;
                 final_sent = storage_ipc_write_event_deadline(
                     event_fd, &event,
                     storage_ipc_monotonic_us() + 1000000ull) == 0;

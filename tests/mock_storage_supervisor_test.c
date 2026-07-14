@@ -12,13 +12,15 @@ static StorageWorkerEvent event(uint32_t type, uint32_t channel)
                            type == STORAGE_WORKER_FATAL
                                ? STORAGE_ERR_INTERNAL : STORAGE_ERR_NONE,
                            0u, "worker_fatal");
-    value.result.data_persisted = true;
-    value.result.receive_integrity_ok = true;
-    value.result.storage_integrity_ok = true;
-    value.result.integrity_ok = true;
-    value.result.dma_received_bytes = 10u;
-    value.result.nvme_completed_bytes = 10u;
-    value.result.file_bytes = 10u;
+    if (type == STORAGE_WORKER_FINAL_RESULT) {
+        value.payload.final.result.data_persisted = true;
+        value.payload.final.result.receive_integrity_ok = true;
+        value.payload.final.result.storage_integrity_ok = true;
+        value.payload.final.result.integrity_ok = true;
+        value.payload.final.result.dma_received_bytes = 10u;
+        value.payload.final.result.nvme_completed_bytes = 10u;
+        value.payload.final.result.file_bytes = 10u;
+    }
     return value;
 }
 
@@ -120,7 +122,7 @@ static void test_stop_send_state(void)
 
     storage_supervisor_init(&s, 1u);
     value = event(STORAGE_WORKER_FATAL, 0u);
-    value.reason[0] = '\0';
+    value.payload.fatal.reason[0] = '\0';
     assert(storage_supervisor_handle_event(&s, &value) == 0);
     assert_reason(&s, "worker_fatal");
 }
@@ -139,10 +141,12 @@ static void test_invalid_sequences(void)
 
     storage_supervisor_init(&s, 1u);
     value = event(STORAGE_WORKER_FATAL, 0u);
-    snprintf(value.reason, sizeof(value.reason), "%s", "primary_reason");
+    snprintf(value.payload.fatal.reason, sizeof(value.payload.fatal.reason),
+             "%s", "primary_reason");
     assert(storage_supervisor_handle_event(&s, &value) == 0);
     value = event(STORAGE_WORKER_FATAL, 0u);
-    snprintf(value.reason, sizeof(value.reason), "%s", "secondary_reason");
+    snprintf(value.payload.fatal.reason, sizeof(value.payload.fatal.reason),
+             "%s", "secondary_reason");
     assert(storage_supervisor_handle_event(&s, &value) != 0);
     assert_reason(&s, "primary_reason");
     assert(strcmp(s.secondary_reason, "invalid_fatal_sequence") == 0);
@@ -241,7 +245,7 @@ static void test_result_failure_reasons(void)
     do {                                                                        \
         storage_supervisor_init(&s, 1u);                                        \
         value = event(STORAGE_WORKER_FINAL_RESULT, 0u);                         \
-        value.result.field = false;                                             \
+        value.payload.final.result.field = false;                               \
         assert(handle_final(&s, &value) == 0);                                  \
         assert(storage_supervisor_result_status(&s) == STORAGE_TASK_FAILED);    \
         assert_reason(&s, reason);                                              \
@@ -256,13 +260,13 @@ static void test_result_failure_reasons(void)
 
     storage_supervisor_init(&s, 1u);
     value = event(STORAGE_WORKER_FINAL_RESULT, 0u);
-    value.result.nvme_completed_bytes = 9u;
+    value.payload.final.result.nvme_completed_bytes = 9u;
     assert(handle_final(&s, &value) == 0);
     assert_reason(&s, "dma_nvme_byte_mismatch");
 
     storage_supervisor_init(&s, 1u);
     value = event(STORAGE_WORKER_FINAL_RESULT, 0u);
-    value.result.file_bytes = 9u;
+    value.payload.final.result.file_bytes = 9u;
     assert(handle_final(&s, &value) == 0);
     assert_reason(&s, "nvme_file_byte_mismatch");
 
@@ -270,9 +274,9 @@ static void test_result_failure_reasons(void)
     value = event(STORAGE_WORKER_FINAL_RESULT, 0u);
     assert(handle_final(&s, &value) == 0);
     value = event(STORAGE_WORKER_FINAL_RESULT, 1u);
-    value.result.dma_received_bytes = 11u;
-    value.result.nvme_completed_bytes = 11u;
-    value.result.file_bytes = 11u;
+    value.payload.final.result.dma_received_bytes = 11u;
+    value.payload.final.result.nvme_completed_bytes = 11u;
+    value.payload.final.result.file_bytes = 11u;
     assert(handle_final(&s, &value) == 0);
     assert_reason(&s, "split_channel_byte_mismatch");
 }
@@ -287,7 +291,7 @@ static void test_one_channel_failure_rejects_aggregate(void)
     assert(handle_final(&s, &value) == 0);
     assert(storage_supervisor_result_status(&s) == STORAGE_TASK_ACTIVE);
     value = event(STORAGE_WORKER_FINAL_RESULT, 1u);
-    value.result.storage_integrity_ok = false;
+    value.payload.final.result.storage_integrity_ok = false;
     assert(handle_final(&s, &value) == 0);
     assert(s.aggregate_ready);
     assert(storage_supervisor_result_status(&s) == STORAGE_TASK_FAILED);
@@ -302,11 +306,11 @@ static void test_payload_media_accounting(void)
 
     storage_supervisor_init(&s, 1u);
     value = event(STORAGE_WORKER_FINAL_RESULT, 0u);
-    value.result.dma_received_bytes = 419692512u;
-    value.result.nvme_completed_bytes = 419692512u;
-    value.result.nvme_media_bytes = 419692544u;
-    value.result.nvme_padding_bytes = 32u;
-    value.result.file_bytes = 419692512u;
+    value.payload.final.result.dma_received_bytes = 419692512u;
+    value.payload.final.result.nvme_completed_bytes = 419692512u;
+    value.payload.final.result.nvme_media_bytes = 419692544u;
+    value.payload.final.result.nvme_padding_bytes = 32u;
+    value.payload.final.result.file_bytes = 419692512u;
     assert(handle_final(&s, &value) == 0);
     assert(storage_supervisor_result_status(&s) == STORAGE_TASK_SUCCESS);
 }
@@ -317,9 +321,10 @@ static StorageWorkerEvent stop_phase(uint32_t channel, uint64_t epoch,
 {
     StorageWorkerEvent value = event(STORAGE_WORKER_STOP_PHASE, channel);
 
-    value.stop_epoch = epoch;
-    value.stop_phase = (uint32_t)phase;
-    snprintf(value.reason, sizeof(value.reason), "%s", reason ? reason : "phase");
+    value.payload.phase.stop_epoch = epoch;
+    value.payload.phase.stop_phase = (uint32_t)phase;
+    snprintf(value.payload.phase.reason, sizeof(value.payload.phase.reason),
+             "%s", reason ? reason : "phase");
     return value;
 }
 
@@ -351,7 +356,7 @@ static void test_multichannel_stop_epoch_and_deferred_isolation(void)
     assert(storage_supervisor_handle_event(&s, &value) == 0);
     value = stop_phase(0u, 88u, STORAGE_WORKER_DMA_QUIESCED,
                        "boundary_timeout_quiesced");
-    value.error_code = STORAGE_ERR_STOP_BOUNDARY_TIMEOUT;
+    value.payload.phase.error_code = STORAGE_ERR_STOP_BOUNDARY_TIMEOUT;
     assert(storage_supervisor_handle_event(&s, &value) == 0);
     assert(!s.first_fatal && s.stop_requested_mask == 0u);
     value = stop_phase(1u, 89u, STORAGE_WORKER_STOP_REQUESTED, "stop_requested");
