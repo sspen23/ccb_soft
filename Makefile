@@ -30,6 +30,7 @@ SRCS := \
 	src/ccb_storage_task.c \
 	src/ccb_storage_perf.c \
 	src/ccb_storage_commit.c \
+	src/ccb_storage_sync_outbox.c \
 	src/ccb_commands.c \
 	src/ccb_tcp_transfer.c
 
@@ -73,6 +74,9 @@ storage-host-tests:
 	$(CC) $(CFLAGS) -Wformat=2 -Iinclude tests/mock_storage_log_test.c \
 		-o /tmp/mock_storage_log_test
 	/tmp/mock_storage_log_test
+	$(CC) $(CFLAGS) -Wformat=2 -Iinclude tests/mock_storage_sync_outbox_test.c \
+		src/ccb_storage_sync_outbox.c -o /tmp/mock_storage_sync_outbox_test
+	/tmp/mock_storage_sync_outbox_test
 	$(CC) $(CFLAGS) -Wformat=2 -Wno-unused-function -Wno-stringop-truncation -ffunction-sections -fdata-sections -Iinclude \
 		tests/mock_storage_config_test.c src/ccb_commands.c -Wl,--gc-sections -o /tmp/mock_storage_config_test
 	/tmp/mock_storage_config_test

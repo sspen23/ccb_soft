@@ -12,6 +12,7 @@ typedef struct {
     int pending_calls, complete_calls;
     int fail_metadata_call, fail_insert_call;
     int fail_commit, fail_flash, fail_metadata_rollback, duplicate, fail_completed_status;
+    int fail_pending;
     int inserted, base_count;
     TaskStatus last_status;
 } Mock;
@@ -34,7 +35,8 @@ static int status(void *p, const char *task, TaskStatus value)
 static int commit(void *p) { Mock *m = p; m->commit_calls++; return m->fail_commit ? -1 : 0; }
 static int rollback(void *p) { Mock *m = p; m->rollback_calls++; m->inserted = 0; return 0; }
 static int flash(void *p) { Mock *m = p; m->flash_calls++; return m->fail_flash ? -1 : 0; }
-static int mark_pending(void *p, const char *task) { Mock *m = p; (void)task; m->pending_calls++; return 0; }
+static int mark_pending(void *p, const char *task)
+{ Mock *m = p; (void)task; m->pending_calls++; return m->fail_pending ? -1 : 0; }
 static int mark_complete(void *p, const char *task) { Mock *m = p; (void)task; m->complete_calls++; return 0; }
 
 static StorageCommitOps ops(Mock *m)
@@ -114,6 +116,11 @@ static void test_failures(void)
     assert(run(&m, &state, items) == 0); assert(strcmp(state.reason, "sync_pending") == 0);
     assert(m.commit_calls == 1 && m.rollback_calls == 0 && m.metadata_rollback_calls == 0);
     assert(m.last_status == TASK_COMPLETED && state.success && state.sync_pending);
+
+    memset(&m, 0, sizeof(m)); m.fail_flash = 1; m.fail_pending = 1;
+    assert(run(&m, &state, items) != 0);
+    assert(strcmp(state.reason, "sync_outbox_persist_failed") == 0);
+    assert(!state.success && !state.sync_pending && m.last_status == TASK_COMPLETED);
 }
 
 static void test_modes(void)

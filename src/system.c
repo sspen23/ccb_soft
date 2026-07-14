@@ -39,6 +39,7 @@
 #include "ccb_storage_perf.h"
 #include "ccb_storage_commit.h"
 #include "ccb_storage_log.h"
+#include "ccb_storage_sync_outbox.h"
 #include "ccb_tcp_transfer.h"
 #include "debug_uart.h"
 
@@ -486,54 +487,6 @@ static const char *storage_sync_outbox_dir(void)
     return value && value[0] != '\0' ? value : STORAGE_SYNC_OUTBOX_DIR_DEFAULT;
 }
 
-static int storage_sync_outbox_path(const char *task_id, char *path, size_t size)
-{
-    size_t i;
-    if (!task_id || task_id[0] == '\0' || !path) return -1;
-    for (i = 0u; task_id[i] != '\0'; ++i) {
-        if (!((task_id[i] >= 'A' && task_id[i] <= 'Z') ||
-              (task_id[i] >= 'a' && task_id[i] <= 'z') ||
-              (task_id[i] >= '0' && task_id[i] <= '9') ||
-              task_id[i] == '_' || task_id[i] == '-')) return -1;
-    }
-    return snprintf(path, size, "%s/%s.pending", storage_sync_outbox_dir(), task_id) <
-           (int)size ? 0 : -1;
-}
-
-static int storage_sync_outbox_mark_pending(const char *task_id)
-{
-    char path[PATH_MAX];
-    int fd;
-    size_t length;
-    size_t used = 0u;
-    if (mkdir(storage_sync_outbox_dir(), 0755) != 0 && errno != EEXIST) return -1;
-    if (storage_sync_outbox_path(task_id, path, sizeof(path)) != 0) return -1;
-    fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd < 0) return -1;
-    length = strlen(task_id);
-    while (used < length) {
-        ssize_t n = write(fd, task_id + used, length - used);
-        if (n > 0) { used += (size_t)n; continue; }
-        if (n < 0 && errno == EINTR) continue;
-        break;
-    }
-    if (used != length || write(fd, "\n", 1u) != 1 || fsync(fd) != 0) {
-        int saved_errno = errno;
-        (void)close(fd);
-        errno = saved_errno;
-        return -1;
-    }
-    if (close(fd) != 0) return -1;
-    return 0;
-}
-
-static int storage_sync_outbox_mark_complete(const char *task_id)
-{
-    char path[PATH_MAX];
-    if (storage_sync_outbox_path(task_id, path, sizeof(path)) != 0) return -1;
-    return unlink(path) == 0 || errno == ENOENT ? 0 : -1;
-}
-
 static void storage_sync_outbox_retry(void)
 {
     DIR *dir = opendir(storage_sync_outbox_dir());
@@ -557,9 +510,16 @@ static void storage_sync_outbox_retry(void)
         size_t n = strlen(entry->d_name);
         if (n > strlen(".pending") &&
             strcmp(entry->d_name + n - strlen(".pending"), ".pending") == 0) {
-            char path[PATH_MAX];
-            if (snprintf(path, sizeof(path), "%s/%s", storage_sync_outbox_dir(),
-                         entry->d_name) < (int)sizeof(path)) (void)unlink(path);
+            char task_id[64];
+            size_t task_length = n - strlen(".pending");
+
+            if (task_length >= sizeof(task_id)) continue;
+            memcpy(task_id, entry->d_name, task_length);
+            task_id[task_length] = '\0';
+            if (storage_sync_outbox_mark_complete(storage_sync_outbox_dir(), task_id) != 0) {
+                LOG_ERROR("STORAGE", "sync outbox marker removal failed task=%s errno=%d",
+                          task_id, errno);
+            }
         }
     }
     (void)closedir(dir);
@@ -1552,13 +1512,13 @@ static int storage_commit_flash_sync(void *ctx)
 static int storage_commit_sync_mark_pending(void *ctx, const char *task_id)
 {
     (void)ctx;
-    return storage_sync_outbox_mark_pending(task_id);
+    return storage_sync_outbox_mark_pending(storage_sync_outbox_dir(), task_id);
 }
 
 static int storage_commit_sync_mark_complete(void *ctx, const char *task_id)
 {
     (void)ctx;
-    return storage_sync_outbox_mark_complete(task_id);
+    return storage_sync_outbox_mark_complete(storage_sync_outbox_dir(), task_id);
 }
 
 static int storage_commit_supervised_results(const char *task_id)
