@@ -10,6 +10,7 @@
 #include "ccb_storage_log.h"
 #include "debug_uart.h"
 #include "storage_config.h"
+#include "storage_worker.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -157,12 +158,10 @@ typedef struct {
     uint32_t cross_slot_batch;
     NvmeCrossSlotConfig cross_slot_config;
     uint64_t nvme_abort_timeout_us;
-    StorageRunState run_state;
-    bool producer_done;
-    bool stop_latched;
+    StorageWorkerState worker_state;
+    bool writer_ready;
+    bool producer_ready;
     bool requeue_enabled;
-    bool writer_abort_requested;
-    bool run_enabled;
     bool error;
     char error_reason[64];
     StorageErrorCode deferred_stop_error;
@@ -192,6 +191,29 @@ static bool storage_queue_slot_counts_valid_locked(const StorageWriteQueue *q)
            c->ready <= c->total && c->nvme_busy <= c->total &&
            c->requeue_pending <= c->total && c->free_count <= c->total &&
            sum == (uint64_t)c->total;
+}
+
+static int storage_queue_transition_locked(StorageWriteQueue *q,
+                                           StorageWorkerState expected,
+                                           StorageWorkerState next)
+{
+    if (!q || storage_worker_transition(&q->worker_state, expected, next) != 0) {
+        if (q) q->error = true;
+        return -1;
+    }
+    return 0;
+}
+
+static void storage_queue_fail_locked(StorageWriteQueue *q)
+{
+    StorageWorkerState current;
+
+    if (!q) return;
+    current = q->worker_state;
+    if (current != WORKER_DONE && current != WORKER_FAILED)
+        (void)storage_worker_transition(&q->worker_state, current,
+                                        WORKER_FAILED);
+    q->error = true;
 }
 
 typedef struct {
@@ -1683,8 +1705,7 @@ static int storage_queue_init(StorageWriteQueue *q,
     q->cross_slot_batch = cross_slot_batch;
     q->nvme_engine_quiesced = true;
     q->requeue_enabled = true;
-    q->stop_latched = false;
-    storage_run_state_init(&q->run_state);
+    q->worker_state = WORKER_INIT;
     q->backlog_mode = storage_env_flag_enabled("SRC_REAL_WRITER_BACKLOG_MODE") != 0;
     if (pthread_mutex_init(&q->lock, NULL) != 0 ||
         pthread_cond_init(&q->not_empty, NULL) != 0 ||
@@ -1807,36 +1828,110 @@ bad:
 }
 
 static void storage_queue_finish(StorageWriteQueue *q) {
+    int rc = 0;
+
     if (!q) {
         return;
     }
     pthread_mutex_lock(&q->lock);
-    q->producer_done = true;
+    if (q->worker_state == WORKER_RUNNING) {
+        rc = storage_queue_transition_locked(q, WORKER_RUNNING,
+                                             WORKER_DRAINING);
+    } else if (q->worker_state == WORKER_HARVESTING) {
+        rc = storage_queue_transition_locked(q, WORKER_HARVESTING,
+                                             WORKER_DRAINING);
+    } else if (q->worker_state != WORKER_DRAINING &&
+               q->worker_state != WORKER_FINALIZING &&
+               q->worker_state != WORKER_DONE &&
+               q->worker_state != WORKER_FAILED) {
+        storage_queue_fail_locked(q);
+        rc = -1;
+    }
     pthread_cond_broadcast(&q->not_empty);
     pthread_mutex_unlock(&q->lock);
+    if (rc != 0) storage_write_request_stop();
 }
 
-/* Stop latching is deliberately separate from producer_done.  A final
- * completion may still need to drain into the writer after input has been
- * quiesced, but it must never re-arm an AXI DMA descriptor. */
+/* STOP first moves RUNNING to WAIT_BOUNDARY.  A final completion may still
+ * drain, but storage_worker_can_requeue() becomes false at this point. */
+static int storage_queue_request_stop_state(StorageWriteQueue *q)
+{
+    int rc = 0;
+
+    if (!q) return -1;
+    pthread_mutex_lock(&q->lock);
+    if (q->worker_state == WORKER_RUNNING) {
+        rc = storage_queue_transition_locked(q, WORKER_RUNNING,
+                                             WORKER_WAIT_BOUNDARY);
+    } else if (!storage_worker_stop_latched(q->worker_state)) {
+        storage_queue_fail_locked(q);
+        rc = -1;
+    }
+    pthread_cond_broadcast(&q->not_empty);
+    pthread_mutex_unlock(&q->lock);
+    return rc;
+}
+
 static bool storage_queue_latch_stop(StorageWriteQueue *q)
 {
     bool first = false;
     if (!q) return false;
     pthread_mutex_lock(&q->lock);
-    if (!q->stop_latched) {
-        q->stop_latched = true;
-        q->requeue_enabled = false;
-        first = true;
-        /* Serialize the software latch with a completion's requeue.  The
-         * DMA-side latch is lock-free, so it is safe to publish it while the
-         * queue lock is held and gives stop a single linearization point. */
-        if (q->rt) dma_latch_stop(q->rt);
+    if (q->worker_state == WORKER_RUNNING)
+        (void)storage_queue_transition_locked(q, WORKER_RUNNING,
+                                              WORKER_WAIT_BOUNDARY);
+    if (q->worker_state == WORKER_WAIT_BOUNDARY) {
+        if (storage_queue_transition_locked(q, WORKER_WAIT_BOUNDARY,
+                                            WORKER_DMA_QUIESCING) == 0)
+            first = true;
     }
+    q->requeue_enabled = false;
+    /* Serialize the software latch with a completion's requeue.  The
+     * DMA-side latch is lock-free, so it is safe to publish it while the
+     * queue lock is held and gives stop a single linearization point. */
+    if (q->rt) dma_latch_stop(q->rt);
     pthread_cond_broadcast(&q->not_empty);
     pthread_cond_broadcast(&q->not_full);
     pthread_mutex_unlock(&q->lock);
     return first;
+}
+
+static int storage_queue_mark_harvesting(StorageWriteQueue *q)
+{
+    int rc;
+
+    if (!q) return -1;
+    pthread_mutex_lock(&q->lock);
+    rc = q->worker_state == WORKER_FAILED
+             ? 0
+             : storage_queue_transition_locked(q, WORKER_DMA_QUIESCING,
+                                                WORKER_HARVESTING);
+    pthread_cond_broadcast(&q->not_empty);
+    pthread_mutex_unlock(&q->lock);
+    return rc;
+}
+
+static int storage_queue_mark_finalizing(StorageWriteQueue *q)
+{
+    int rc;
+
+    if (!q) return -1;
+    pthread_mutex_lock(&q->lock);
+    rc = storage_queue_transition_locked(q, WORKER_DRAINING,
+                                         WORKER_FINALIZING);
+    pthread_mutex_unlock(&q->lock);
+    return rc;
+}
+
+static int storage_queue_mark_done(StorageWriteQueue *q)
+{
+    int rc;
+
+    if (!q) return -1;
+    pthread_mutex_lock(&q->lock);
+    rc = storage_queue_transition_locked(q, WORKER_FINALIZING, WORKER_DONE);
+    pthread_mutex_unlock(&q->lock);
+    return rc;
 }
 
 static void storage_queue_set_engine(StorageWriteQueue *q,
@@ -1847,7 +1942,7 @@ static void storage_queue_set_engine(StorageWriteQueue *q,
     if (!q) return;
     pthread_mutex_lock(&q->lock);
     q->nvme_engine = engine;
-    abort_requested = q->writer_abort_requested;
+    abort_requested = q->worker_state == WORKER_FAILED;
     pthread_mutex_unlock(&q->lock);
     if (engine && abort_requested) {
         nvme_cross_slot_engine_request_abort(engine, "writer_abort_requested");
@@ -1877,9 +1972,7 @@ static void storage_queue_request_abort(StorageWriteQueue *q)
     NvmeCrossSlotEngine *engine;
     if (!q) return;
     pthread_mutex_lock(&q->lock);
-    q->writer_abort_requested = true;
-    q->error = true;
-    q->producer_done = true;
+    storage_queue_fail_locked(q);
     engine = q->nvme_engine;
     /* Keep the engine published while the abort state is latched.  The
      * writer cannot clear/destroy it until this lock is released, avoiding a
@@ -1896,7 +1989,7 @@ static bool storage_queue_abort_requested(StorageWriteQueue *q)
     bool value = false;
     if (!q) return true;
     pthread_mutex_lock(&q->lock);
-    value = q->writer_abort_requested;
+    value = q->worker_state == WORKER_FAILED;
     pthread_mutex_unlock(&q->lock);
     return value;
 }
@@ -2520,7 +2613,8 @@ static int storage_complete_slot(StorageWriteQueue *q, const PendingDdrSlot *ite
     } else {
         q->buffered_bytes = 0u;
     }
-    should_requeue = q->requeue_enabled && !q->stop_latched && !q->producer_done;
+    should_requeue = q->requeue_enabled &&
+                     storage_worker_can_requeue(q->worker_state);
     if (storage_local_slot_transition_locked(q, item->slot, STORAGE_SLOT_NVME_BUSY,
                                              should_requeue ? STORAGE_SLOT_REQUEUE_PENDING : STORAGE_SLOT_FREE) != 0) {
         pthread_mutex_unlock(&q->lock); return -1;
@@ -2535,8 +2629,7 @@ static int storage_complete_slot(StorageWriteQueue *q, const PendingDdrSlot *ite
          * takes the same lock, so a stop either linearizes before this call or
          * after it; it can never observe a post-latch requeue race. */
         if (dma_requeue_one(q->rt, item->slot) != 0) {
-            q->error = true;
-            q->producer_done = true;
+            storage_queue_fail_locked(q);
             if (q->error_reason[0] == '\0')
                 (void)snprintf(q->error_reason, sizeof(q->error_reason),
                                "%s", "dma_requeue_failed");
@@ -2594,8 +2687,7 @@ static void storage_fail_fatal(StorageWriteQueue *q) {
          * unconfirmed Host Core command may still hold its PRP. */
         q->nvme_engine_quiesced = false;
     }
-    q->error = true;
-    q->producer_done = true;
+    storage_queue_fail_locked(q);
     pthread_cond_broadcast(&q->not_full);
     pthread_cond_broadcast(&q->not_empty);
     pthread_mutex_unlock(&q->lock);
@@ -2635,10 +2727,12 @@ static StorageQueuePopResult storage_queue_pop(StorageWriteQueue *q, PendingDdrS
         return STORAGE_QUEUE_POP_ERROR;
     }
     pthread_mutex_lock(&q->lock);
-    if (wait_for_item && q->count == 0u && !q->producer_done && !q->error) {
+    if (wait_for_item && q->count == 0u &&
+        !storage_worker_producer_done(q->worker_state) && !q->error) {
         empty_wait_start_us = storage_wall_time_us();
     }
-    while (wait_for_item && !q->producer_done && !q->error && q->count == 0u) {
+    while (wait_for_item && !storage_worker_producer_done(q->worker_state) &&
+           !q->error && q->count == 0u) {
         pthread_cond_wait(&q->not_empty, &q->lock);
     }
     if (empty_wait_start_us != 0u) {
@@ -2651,7 +2745,7 @@ static StorageQueuePopResult storage_queue_pop(StorageWriteQueue *q, PendingDdrS
         return STORAGE_QUEUE_POP_ERROR;
     }
     if (q->count == 0u) {
-        StorageQueuePopResult result = q->producer_done
+        StorageQueuePopResult result = storage_worker_producer_done(q->worker_state)
                                            ? STORAGE_QUEUE_POP_PRODUCER_DRAINED
                                            : STORAGE_QUEUE_POP_TEMP_EMPTY;
         pthread_mutex_unlock(&q->lock);
@@ -2678,7 +2772,7 @@ static StorageCrossSlotWriterDecision storage_cross_slot_writer_decision_locked(
     if (!q || !engine) return STORAGE_CROSS_SLOT_WRITER_QUEUE_ERROR;
     pthread_mutex_lock(&q->lock);
     decision = storage_cross_slot_writer_decide(
-        q->producer_done, q->count, q->error,
+        storage_worker_producer_done(q->worker_state), q->count, q->error,
         nvme_cross_slot_engine_active(engine), nvme_cross_slot_engine_inflight(engine));
     pthread_mutex_unlock(&q->lock);
     return decision;
@@ -2689,10 +2783,23 @@ static int storage_queue_wait_run(StorageWriteQueue *q)
     int rc = 0;
     if (!q) return -1;
     pthread_mutex_lock(&q->lock);
-    while (!q->run_enabled && !q->error && !q->producer_done) {
+    while (q->worker_state == WORKER_INIT ||
+           q->worker_state == WORKER_READY) {
         pthread_cond_wait(&q->not_empty, &q->lock);
     }
-    if (q->error) rc = -1;
+    if (q->error || q->worker_state != WORKER_ARMED) rc = -1;
+    pthread_mutex_unlock(&q->lock);
+    return rc;
+}
+
+static int storage_queue_mark_ready(StorageWriteQueue *q)
+{
+    int rc;
+
+    if (!q) return -1;
+    pthread_mutex_lock(&q->lock);
+    rc = storage_queue_transition_locked(q, WORKER_INIT, WORKER_READY);
+    pthread_cond_broadcast(&q->not_empty);
     pthread_mutex_unlock(&q->lock);
     return rc;
 }
@@ -2703,8 +2810,7 @@ static int storage_queue_enable_run(StorageWriteQueue *q)
 
     if (!q) return -1;
     pthread_mutex_lock(&q->lock);
-    rc = storage_run_state_enable_writer(&q->run_state);
-    if (rc == 0) q->run_enabled = true;
+    rc = storage_queue_transition_locked(q, WORKER_READY, WORKER_ARMED);
     pthread_cond_broadcast(&q->not_empty);
     pthread_mutex_unlock(&q->lock);
     return rc;
@@ -2714,11 +2820,12 @@ static void storage_queue_set_writer_ready(StorageWriteQueue *q, bool success)
 {
     if (!q) return;
     pthread_mutex_lock(&q->lock);
-    (void)storage_run_state_set_writer_ready(&q->run_state, success);
-    if (!success) {
-        q->error = true;
-        q->producer_done = true;
-    }
+    if (success && q->worker_state == WORKER_ARMED && !q->writer_ready)
+        q->writer_ready = true;
+    else if (!success)
+        storage_queue_fail_locked(q);
+    else
+        storage_queue_fail_locked(q);
     pthread_cond_broadcast(&q->not_empty);
     pthread_mutex_unlock(&q->lock);
 }
@@ -2733,8 +2840,8 @@ static int storage_queue_wait_writer_ready(StorageWriteQueue *q, uint64_t deadli
         bool failed;
 
         pthread_mutex_lock(&q->lock);
-        ready = q->run_state.writer_run_ready;
-        failed = q->run_state.writer_schedule_failed || q->error;
+        ready = q->writer_ready;
+        failed = q->worker_state == WORKER_FAILED || q->error;
         pthread_mutex_unlock(&q->lock);
         if (ready) return 0;
         if (failed) return -1;
@@ -2752,7 +2859,15 @@ static int storage_queue_set_producer_ready(StorageWriteQueue *q, bool success)
 
     if (!q) return -1;
     pthread_mutex_lock(&q->lock);
-    rc = storage_run_state_set_producer_ready(&q->run_state, success);
+    if (success && q->worker_state == WORKER_ARMED && q->writer_ready &&
+        !q->producer_ready) {
+        q->producer_ready = true;
+        rc = 0;
+    } else {
+        storage_queue_fail_locked(q);
+        rc = -1;
+    }
+    pthread_cond_broadcast(&q->not_empty);
     pthread_mutex_unlock(&q->lock);
     return rc;
 }
@@ -2763,7 +2878,13 @@ static int storage_queue_mark_running(StorageWriteQueue *q)
 
     if (!q) return -1;
     pthread_mutex_lock(&q->lock);
-    rc = storage_run_state_mark_running(&q->run_state);
+    if (!q->writer_ready || !q->producer_ready) {
+        storage_queue_fail_locked(q);
+        rc = -1;
+    } else {
+        rc = storage_queue_transition_locked(q, WORKER_ARMED,
+                                             WORKER_RUNNING);
+    }
     pthread_mutex_unlock(&q->lock);
     return rc;
 }
@@ -3944,6 +4065,11 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
         goto out;
     }
     writer_started = true;
+    if (storage_queue_mark_ready(&write_queue) != 0) {
+        storage_record_error(&producer_stats, STORAGE_ERR_QUEUE,
+                             "worker_ready_transition_failed");
+        goto out;
+    }
     producer_stats.interval_ms = storage_pipeline_stats_ms();
     storage_emit_line(STORAGE_LOG_DEBUG, "storage_ready channel=%d task=%s file_index=%u start_gate_mode=%s",
                       cfg->id, args->task_no, (unsigned)effective_file_index,
@@ -4091,6 +4217,11 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                 stop_request_us = storage_wall_time_us();
                 (void)storage_stop_state_advance(&stop_state,
                                                  STORAGE_STOP_WAIT_BOUNDARY);
+                if (storage_queue_request_stop_state(&write_queue) != 0) {
+                    storage_record_error(&producer_stats, STORAGE_ERR_QUEUE,
+                                         "worker_stop_transition_failed");
+                    goto out;
+                }
                 if (storage_emit_stop_phase(&rt, STORAGE_WORKER_STOP_REQUESTED,
                                             STORAGE_ERR_NONE,
                                             dma_received_bytes,
@@ -4153,6 +4284,11 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                     }
                     dma_quiesced = true;
                     dma_quiesced_us = storage_wall_time_us();
+                    if (storage_queue_mark_harvesting(&write_queue) != 0) {
+                        storage_record_error(&producer_stats, STORAGE_ERR_QUEUE,
+                                             "worker_harvest_transition_failed");
+                        goto out;
+                    }
                     if (storage_emit_stop_phase(
                             &rt, STORAGE_WORKER_DMA_QUIESCED,
                             boundary_timed_out
@@ -4197,6 +4333,11 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                     dma_stop_result = quiesce_result;
                 }
                 dma_quiesced = true;
+                if (storage_queue_mark_harvesting(&write_queue) != 0) {
+                    storage_record_error(&producer_stats, STORAGE_ERR_QUEUE,
+                                         "worker_harvest_transition_failed");
+                    goto out;
+                }
                 stop_state.deadline_us = storage_wall_time_us() + stop_timeouts.stop_harvest_us;
                 (void)storage_stop_state_advance(
                     &stop_state, STORAGE_STOP_HARVESTING);
@@ -4719,6 +4860,11 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
     if (stop_state.state == STORAGE_STOP_WRITER_DRAINING) {
         (void)storage_stop_state_advance(&stop_state, STORAGE_STOP_FINALIZING);
     }
+    if (storage_queue_mark_finalizing(&write_queue) != 0) {
+        storage_record_error(&producer_stats, STORAGE_ERR_QUEUE,
+                             "worker_finalize_transition_failed");
+        goto out;
+    }
     if (write_queue.error) {
         dbg_printf("[DBG][WRITE] writer thread failed ch=%d captured=%" PRIu64 "\n",
                    cfg->id, bytes_captured);
@@ -4743,6 +4889,11 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
     nvme_write_us = write_queue.nvme_write_us;
     (void)storage_queue_busy_count(&write_queue, &max_busy_slots);
     (void)storage_queue_buffered_bytes(&write_queue, &max_buffered_bytes);
+    if (storage_queue_mark_done(&write_queue) != 0) {
+        storage_record_error(&producer_stats, STORAGE_ERR_QUEUE,
+                             "worker_done_transition_failed");
+        goto out;
+    }
     storage_queue_destroy(&write_queue);
     write_queue_ready = false;
     final_us = storage_wall_time_us();
@@ -5234,6 +5385,7 @@ out:
             (void)storage_stop_state_latch(
                 &stop_state, storage_wall_time_us() + stop_timeouts.stop_harvest_us);
             (void)storage_stop_state_advance(&stop_state, STORAGE_STOP_WAIT_BOUNDARY);
+            (void)storage_queue_request_stop_state(&write_queue);
             (void)storage_queue_latch_stop(&write_queue);
             (void)storage_stop_state_advance(&stop_state,
                                              STORAGE_STOP_DMA_QUIESCING);
@@ -5241,11 +5393,13 @@ out:
                                      stop_timeouts.dma_quiesce_us;
         } else if (stop_state.state == STORAGE_STOP_REQUESTED) {
             (void)storage_stop_state_advance(&stop_state, STORAGE_STOP_WAIT_BOUNDARY);
+            (void)storage_queue_request_stop_state(&write_queue);
             (void)storage_queue_latch_stop(&write_queue);
             (void)storage_stop_state_advance(&stop_state, STORAGE_STOP_DMA_QUIESCING);
             stop_state.deadline_us = storage_wall_time_us() +
                                      stop_timeouts.dma_quiesce_us;
         } else if (stop_state.state == STORAGE_STOP_WAIT_BOUNDARY) {
+            (void)storage_queue_request_stop_state(&write_queue);
             (void)storage_queue_latch_stop(&write_queue);
             (void)storage_stop_state_advance(&stop_state, STORAGE_STOP_DMA_QUIESCING);
             stop_state.deadline_us = storage_wall_time_us() +
@@ -5257,6 +5411,7 @@ out:
             if (quiesce_result != DMA_STOP_FAILED) {
                 dma_quiesced = true;
                 dma_stop_result = quiesce_result;
+                (void)storage_queue_mark_harvesting(&write_queue);
             } else {
                 dma_stop_failed = true;
                 storage_record_failure(&producer_stats,

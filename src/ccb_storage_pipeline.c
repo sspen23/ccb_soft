@@ -146,50 +146,6 @@ bool storage_ring_pressure_should_stop(uint32_t pressure_level,
            now_us - critical_since_us >= critical_duration_us;
 }
 
-void storage_run_state_init(StorageRunState *state)
-{
-    if (state) memset(state, 0, sizeof(*state));
-}
-
-int storage_run_state_enable_writer(StorageRunState *state)
-{
-    if (!state || state->writer_enabled || state->running_sent) return -1;
-    state->writer_enabled = true;
-    return 0;
-}
-
-int storage_run_state_set_writer_ready(StorageRunState *state, bool success)
-{
-    if (!state || !state->writer_enabled || state->writer_run_ready ||
-        state->writer_schedule_failed || state->running_sent) return -1;
-    state->writer_run_ready = success;
-    state->writer_schedule_failed = !success;
-    return success ? 0 : -1;
-}
-
-int storage_run_state_set_producer_ready(StorageRunState *state, bool success)
-{
-    if (!state || !state->writer_run_ready || state->producer_run_ready ||
-        state->producer_schedule_failed || state->running_sent) return -1;
-    state->producer_run_ready = success;
-    state->producer_schedule_failed = !success;
-    return success ? 0 : -1;
-}
-
-bool storage_run_state_can_emit_running(const StorageRunState *state)
-{
-    return state && state->writer_enabled && state->writer_run_ready &&
-           state->producer_run_ready && !state->writer_schedule_failed &&
-           !state->producer_schedule_failed && !state->running_sent;
-}
-
-int storage_run_state_mark_running(StorageRunState *state)
-{
-    if (!storage_run_state_can_emit_running(state)) return -1;
-    state->running_sent = true;
-    return 0;
-}
-
 StorageFirstDmaDeadlineOutcome storage_first_dma_deadline_outcome(
     bool deadline_due, bool saw_dma_data, bool stop_requested,
     int harvest_rc, uint32_t harvest_count)

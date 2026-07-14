@@ -14,6 +14,7 @@ endif
 TARGET := src_real_app
 STORAGE_CONFIG_SRC := src/storage_config.c
 STORAGE_ERROR_SRC := src/storage_error.c
+STORAGE_WORKER_SRC := src/storage_worker.c
 
 SRCS := \
 	src/system.c \
@@ -35,6 +36,7 @@ SRCS := \
 	src/ccb_storage_sync_outbox.c \
 	src/storage_config.c \
 	src/storage_error.c \
+	src/storage_worker.c \
 	src/ccb_commands.c \
 	src/ccb_tcp_transfer.c
 
@@ -54,6 +56,9 @@ mock-bd-test:
 	/tmp/mock_bd_ring_test
 
 storage-host-tests:
+	$(CC) $(CFLAGS) -Wformat=2 -Iinclude tests/mock_storage_worker_state_test.c \
+		$(STORAGE_WORKER_SRC) -o /tmp/mock_storage_worker_state_test
+	/tmp/mock_storage_worker_state_test
 	$(CC) $(CFLAGS) -Wformat=2 -Iinclude tests/mock_storage_error_test.c \
 		$(STORAGE_ERROR_SRC) -o /tmp/mock_storage_error_test
 	/tmp/mock_storage_error_test
@@ -94,14 +99,14 @@ storage-host-tests:
 		src/ccb_storage_sync_outbox.c -o /tmp/mock_storage_sync_outbox_test
 	/tmp/mock_storage_sync_outbox_test
 	$(CC) $(CFLAGS) -Wformat=2 -Wno-unused-function -Wno-stringop-truncation -ffunction-sections -fdata-sections -Iinclude \
-		tests/mock_storage_config_test.c src/ccb_commands.c $(STORAGE_CONFIG_SRC) $(STORAGE_ERROR_SRC) -Wl,--gc-sections -o /tmp/mock_storage_config_test
+		tests/mock_storage_config_test.c src/ccb_commands.c $(STORAGE_CONFIG_SRC) $(STORAGE_ERROR_SRC) $(STORAGE_WORKER_SRC) -Wl,--gc-sections -o /tmp/mock_storage_config_test
 	/tmp/mock_storage_config_test
 	$(CC) $(CFLAGS) -Wformat=2 -ffunction-sections -fdata-sections -Iinclude \
 		tests/mock_nvme_cross_slot_test.c src/ccb_hw.c src/debug_uart.c $(STORAGE_CONFIG_SRC) $(STORAGE_ERROR_SRC) -Wl,--gc-sections -o /tmp/mock_nvme_cross_slot_test
 	/tmp/mock_nvme_cross_slot_test
 	$(CC) $(CFLAGS) -Wformat=2 -Wno-unused-function -Wno-stringop-truncation \
 		-ffunction-sections -fdata-sections -Iinclude tests/mock_cross_slot_writer_lifecycle_test.c \
-		src/ccb_commands.c src/ccb_hw.c src/debug_uart.c $(STORAGE_CONFIG_SRC) $(STORAGE_ERROR_SRC) -Wl,--gc-sections -o /tmp/mock_cross_slot_writer_lifecycle_test
+		src/ccb_commands.c src/ccb_hw.c src/debug_uart.c $(STORAGE_CONFIG_SRC) $(STORAGE_ERROR_SRC) $(STORAGE_WORKER_SRC) -Wl,--gc-sections -o /tmp/mock_cross_slot_writer_lifecycle_test
 	/tmp/mock_cross_slot_writer_lifecycle_test
 	$(CC) $(CFLAGS) -Wformat=2 -ffunction-sections -fdata-sections -Iinclude \
 		tests/mock_nvme_legacy_submit_test.c src/ccb_hw.c src/debug_uart.c $(STORAGE_CONFIG_SRC) $(STORAGE_ERROR_SRC) -lpthread -Wl,--gc-sections -o /tmp/mock_nvme_legacy_submit_test

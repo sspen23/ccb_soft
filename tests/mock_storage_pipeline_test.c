@@ -9,7 +9,6 @@ int main(void)
         {.slot=1,.bytes=512,.sectors=1,.chunk_index=8,.file_offset=512,.start_lba=101}}, out;
     StorageStopState stop;
     StorageStopHarvestState harvest_stop;
-    StorageRunState run;
 
     storage_stop_state_init(&stop);
     assert(stop.state == STORAGE_STOP_NONE);
@@ -57,9 +56,6 @@ int main(void)
         assert(!queue_error && !producer_done);
     }
 
-    storage_run_state_init(&run);
-    assert(!storage_run_state_can_emit_running(&run));
-
     assert(storage_first_dma_deadline_outcome(true, false, false, 0, 0u) ==
            STORAGE_FIRST_DMA_DEADLINE_EXPIRED);
     assert(storage_first_dma_deadline_outcome(true, false, false, -1, 0u) ==
@@ -68,25 +64,6 @@ int main(void)
            STORAGE_FIRST_DMA_DEADLINE_DATA);
     assert(storage_first_dma_deadline_outcome(true, false, true, 0, 0u) ==
            STORAGE_FIRST_DMA_DEADLINE_WAIT);
-    assert(storage_run_state_enable_writer(&run) == 0);
-    assert(!storage_run_state_can_emit_running(&run));
-    assert(storage_run_state_set_writer_ready(&run, true) == 0);
-    assert(!storage_run_state_can_emit_running(&run));
-    assert(storage_run_state_set_producer_ready(&run, true) == 0);
-    assert(storage_run_state_can_emit_running(&run));
-    assert(storage_run_state_mark_running(&run) == 0);
-    assert(!storage_run_state_can_emit_running(&run));
-
-    storage_run_state_init(&run);
-    assert(storage_run_state_enable_writer(&run) == 0);
-    assert(storage_run_state_set_writer_ready(&run, false) != 0);
-    assert(!storage_run_state_can_emit_running(&run));
-    storage_run_state_init(&run);
-    assert(storage_run_state_enable_writer(&run) == 0);
-    assert(storage_run_state_set_writer_ready(&run, true) == 0);
-    assert(storage_run_state_set_producer_ready(&run, false) != 0);
-    assert(!storage_run_state_can_emit_running(&run));
-
     assert(storage_pipeline_init(&p, 2u) == 0);
     assert(storage_harvest_limit_for_remaining(8192u, 4096u, 4u) == 2u);
     assert(storage_harvest_limit_for_remaining(16384u, 4096u, 4u) == 4u);

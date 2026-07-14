@@ -48,15 +48,6 @@ typedef struct {
     uint64_t completion_count;
 } StorageDrainInvariant;
 
-typedef struct {
-    bool writer_enabled;
-    bool writer_run_ready;
-    bool writer_schedule_failed;
-    bool producer_run_ready;
-    bool producer_schedule_failed;
-    bool running_sent;
-} StorageRunState;
-
 /* The producer must decide a first-DMA deadline only after its normal
  * harvest attempt.  Software slot counts can lag a completed hardware BD,
  * so they are diagnostic data, not deadline evidence. */
@@ -147,12 +138,6 @@ bool storage_ring_pressure_should_stop(uint32_t pressure_level,
                                        uint64_t now_us,
                                        uint64_t critical_duration_us,
                                        bool stop_enabled);
-void storage_run_state_init(StorageRunState *state);
-int storage_run_state_enable_writer(StorageRunState *state);
-int storage_run_state_set_writer_ready(StorageRunState *state, bool success);
-int storage_run_state_set_producer_ready(StorageRunState *state, bool success);
-bool storage_run_state_can_emit_running(const StorageRunState *state);
-int storage_run_state_mark_running(StorageRunState *state);
 StorageFirstDmaDeadlineOutcome storage_first_dma_deadline_outcome(
     bool deadline_due, bool saw_dma_data, bool stop_requested,
     int harvest_rc, uint32_t harvest_count);
