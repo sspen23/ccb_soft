@@ -38,6 +38,7 @@
 #include "ccb_storage_task.h"
 #include "ccb_storage_perf.h"
 #include "ccb_storage_commit.h"
+#include "ccb_storage_log.h"
 #include "ccb_tcp_transfer.h"
 #include "debug_uart.h"
 
@@ -169,7 +170,7 @@ static void storage_handle_worker_exit(Task *task, int status);
 static int storage_commit_supervised_results(const char *task_id);
 static void storage_service_pending_stop(void);
 static void storage_service_pending_start(void);
-static void system_emit_line(const char *fmt, ...);
+static void system_emit_line(StorageLogSeverity severity, const char *fmt, ...);
 
 static void storage_supervisor_emit_aggregate(void)
 {
@@ -204,21 +205,29 @@ static void storage_supervisor_emit_aggregate(void)
             }
         }
     }
-    printf("storage_capture_complete task=%s status=%s ch0_bytes=%" PRIu64
-           " ch1_bytes=%" PRIu64 " ch2_bytes=%" PRIu64 " integrity_ok=%u"
-           " primary_reason=%s secondary_reason=%s reason=%s\n",
-           task_id,
-           status == STORAGE_TASK_SUCCESS ? "success" : "failed", bytes[0], bytes[1], bytes[2],
-           status == STORAGE_TASK_SUCCESS ? 1u : 0u,
-           status == STORAGE_TASK_SUCCESS && g_storage_commit_state.sync_pending ? "sync_pending" :
-               (status == STORAGE_TASK_SUCCESS ? "none" :
-               (g_storage_commit_state.attempted && !g_storage_commit_state.success
-                    ? g_storage_commit_state.reason : g_storage_supervisor.fatal_reason)),
-           secondary_reason,
-           status == STORAGE_TASK_SUCCESS && g_storage_commit_state.sync_pending ? "sync_pending" :
-               (status == STORAGE_TASK_SUCCESS ? "none" :
-               (g_storage_commit_state.attempted && !g_storage_commit_state.success
-                    ? g_storage_commit_state.reason : g_storage_supervisor.fatal_reason)));
+    system_emit_line(STORAGE_LOG_ALWAYS_CRITICAL,
+                     "storage_capture_complete task=%s status=%s ch0_bytes=%" PRIu64
+                     " ch1_bytes=%" PRIu64 " ch2_bytes=%" PRIu64 " integrity_ok=%u"
+                     " primary_reason=%s secondary_reason=%s reason=%s",
+                     task_id,
+                     status == STORAGE_TASK_SUCCESS ? "success" : "failed", bytes[0], bytes[1], bytes[2],
+                     status == STORAGE_TASK_SUCCESS ? 1u : 0u,
+                     status == STORAGE_TASK_SUCCESS && g_storage_commit_state.sync_pending ? "sync_pending" :
+                         (status == STORAGE_TASK_SUCCESS ? "none" :
+                         (g_storage_commit_state.attempted && !g_storage_commit_state.success
+                              ? g_storage_commit_state.reason : g_storage_supervisor.fatal_reason)),
+                     secondary_reason,
+                     status == STORAGE_TASK_SUCCESS && g_storage_commit_state.sync_pending ? "sync_pending" :
+                         (status == STORAGE_TASK_SUCCESS ? "none" :
+                         (g_storage_commit_state.attempted && !g_storage_commit_state.success
+                              ? g_storage_commit_state.reason : g_storage_supervisor.fatal_reason)));
+    system_emit_line(STORAGE_LOG_SUMMARY,
+                     "storage_supervisor_aggregate task=%s status=%s target_mask=0x%02X"
+                     " primary_reason=%s secondary_reason=%s",
+                     task_id, status == STORAGE_TASK_SUCCESS ? "success" : "failed",
+                     g_storage_supervisor.target_channel_mask,
+                     status == STORAGE_TASK_SUCCESS ? "none" : g_storage_supervisor.fatal_reason,
+                     secondary_reason);
     g_storage_supervisor.aggregate_emitted = true;
 }
 
@@ -1361,7 +1370,7 @@ static void storage_service_pending_stop(void)
     proto_send_acq_ack(result,
                        g_pending_storage_stop.acq_type,
                        result == ACK_SUCCESS ? FAIL_TYPE_NONE : g_pending_storage_stop.failure_type);
-    system_emit_line("serial_cmd_ack cmd=0x21 action=stop task_no=%s ack_status=0x%02X"
+    system_emit_line(STORAGE_LOG_SUMMARY, "serial_cmd_ack cmd=0x21 action=stop task_no=%s ack_status=0x%02X"
                      " result_code=0x%02X worker_state=%d storage_state=%d reason=%s",
                      g_pending_storage_stop.task_id,
                      result,
@@ -1674,30 +1683,14 @@ static int system_env_flag_enabled(const char *name)
     return 1;
 }
 
-static bool system_text_output_enabled(void)
-{
-    const char *legacy = getenv("SRC_REAL_LEGACY_STORAGE_TEXT");
-    const char *level = getenv("SRC_REAL_CONSOLE_LOG_LEVEL");
-    return (legacy && (strcmp(legacy, "1") == 0 || strcmp(legacy, "true") == 0 ||
-                       strcmp(legacy, "yes") == 0 || strcmp(legacy, "on") == 0)) ||
-           (level && (strcmp(level, "debug") == 0 || strcmp(level, "trace") == 0));
-}
-
-static bool system_critical_line(const char *fmt)
-{
-    return fmt && (strstr(fmt, "storage_ddr_full") != NULL ||
-                   strstr(fmt, "storage_start_failed") != NULL ||
-                   strstr(fmt, "storage_capture_complete") != NULL);
-}
-
-static void system_emit_line(const char *fmt, ...)
+static void system_emit_line(StorageLogSeverity severity, const char *fmt, ...)
 {
     char line[1024];
     va_list ap;
     int n;
     size_t len;
 
-    if (!fmt || (!system_text_output_enabled() && !system_critical_line(fmt))) {
+    if (!fmt || !storage_log_severity_enabled(severity)) {
         return;
     }
     va_start(ap, fmt);
@@ -1737,53 +1730,31 @@ static void system_write_stdout_line(const char *line)
     }
 }
 
-static bool worker_output_has_important_token(const char *text)
+/* Worker stdout is line-oriented and has no severity field.  The worker has
+ * already applied StorageLogSeverity before writing; this final quiet-mode
+ * gate only preserves critical failure reporting if an older worker emits a
+ * line directly. */
+static bool worker_output_is_quiet_critical(const char *text)
 {
     const char *console = getenv("SRC_REAL_CONSOLE_LOG_LEVEL");
-    static const char *tokens[] = {
-        "storage_worker_done",
-        "storage_pipeline_config",
-        "storage_pipeline",
-        "storage_dma_idle_done",
-        "storage_ready",
-        "storage_started",
-        "storage_receive",
-        "dma_bd_low",
-        "dma_bd_exhausted",
-        "storage_receive_failed",
-        "pcie_link_status",
-        "storage_result",
-        "storage_result_perf",
-        "storage_result_diag",
-        "storage_result_receive",
-        "storage_transfer_done",
-        "storage_transfer_failed",
-        "storage_ring_warning",
-        "CQ timeout",
-        "write failed",
-        "CmdCtxError",
-        "failed",
-        "error",
-        "warning",
-        NULL
-    };
-    size_t i;
 
     if (!text) {
         return false;
     }
-    if (!console || strcmp(console, "critical") == 0) {
-        return strstr(text, "storage_ddr_full") != NULL ||
-               strstr(text, "storage_capture_complete") != NULL ||
-               strstr(text, "storage_start_failed") != NULL;
+    if (console && strcmp(console, "none") == 0) return false;
+    if (console && (strcmp(console, "debug") == 0 || strcmp(console, "trace") == 0)) {
+        return true;
     }
-    if (strcmp(console, "none") == 0) return false;
-    for (i = 0u; tokens[i] != NULL; ++i) {
-        if (strstr(text, tokens[i]) != NULL) {
-            return true;
-        }
+    if ((!console || strcmp(console, "critical") != 0) &&
+        storage_log_severity_enabled(STORAGE_LOG_SUMMARY)) {
+        return true;
     }
-    return false;
+    return strstr(text, "storage_ddr_full") != NULL ||
+           strstr(text, "storage_receive_failed") != NULL ||
+           strstr(text, "storage_first_dma_timeout") != NULL ||
+           strstr(text, "storage_ring_config_error") != NULL ||
+           strstr(text, "dma_bd_exhausted") != NULL ||
+           (strstr(text, "storage_result") != NULL && strstr(text, "status=failed") != NULL);
 }
 
 static void echo_worker_line(Task *task, const char *line)
@@ -1791,7 +1762,7 @@ static void echo_worker_line(Task *task, const char *line)
     if (!task || !line) {
         return;
     }
-    if (worker_output_has_important_token(line)) {
+    if (worker_output_is_quiet_critical(line)) {
         system_write_stdout_line(line);
         return;
     }
@@ -2188,7 +2159,7 @@ static void storage_pending_start_send_failure(void)
         proto_send_acq_ack(ACK_FAILED, g_pending_storage_start.acq_type,
                            g_pending_storage_start.failure_type);
     }
-    system_emit_line("storage_start_failed task=%s phase=%s reason=start_barrier_failed",
+    system_emit_line(STORAGE_LOG_ALWAYS_CRITICAL, "storage_start_failed task=%s phase=%s reason=start_barrier_failed",
                      g_pending_storage_start.task_id,
                      g_pending_storage_start.prepare ? "prepare" : "run");
 }
@@ -2285,7 +2256,7 @@ static void storage_service_pending_start(void)
             storage_pending_start_fail();
         } else {
             proto_send_ack(CMD_TASK_INFO, ACK_SUCCESS);
-            system_emit_line("serial_cmd_ack cmd=0x11 action=prestart task_no=%s ack_status=0x%02X result_code=0x%02X worker_state=%d storage_state=%d reason=storage_prepared",
+            system_emit_line(STORAGE_LOG_SUMMARY, "serial_cmd_ack cmd=0x11 action=prestart task_no=%s ack_status=0x%02X result_code=0x%02X worker_state=%d storage_state=%d reason=storage_prepared",
                              g_pending_storage_start.task_id, ACK_SUCCESS, ACK_SUCCESS,
                              RUNNING, storage_state_summary());
             memset(&g_pending_storage_start, 0, sizeof(g_pending_storage_start));
@@ -2316,7 +2287,7 @@ static void storage_service_pending_start(void)
     if (g_pending_storage_start.phase == STORAGE_START_RUN_WAIT &&
         running == (uint32_t)g_pending_storage_start.target_count) {
         proto_send_acq_ack(ACK_SUCCESS, g_pending_storage_start.acq_type, FAIL_TYPE_NONE);
-        system_emit_line("serial_cmd_ack cmd=0x21 action=start task_no=%s ack_status=0x%02X result_code=0x%02X worker_state=%d storage_state=%d reason=all_workers_started",
+        system_emit_line(STORAGE_LOG_SUMMARY, "serial_cmd_ack cmd=0x21 action=start task_no=%s ack_status=0x%02X result_code=0x%02X worker_state=%d storage_state=%d reason=all_workers_started",
                          g_pending_storage_start.task_id, ACK_SUCCESS, ACK_SUCCESS,
                          RUNNING, storage_state_summary());
         memset(&g_pending_storage_start, 0, sizeof(g_pending_storage_start));
@@ -4076,7 +4047,7 @@ void handle_frame(uint8_t *f)
                    task_cmd->task_file_mode,
                    (unsigned)task_cmd->envelope_clock,
                    (unsigned)envelope_duration);
-        system_emit_line("serial_cmd_rx cmd=0x%02X action=prestart task_no=%s channel_mask=0x%02X storage_state=%d",
+        system_emit_line(STORAGE_LOG_DEBUG, "serial_cmd_rx cmd=0x%02X action=prestart task_no=%s channel_mask=0x%02X storage_state=%d",
                          cmd,
                          task_id,
                          task_cmd->task_file_mode,
@@ -4085,7 +4056,7 @@ void handle_frame(uint8_t *f)
             LOG_WARN("SYSTEM", "Invalid overpass_time in 0x11: %s", overpass_time_str);
             dbg_printf("[DBG][PROTO] 0x11 invalid overpass_time=%s\n", overpass_time_str);
             proto_send_ack(cmd, ACK_INVALID_PARAM);
-            system_emit_line("serial_cmd_ack cmd=0x%02X action=prestart task_no=%s ack_status=0x%02X result_code=0x%02X worker_state=%d storage_state=%d reason=invalid_overpass_time",
+            system_emit_line(STORAGE_LOG_SUMMARY, "serial_cmd_ack cmd=0x%02X action=prestart task_no=%s ack_status=0x%02X result_code=0x%02X worker_state=%d storage_state=%d reason=invalid_overpass_time",
                              cmd, task_id, ACK_INVALID_PARAM, ACK_INVALID_PARAM,
                              RUNNING, storage_state_summary());
             break;
@@ -4100,7 +4071,7 @@ void handle_frame(uint8_t *f)
                        storage_state_summary(),
                        transfer_task.state);
             proto_send_ack(cmd, ACK_RETRYING);
-            system_emit_line("serial_cmd_ack cmd=0x%02X action=prestart task_no=%s ack_status=0x%02X result_code=0x%02X worker_state=%d storage_state=%d reason=busy",
+            system_emit_line(STORAGE_LOG_SUMMARY, "serial_cmd_ack cmd=0x%02X action=prestart task_no=%s ack_status=0x%02X result_code=0x%02X worker_state=%d storage_state=%d reason=busy",
                              cmd, task_id, ACK_RETRYING, ACK_RETRYING,
                              RUNNING, storage_state_summary());
             break;
@@ -4130,7 +4101,7 @@ void handle_frame(uint8_t *f)
                          task_id, task_cmd->task_file_mode, task_cmd->usb_transfer_enable);
                 dbg_printf("[DBG][PROTO] 0x11 ACK success task=%s storage prepared\n", task_id);
                 proto_send_ack(cmd, ACK_SUCCESS);
-                system_emit_line("serial_cmd_ack cmd=0x%02X action=prestart task_no=%s ack_status=0x%02X result_code=0x%02X worker_state=%d storage_state=%d reason=storage_prepared",
+                system_emit_line(STORAGE_LOG_SUMMARY, "serial_cmd_ack cmd=0x%02X action=prestart task_no=%s ack_status=0x%02X result_code=0x%02X worker_state=%d storage_state=%d reason=storage_prepared",
                                  cmd, task_id, ACK_SUCCESS, ACK_SUCCESS,
                                  RUNNING, storage_state_summary());
             } else if (prep_result == STORAGE_START_PENDING) {
@@ -4142,10 +4113,10 @@ void handle_frame(uint8_t *f)
                           task_id, task_cmd->task_file_mode, prep_result, prep_failure_type);
                 dbg_printf("[DBG][PROTO] 0x11 ACK fail task=%s prep_result=0x%02X failure=0x%02X\n",
                            task_id, prep_result, prep_failure_type);
-                system_emit_line("storage_start_failed task=%s phase=prepare reason=storage_prepare_failed"
+                system_emit_line(STORAGE_LOG_ALWAYS_CRITICAL, "storage_start_failed task=%s phase=prepare reason=storage_prepare_failed"
                                  " result_code=0x%02X", task_id, prep_result);
                 proto_send_ack(cmd, prep_result);
-                system_emit_line("serial_cmd_ack cmd=0x%02X action=prestart task_no=%s ack_status=0x%02X result_code=0x%02X worker_state=%d storage_state=%d reason=storage_prepare_failed",
+                system_emit_line(STORAGE_LOG_SUMMARY, "serial_cmd_ack cmd=0x%02X action=prestart task_no=%s ack_status=0x%02X result_code=0x%02X worker_state=%d storage_state=%d reason=storage_prepare_failed",
                                  cmd, task_id, prep_result, prep_result,
                                  ERROR, storage_state_summary());
             }
@@ -4153,7 +4124,7 @@ void handle_frame(uint8_t *f)
             LOG_ERROR("SYSTEM", "TASK CONFIG FAILED: %s", task_id);
             dbg_printf("[DBG][PROTO] 0x11 task_create failed task=%s\n", task_id);
             proto_send_ack(cmd, ACK_FAILED);
-            system_emit_line("serial_cmd_ack cmd=0x%02X action=prestart task_no=%s ack_status=0x%02X result_code=0x%02X worker_state=%d storage_state=%d reason=task_create_failed",
+            system_emit_line(STORAGE_LOG_SUMMARY, "serial_cmd_ack cmd=0x%02X action=prestart task_no=%s ack_status=0x%02X result_code=0x%02X worker_state=%d storage_state=%d reason=task_create_failed",
                              cmd, task_id, ACK_FAILED, ACK_FAILED,
                              ERROR, storage_state_summary());
         }
@@ -4173,7 +4144,7 @@ void handle_frame(uint8_t *f)
                    g_last_task.valid ? 1u : 0u,
                    g_last_task.valid ? g_last_task.task_id : "",
                    storage_state);
-        system_emit_line("serial_cmd_rx cmd=0x%02X action=%s task_no=%s channel_mask=0x%02X storage_state=%d",
+        system_emit_line(STORAGE_LOG_DEBUG, "serial_cmd_rx cmd=0x%02X action=%s task_no=%s channel_mask=0x%02X storage_state=%d",
                          cmd,
                          acq_cmd->switch_flag == SWITCH_ON ? "start" :
                          (acq_cmd->switch_flag == SWITCH_OFF ? "stop" : "unknown"),
@@ -4187,7 +4158,7 @@ void handle_frame(uint8_t *f)
                  * progressed by the main loop. */
                 proto_send_acq_ack(ACK_RETRYING, acq_type,
                                    FAIL_TYPE_LOW | FAIL_TYPE_HIGH_I | FAIL_TYPE_HIGH_Q);
-                system_emit_line("serial_cmd_ack cmd=0x%02X action=start task_no=%s ack_status=0x%02X result_code=0x%02X worker_state=%d storage_state=%d reason=busy",
+                system_emit_line(STORAGE_LOG_SUMMARY, "serial_cmd_ack cmd=0x%02X action=start task_no=%s ack_status=0x%02X result_code=0x%02X worker_state=%d storage_state=%d reason=busy",
                                  cmd, g_last_task.valid ? g_last_task.task_id : "",
                                  ACK_RETRYING, ACK_RETRYING, RUNNING, storage_state_summary());
                 return;
@@ -4199,7 +4170,7 @@ void handle_frame(uint8_t *f)
                 result = ACK_FAILED;
                 failure_type = FAIL_TYPE_LOW | FAIL_TYPE_HIGH_I | FAIL_TYPE_HIGH_Q;
                 (void)request_storage_stop_all();
-                system_emit_line("storage_start_failed task=%s phase=run_barrier reason=start_barrier_failed",
+                system_emit_line(STORAGE_LOG_ALWAYS_CRITICAL, "storage_start_failed task=%s phase=run_barrier reason=start_barrier_failed",
                                  g_last_task.valid ? g_last_task.task_id : "");
             } else {
                 /* The RUN ACK is emitted by storage_service_pending_start once
@@ -4207,7 +4178,7 @@ void handle_frame(uint8_t *f)
                 return;
             }
             proto_send_acq_ack(result, acq_type, failure_type);
-            system_emit_line("serial_cmd_ack cmd=0x%02X action=start task_no=%s ack_status=0x%02X result_code=0x%02X worker_state=%d storage_state=%d reason=%s",
+            system_emit_line(STORAGE_LOG_SUMMARY, "serial_cmd_ack cmd=0x%02X action=start task_no=%s ack_status=0x%02X result_code=0x%02X worker_state=%d storage_state=%d reason=%s",
                              cmd,
                              g_last_task.valid ? g_last_task.task_id : "",
                              result,
@@ -4215,7 +4186,7 @@ void handle_frame(uint8_t *f)
                              result == ACK_SUCCESS ? RUNNING : ERROR,
                              storage_state_summary(),
                              result == ACK_SUCCESS ? "all_workers_started" : "start_barrier_failed");
-            system_emit_line("serial_cmd_result cmd=start task=%s status=%s storage_state=%d reason=%s",
+            system_emit_line(STORAGE_LOG_SUMMARY, "serial_cmd_result cmd=start task=%s status=%s storage_state=%d reason=%s",
                              g_last_task.valid ? g_last_task.task_id : "",
                              result == ACK_SUCCESS ? "success" : "failed",
                              storage_state_summary(),
@@ -4225,7 +4196,7 @@ void handle_frame(uint8_t *f)
                 LOG_WARN("CAPTURE", "Stop rejected: no valid 0x11 task context");
                 result = ACK_INVALID_PARAM;
                 dbg_printf("[DBG][PROTO] 0x21 stop rejected result=0x%02X\n", result);
-                system_emit_line("serial_cmd_result cmd=stop task=%s status=failed storage_done=0 data_persisted=0 integrity_ok=0 reason=no_valid_task",
+                system_emit_line(STORAGE_LOG_SUMMARY, "serial_cmd_result cmd=stop task=%s status=failed storage_done=0 data_persisted=0 integrity_ok=0 reason=no_valid_task",
                                  g_last_task.valid ? g_last_task.task_id : "");
             } else if (g_pending_storage_stop.active) {
                 /* STOP is idempotent while the first stop is draining.  The
@@ -4264,7 +4235,7 @@ void handle_frame(uint8_t *f)
                 stop_started_us = storage_ipc_monotonic_us();
                 g_pending_storage_stop.deadline_us = storage_ipc_saturating_add_u64(
                     stop_started_us, parent_stop_config.parent_timeout_us);
-                system_emit_line("storage_parent_stop_config task=%s parent_timeout_us=%" PRIu64
+                system_emit_line(STORAGE_LOG_SUMMARY, "storage_parent_stop_config task=%s parent_timeout_us=%" PRIu64
                                  " source=%s dma_quiesce_us=%" PRIu64
                                  " stop_harvest_us=%" PRIu64
                                  " writer_drain_us=%" PRIu64
@@ -4284,7 +4255,7 @@ void handle_frame(uint8_t *f)
                 return;
             }
             proto_send_acq_ack(result, acq_type, failure_type);
-            system_emit_line("serial_cmd_ack cmd=0x%02X action=stop task_no=%s ack_status=0x%02X result_code=0x%02X worker_state=%d storage_state=%d reason=%s",
+            system_emit_line(STORAGE_LOG_SUMMARY, "serial_cmd_ack cmd=0x%02X action=stop task_no=%s ack_status=0x%02X result_code=0x%02X worker_state=%d storage_state=%d reason=%s",
                              cmd,
                              g_last_task.valid ? g_last_task.task_id : "",
                              result,
@@ -4296,7 +4267,7 @@ void handle_frame(uint8_t *f)
             LOG_WARN("CAPTURE", "Invalid switch flag: 0x%02X", acq_cmd->switch_flag);
             dbg_printf("[DBG][PROTO] 0x21 invalid switch=0x%02X\n", acq_cmd->switch_flag);
             proto_send_acq_ack(ACK_INVALID_PARAM, acq_type, failure_type);
-            system_emit_line("serial_cmd_ack cmd=0x%02X action=unknown task_no=%s ack_status=0x%02X result_code=0x%02X worker_state=%d storage_state=%d reason=invalid_switch",
+            system_emit_line(STORAGE_LOG_SUMMARY, "serial_cmd_ack cmd=0x%02X action=unknown task_no=%s ack_status=0x%02X result_code=0x%02X worker_state=%d storage_state=%d reason=invalid_switch",
                              cmd,
                              g_last_task.valid ? g_last_task.task_id : "",
                              ACK_INVALID_PARAM,

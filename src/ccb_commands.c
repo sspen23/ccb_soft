@@ -7,6 +7,7 @@
 #include "ccb_storage_ipc.h"
 #include "ccb_storage_pipeline.h"
 #include "ccb_storage_diag.h"
+#include "ccb_storage_log.h"
 #include "debug_uart.h"
 
 #include <stdio.h>
@@ -59,13 +60,6 @@ typedef struct {
     uint64_t sectors;
     uint64_t hw_addr;
 } PendingDdrSlot;
-
-typedef enum {
-    STORAGE_LOG_QUIET = 0,
-    STORAGE_LOG_SUMMARY = 1,
-    STORAGE_LOG_DEBUG = 2,
-    STORAGE_LOG_TRACE = 3,
-} StorageLogLevel;
 
 typedef struct {
     uint32_t ready_depth_current;
@@ -297,7 +291,6 @@ void storage_write_request_stop(void);
 static int storage_env_flag_enabled(const char *name);
 static bool storage_env_string_is(const char *name, const char *expected);
 static bool storage_text_output_enabled(void);
-static bool storage_should_emit_text_format(const char *fmt);
 static uint64_t storage_timeout_us(const char *us_name, const char *ms_name,
                                    uint64_t fallback_us);
 
@@ -599,9 +592,9 @@ static void storage_emit_line_impl(const char *fmt, ...)
     }
 }
 
-#define storage_emit_line(fmt, ...) \
+#define storage_emit_line(severity, fmt, ...) \
     do { \
-        if (storage_should_emit_text_format((fmt))) \
+        if (storage_log_enabled((severity))) \
             storage_emit_line_impl((fmt), ##__VA_ARGS__); \
     } while (0)
 
@@ -622,45 +615,14 @@ static uint32_t storage_idle_notice_ms(void) {
     return (uint32_t)parsed;
 }
 
-static StorageLogLevel storage_log_level(void)
+static bool storage_log_enabled(StorageLogSeverity need)
 {
-    static int cached = -1;
-    const char *env;
-
-    if (cached >= 0) {
-        return (StorageLogLevel)cached;
-    }
-    env = getenv("SRC_REAL_LOG_LEVEL");
-    if (!env || env[0] == '\0' || strcmp(env, "quiet") == 0) {
-        cached = STORAGE_LOG_QUIET;
-    } else if (strcmp(env, "summary") == 0) {
-        cached = STORAGE_LOG_SUMMARY;
-    } else if (strcmp(env, "debug") == 0) {
-        cached = STORAGE_LOG_DEBUG;
-    } else if (strcmp(env, "trace") == 0) {
-        cached = STORAGE_LOG_TRACE;
-    } else {
-        fprintf(stderr, "warning: invalid SRC_REAL_LOG_LEVEL=%s; fallback=quiet\n", env);
-        cached = STORAGE_LOG_QUIET;
-    }
-    return (StorageLogLevel)cached;
-}
-
-static bool storage_log_enabled(StorageLogLevel need)
-{
-    return storage_log_level() >= need;
+    return storage_log_severity_enabled(need);
 }
 
 static bool storage_text_output_enabled(void)
 {
-    return storage_env_flag_enabled("SRC_REAL_LEGACY_STORAGE_TEXT") ||
-           storage_log_enabled(STORAGE_LOG_DEBUG);
-}
-
-static bool storage_should_emit_text_format(const char *fmt)
-{
-    return fmt && (storage_text_output_enabled() ||
-                   strncmp(fmt, "storage_ddr_full", strlen("storage_ddr_full")) == 0);
+    return storage_log_enabled(STORAGE_LOG_DEBUG);
 }
 
 static uint32_t storage_env_u32_limit(const char *name, uint32_t fallback, uint32_t max_value);
@@ -1276,7 +1238,7 @@ static int storage_apply_writer_rt(StorageWriteQueue *q)
     if (prio == 0u) {
         __atomic_store_n(&q->writer_rt_policy, SCHED_OTHER, __ATOMIC_RELEASE);
         __atomic_store_n(&q->writer_rt_enabled, false, __ATOMIC_RELEASE);
-        storage_emit_line("storage_writer_scheduler channel=%d effective_policy=other"
+        storage_emit_line(STORAGE_LOG_SUMMARY, "storage_writer_scheduler channel=%d effective_policy=other"
                           " effective_prio=0 rt_enabled=0",
                           q->rt->cfg->id);
         return 0;
@@ -1302,13 +1264,13 @@ static int storage_apply_writer_rt(StorageWriteQueue *q)
         __atomic_store_n(&q->writer_rt_policy, SCHED_OTHER, __ATOMIC_RELEASE);
         __atomic_store_n(&q->writer_rt_prio, 0u, __ATOMIC_RELEASE);
         __atomic_store_n(&q->writer_rt_enabled, false, __ATOMIC_RELEASE);
-        storage_emit_line("storage_rt_fallback channel=%d role=writer requested_policy=%s"
+        storage_emit_line(STORAGE_LOG_SUMMARY, "storage_rt_fallback channel=%d role=writer requested_policy=%s"
                           " requested_prio=%u effective_policy=other effective_prio=0 reason=%s",
                           q->rt->cfg->id, storage_rt_policy_name(policy), (unsigned)prio,
                           storage_require_rt() ? "required" : "setschedparam_failed");
         return storage_require_rt() ? -1 : 0;
     }
-    storage_emit_line("storage_writer_scheduler channel=%d effective_policy=%s"
+    storage_emit_line(STORAGE_LOG_SUMMARY, "storage_writer_scheduler channel=%d effective_policy=%s"
                       " effective_prio=%u rt_enabled=%u",
                       q->rt->cfg->id,
                       storage_rt_policy_name(__atomic_load_n(&q->writer_rt_policy,
@@ -1345,7 +1307,7 @@ static int storage_apply_producer_rt(const ChannelRuntime *rt,
         producer_prio = 0u;
         if (effective_policy) *effective_policy = policy;
         if (effective_prio) *effective_prio = producer_prio;
-        storage_emit_line("storage_rt_fallback channel=%d role=producer requested_policy=%s"
+        storage_emit_line(STORAGE_LOG_SUMMARY, "storage_rt_fallback channel=%d role=producer requested_policy=%s"
                           " requested_prio=%u effective_policy=other effective_prio=0 reason=%s",
                           rt->cfg->id, storage_rt_policy_name(requested_policy),
                           (unsigned)requested_prio,
@@ -1354,7 +1316,7 @@ static int storage_apply_producer_rt(const ChannelRuntime *rt,
     }
     if (effective_policy) *effective_policy = policy;
     if (effective_prio) *effective_prio = producer_prio;
-    storage_emit_line("storage_producer_scheduler channel=%d effective_policy=%s"
+    storage_emit_line(STORAGE_LOG_SUMMARY, "storage_producer_scheduler channel=%d effective_policy=%s"
                       " effective_prio=%u rt_enabled=%u",
                       rt->cfg->id, storage_rt_policy_name(policy),
                       (unsigned)producer_prio, policy != SCHED_OTHER ? 1u : 0u);
@@ -1981,7 +1943,7 @@ static int storage_capture_bd_snapshot(StorageProducerStats *stats,
                   out->nvme_busy_slots + out->requeue_pending + out->free_slots;
     if (state_total != out->total_slots) {
         storage_record_failure(stats, "slot_ownership_invariant_failed");
-        storage_emit_line("storage_receive_failed channel=%d task=%s file_index=%u"
+        storage_emit_line(STORAGE_LOG_ALWAYS_CRITICAL, "storage_receive_failed channel=%d task=%s file_index=%u"
                           " reason=slot_ownership_invariant_failed received_bytes=%" PRIu64,
                           rt->cfg->id, task_no, (unsigned)file_index, received_bytes);
         return -1;
@@ -1995,7 +1957,7 @@ static int storage_capture_bd_snapshot(StorageProducerStats *stats,
         if (out->dma_writable <= low_threshold && out->dma_writable > 0u &&
             !stats->dma_bd_low_active) {
             stats->dma_bd_low_active = true;
-            storage_emit_line("dma_bd_low channel=%d task=%s file_index=%u"
+            storage_emit_line(STORAGE_LOG_DEBUG, "dma_bd_low channel=%d task=%s file_index=%u"
                               " dma_writable=%u threshold=%u completed_unharvested=%u"
                               " occupied_bytes_est=%" PRIu64,
                               rt->cfg->id, task_no, (unsigned)file_index,
@@ -2030,7 +1992,7 @@ static int storage_capture_bd_snapshot(StorageProducerStats *stats,
                 stats->first_receive_failure_us = now_us;
                 stats->first_receive_failure_bytes = received_bytes;
                 stats->first_failure_snapshot = *out;
-                storage_emit_line("storage_ddr_full channel=%d task=%s file_index=%u"
+                storage_emit_line(STORAGE_LOG_ALWAYS_CRITICAL, "storage_ddr_full channel=%d task=%s file_index=%u"
                                   " received_bytes=%" PRIu64 " completed_unharvested=%u"
                                   " ready_slots=%u nvme_busy_slots=%u requeue_pending=%u"
                                   " curdesc=%u taildesc=%u s2mm_dmasr=0x%08x",
@@ -2039,7 +2001,7 @@ static int storage_capture_bd_snapshot(StorageProducerStats *stats,
                                   out->ready_slots, out->nvme_busy_slots,
                                   out->requeue_pending, out->curdesc_index,
                                   out->taildesc_index, out->s2mm_dmasr);
-                storage_emit_line("storage_receive_failed channel=%d task=%s file_index=%u"
+                storage_emit_line(STORAGE_LOG_ALWAYS_CRITICAL, "storage_receive_failed channel=%d task=%s file_index=%u"
                                   " reason=dma_bd_exhausted_no_upstream_backpressure"
                                   " received_bytes=%" PRIu64 " dma_writable=0"
                                   " completed_unharvested=%u s2mm_dmasr=0x%08x",
@@ -2059,7 +2021,7 @@ static int storage_capture_bd_snapshot(StorageProducerStats *stats,
             stats->first_receive_failure_us = storage_wall_time_us();
             stats->first_receive_failure_bytes = received_bytes;
             stats->first_failure_snapshot = *out;
-            storage_emit_line("storage_receive_failed channel=%d task=%s file_index=%u"
+            storage_emit_line(STORAGE_LOG_ALWAYS_CRITICAL, "storage_receive_failed channel=%d task=%s file_index=%u"
                               " reason=%s received_bytes=%" PRIu64
                               " dma_writable=%u completed_unharvested=%u"
                               " s2mm_dmasr=0x%08x",
@@ -2269,7 +2231,7 @@ static void storage_stats_print_periodic(StorageProducerStats *stats,
 
     if (!print_zero_stats && received_delta == 0u && nvme_delta == 0u) {
         if (!stats->idle_printed && received_bytes == 0u && nvme_bytes == 0u) {
-            storage_emit_line("storage_pipeline_idle channel=%d dma_writable_slots=%u",
+            storage_emit_line(STORAGE_LOG_DEBUG, "storage_pipeline_idle channel=%d dma_writable_slots=%u",
                    rt->cfg->id,
                    (unsigned)snapshot.dma_writable_slots);
             stats->idle_printed = true;
@@ -2318,7 +2280,7 @@ static void storage_stats_print_periodic(StorageProducerStats *stats,
                (unsigned)__atomic_load_n(&rt->nvme_active_qd_current, __ATOMIC_ACQUIRE),
                (unsigned)__atomic_load_n(&rt->nvme_active_qd_max, __ATOMIC_ACQUIRE));
     }
-    storage_emit_line("storage_pipeline channel=%d window_ms=%" PRIu64 " task=%s file_index=%u"
+    storage_emit_line(STORAGE_LOG_SUMMARY, "storage_pipeline channel=%d window_ms=%" PRIu64 " task=%s file_index=%u"
            " rx_mib_s=%.3f nvme_complete_mib_s=%.3f"
            " ready_q=%u ready_q_avg=%u ready_q_max=%u"
            " dma_writable_slots=%u software_free_slots=%u ready_slots=%u nvme_busy_slots=%u"
@@ -2375,7 +2337,7 @@ static void storage_stats_print_periodic(StorageProducerStats *stats,
            snapshot.writer_drain_loop_count > 0u
                ? snapshot.writer_slots_drained / snapshot.writer_drain_loop_count
                : 0u);
-    storage_emit_line("storage_receive channel=%d task=%s file_index=%u window_ms=%" PRIu64
+    storage_emit_line(STORAGE_LOG_SUMMARY, "storage_receive channel=%d task=%s file_index=%u window_ms=%" PRIu64
                       " dma_bytes=%" PRIu64 " dma_mib_s=%.3f dma_bd_total=%u"
                       " dma_bd_writable=%u dma_bd_completed_unharvested=%u ready_slots=%u"
                       " nvme_busy_slots=%u requeue_pending=%u occupied_bytes_est=%" PRIu64
@@ -3452,7 +3414,7 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
     stop_timeouts = storage_stop_timeouts(&rt);
     requested_ring_bytes = storage_requested_ring_bytes(&rt);
     if (requested_ring_bytes != rt.dma_ring_bytes) {
-        storage_emit_line("storage_ring_config_error channel=%d requested_ring_bytes=%" PRIu64
+        storage_emit_line(STORAGE_LOG_ALWAYS_CRITICAL, "storage_ring_config_error channel=%d requested_ring_bytes=%" PRIu64
                           " effective_ring_bytes=%" PRIu64
                           " reason=%s",
                           cfg->id,
@@ -3469,7 +3431,7 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                                                                     &planned_desc_count,
                                                                     &desc_capacity);
         if (layout_error) {
-            storage_emit_line("storage_ring_config_error channel=%d requested_ring_bytes=%" PRIu64
+            storage_emit_line(STORAGE_LOG_ALWAYS_CRITICAL, "storage_ring_config_error channel=%d requested_ring_bytes=%" PRIu64
                               " effective_ring_bytes=%" PRIu64
                               " slot_bytes=%u total_slots=%u desc_capacity=%u reason=%s",
                               cfg->id,
@@ -3602,7 +3564,7 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                (unsigned)rt.nvme_qd_effective, (unsigned)rt.nvme_cmd_size_bytes,
                (unsigned)rt.nvme_max_dts_bytes, cross_slot_qd ? (unsigned)cross_slot_batch : 1u);
     }
-    storage_emit_line("storage_pipeline_config channel=%d mode=%s fast_pipeline=%u"
+    storage_emit_line(STORAGE_LOG_SUMMARY, "storage_pipeline_config channel=%d mode=%s fast_pipeline=%u"
                       " requested_ring_bytes=%" PRIu64
                       " effective_ring_bytes=%" PRIu64
                       " slot_bytes=%u total_slots=%u ring_clamp_reason=%s"
@@ -3633,7 +3595,7 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                       (unsigned)rt.dma_desc_count,
                       (unsigned)rt.nvme_qd_effective,
                       (unsigned)rt.nvme_cmd_size_bytes,
-                      (unsigned)storage_log_level(),
+                      (unsigned)storage_log_effective_level(),
                       storage_rt_policy_name(storage_rt_policy("SRC_REAL_WRITER_RT_POLICY", SCHED_RR)),
                       (unsigned)storage_writer_rt_prio(&rt),
                       storage_rt_policy_name(storage_rt_policy("SRC_REAL_PRODUCER_RT_POLICY", SCHED_RR)),
@@ -3657,7 +3619,7 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                       storage_env_flag_enabled("SRC_REAL_ENABLE_STORAGE_STATS") ? 1u : 0u,
                       storage_env_flag_enabled("SRC_REAL_SLOT_WRITE_PERF") ? 1u : 0u,
                       (unsigned)storage_slot_perf_interval());
-    storage_emit_line("storage_cross_slot_effective_config channel=%d enabled=%u"
+    storage_emit_line(STORAGE_LOG_SUMMARY, "storage_cross_slot_effective_config channel=%d enabled=%u"
                       " max_active=%u target_qd=%u cq_batch=%u writer_budget_us=%u"
                       " busy_poll_us=%u empty_sleep_us=%u no_progress_timeout_us=%u"
                       " enabled_source_kind=%s enabled_source_name=%s"
@@ -3707,7 +3669,7 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
 
         for (i = 0u; i < sizeof(resolutions) / sizeof(resolutions[0]); ++i) {
             if (resolutions[i]->invalid_source_name[0] != '\0') {
-                storage_emit_line("storage_cross_slot_invalid_config channel=%d parameter=%s"
+                storage_emit_line(STORAGE_LOG_SUMMARY, "storage_cross_slot_invalid_config channel=%d parameter=%s"
                                   " invalid_source=%s fallback_source=%s fallback_value=%u",
                                   cfg->id, labels[i], resolutions[i]->invalid_source_name,
                                   resolutions[i]->fallback_source_name,
@@ -3715,7 +3677,7 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
             }
         }
     }
-    storage_emit_line("storage_stop_config channel=%d compat_timeout_us=%" PRIu64
+    storage_emit_line(STORAGE_LOG_SUMMARY, "storage_stop_config channel=%d compat_timeout_us=%" PRIu64
                       " dma_quiesce_timeout_us=%" PRIu64
                       " stop_harvest_timeout_us=%" PRIu64
                       " writer_drain_timeout_us=%" PRIu64
@@ -3723,19 +3685,19 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                       cfg->id, stop_timeouts.compat_us, stop_timeouts.dma_quiesce_us,
                       stop_timeouts.stop_harvest_us, stop_timeouts.writer_drain_us,
                       stop_timeouts.nvme_abort_us);
-    storage_emit_line("storage_idle_policy channel=%d supervised_channel_count=%u"
+    storage_emit_line(STORAGE_LOG_SUMMARY, "storage_idle_policy channel=%d supervised_channel_count=%u"
                       " auto_idle_enabled=%u idle_ms=%u reason=%s",
                       cfg->id, (unsigned)supervised_channel_count,
                       auto_idle_enabled ? 1u : 0u,
                       auto_idle_enabled ? (unsigned)dma_idle_done_ms : 0u,
                       auto_idle_enabled ? "standalone_single_channel" : "supervised_barrier");
-    storage_emit_line("storage_zero_payload_policy channel=%d require_nonempty=%u first_dma_timeout_us=%" PRIu64
+    storage_emit_line(STORAGE_LOG_SUMMARY, "storage_zero_payload_policy channel=%d require_nonempty=%u first_dma_timeout_us=%" PRIu64
                       " allow_zero_env=%u",
                       cfg->id, require_nonempty_payload ? 1u : 0u,
                       first_dma_timeout_us,
                       storage_env_flag_enabled("SRC_REAL_ALLOW_ZERO_BYTE_CAPTURE") ? 1u : 0u);
     if (first_dma_timeout_us != 0u)
-        storage_emit_line("storage_first_dma_timeout channel=%d timeout_us=%" PRIu64,
+        storage_emit_line(STORAGE_LOG_SUMMARY, "storage_first_dma_timeout channel=%d timeout_us=%" PRIu64,
                           cfg->id, first_dma_timeout_us);
     if (pthread_create(&writer_thread,
                        NULL,
@@ -3747,7 +3709,7 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
     }
     writer_started = true;
     producer_stats.interval_ms = storage_pipeline_stats_ms();
-    storage_emit_line("storage_ready channel=%d task=%s file_index=%u start_gate_mode=%s",
+    storage_emit_line(STORAGE_LOG_DEBUG, "storage_ready channel=%d task=%s file_index=%u start_gate_mode=%s",
                       cfg->id, args->task_no, (unsigned)effective_file_index,
                       getenv("SRC_REAL_START_FD") ? "software_barrier" : "standalone_immediate");
     dma_started = true;
@@ -3808,7 +3770,7 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
         storage_mark_writer_error(&write_queue);
         goto out;
     }
-    storage_emit_line("storage_started channel=%d task=%s file_index=%u"
+    storage_emit_line(STORAGE_LOG_DEBUG, "storage_started channel=%d task=%s file_index=%u"
                       " start_gate_mode=%s start_skew_us=%" PRIu64,
                       cfg->id, args->task_no, (unsigned)effective_file_index,
                       start_gate_mode, start_skew_us);
@@ -3927,7 +3889,7 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                                        rt.dma_last_completed_status, 0u, true);
                 }
                 storage_record_failure(&producer_stats, "dma_harvest_failed");
-                storage_emit_line("storage_receive_failed channel=%d task=%s file_index=%u"
+                storage_emit_line(STORAGE_LOG_ALWAYS_CRITICAL, "storage_receive_failed channel=%d task=%s file_index=%u"
                                   " reason=%s received_bytes=%" PRIu64
                                   " descriptor_status=0x%08x",
                                   cfg->id, args->task_no, (unsigned)effective_file_index,
@@ -3955,7 +3917,7 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                                                   &first_snapshot);
                     pthread_mutex_unlock(&write_queue.lock);
                     storage_record_failure(&producer_stats, "first_dma_timeout");
-                    storage_emit_line("storage_first_dma_timeout channel=%d reason=first_dma_timeout"
+                    storage_emit_line(STORAGE_LOG_ALWAYS_CRITICAL, "storage_first_dma_timeout channel=%d reason=first_dma_timeout"
                                       " axis_source=%d cr=0x%08x sr=0x%08x curdesc=0x%08" PRIx64
                                       " taildesc=0x%08" PRIx64
                                       " hw_owned=%u completed_unharvested=%u",
@@ -4002,7 +3964,7 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                                        bd_snapshot.ready_slots, true);
                     storage_record_failure(&producer_stats, "dma_bd_exhausted");
                     if (!ring_full_logged) {
-                        storage_emit_line("storage_ddr_full channel=%d busy_slots=%u total_slots=%u"
+                        storage_emit_line(STORAGE_LOG_ALWAYS_CRITICAL, "storage_ddr_full channel=%d busy_slots=%u total_slots=%u"
                                           " buffered_bytes=%" PRIu64 " captured_bytes=%" PRIu64,
                                           cfg->id, (unsigned)busy_slots,
                                           (unsigned)rt.dma_desc_count, buffered_bytes,
@@ -4021,7 +3983,7 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                         StorageQueueSnapshot idle_snapshot;
 
                         storage_queue_snapshot(&write_queue, &idle_snapshot);
-                        storage_emit_line("storage_dma_idle_done channel=%d idle_ms=%" PRIu64
+                        storage_emit_line(STORAGE_LOG_DEBUG, "storage_dma_idle_done channel=%d idle_ms=%" PRIu64
                                           " received_bytes=%" PRIu64
                                           " written_bytes=%" PRIu64
                                           " buffered=%" PRIu64
@@ -4498,7 +4460,8 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                    bounded ? 0u : 1u);
         }
 
-        storage_emit_line("storage_result channel=%d task=%s file_index=%u status=%s"
+        storage_emit_line(integrity_ok ? STORAGE_LOG_SUMMARY : STORAGE_LOG_ALWAYS_CRITICAL,
+                          "storage_result channel=%d task=%s file_index=%u status=%s"
                           " file_bytes=%" PRIu64 " data_persisted=%u"
                           " receive_integrity_ok=%u storage_integrity_ok=%u integrity_ok=%u"
                           " integrity_risk=%s ring_full_count=%" PRIu64,
@@ -4513,7 +4476,7 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                           integrity_ok ? 1u : 0u,
                           integrity_risk,
                           producer_stats.ring_full_count);
-        storage_emit_line("storage_result_perf channel=%d task=%s file_index=%u elapsed_ms=%" PRIu64
+        storage_emit_line(STORAGE_LOG_SUMMARY, "storage_result_perf channel=%d task=%s file_index=%u elapsed_ms=%" PRIu64
                           " nvme_active_ms=%" PRIu64 " nvme_active_mib_s=%.3f"
                           " nvme_wall_ms=%" PRIu64 " nvme_wall_mib_s=%.3f"
                           " dma_observed_mib_s=%.3f nvme_qd_effective=%u"
@@ -4533,7 +4496,7 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                               ? (double)rt.nvme_active_qd_integral_us /
                                     (double)rt.nvme_active_qd_observed_us : 0.0,
                           (unsigned)__atomic_load_n(&rt.nvme_active_qd_max, __ATOMIC_ACQUIRE));
-        storage_emit_line("storage_result_diag channel=%d task=%s file_index=%u"
+        storage_emit_line(STORAGE_LOG_DEBUG, "storage_result_diag channel=%d task=%s file_index=%u"
                           " ready_q_max=%u ready_q_avg=%u"
                           " max_ddr_busy_slots=%u max_ddr_buffered_bytes=%" PRIu64
                           " submit_stall_count=%" PRIu64 " submit_stall_max_us=%" PRIu64
@@ -4552,7 +4515,7 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                               ? producer_stats.dma_harvest_interval_total_us /
                                     producer_stats.dma_harvest_interval_count : 0u,
                           producer_stats.dma_harvest_interval_max_us);
-        storage_emit_line("storage_result_receive channel=%d task=%s file_index=%u"
+        storage_emit_line(STORAGE_LOG_SUMMARY, "storage_result_receive channel=%d task=%s file_index=%u"
                           " dma_received_bytes=%" PRIu64
                           " dma_bd_exhaustion_count=%" PRIu64
                           " dma_error_count=%" PRIu64 " descriptor_error_count=%" PRIu64
@@ -4884,7 +4847,7 @@ out:
                rt.dma_rxeof_count,
                rt.dma_rx_packet_open ? 1u : 0u);
         }
-        storage_emit_line("storage_result channel=%d task=%s file_index=%u status=failed"
+        storage_emit_line(STORAGE_LOG_ALWAYS_CRITICAL, "storage_result channel=%d task=%s file_index=%u status=failed"
                           " file_bytes=%" PRIu64 " data_persisted=%u"
                           " receive_integrity_ok=0 storage_integrity_ok=0 integrity_ok=0"
                           " integrity_risk=%s ring_full_count=%" PRIu64,
@@ -4899,7 +4862,7 @@ out:
                                                  : (dma_stop_failed ? "dma_stop_recovery_failed"
                                                                     : "storage_error")),
                           producer_stats.ring_full_count);
-        storage_emit_line("storage_result_perf channel=%d task=%s file_index=%u elapsed_ms=%" PRIu64
+        storage_emit_line(STORAGE_LOG_SUMMARY, "storage_result_perf channel=%d task=%s file_index=%u elapsed_ms=%" PRIu64
                           " nvme_active_ms=%" PRIu64 " nvme_active_mib_s=%.3f"
                           " nvme_wall_ms=0 nvme_wall_mib_s=0.000 dma_observed_mib_s=0.000"
                           " nvme_qd_effective=%u nvme_active_qd_avg=0.000 nvme_active_qd_max=%u",
@@ -4911,7 +4874,7 @@ out:
                                                    (double)nvme_write_us / 1048576.0) : 0.0,
                           (unsigned)rt.nvme_qd_effective,
                           (unsigned)__atomic_load_n(&rt.nvme_active_qd_max, __ATOMIC_ACQUIRE));
-        storage_emit_line("storage_result_diag channel=%d task=%s file_index=%u"
+        storage_emit_line(STORAGE_LOG_DEBUG, "storage_result_diag channel=%d task=%s file_index=%u"
                           " ready_q_max=0 ready_q_avg=0"
                           " max_ddr_busy_slots=%u max_ddr_buffered_bytes=%" PRIu64
                           " submit_stall_count=%" PRIu64 " submit_stall_max_us=%" PRIu64
@@ -4929,7 +4892,7 @@ out:
                               ? producer_stats.dma_harvest_interval_total_us /
                                     producer_stats.dma_harvest_interval_count : 0u,
                           producer_stats.dma_harvest_interval_max_us);
-        storage_emit_line("storage_result_receive channel=%d task=%s file_index=%u"
+        storage_emit_line(STORAGE_LOG_SUMMARY, "storage_result_receive channel=%d task=%s file_index=%u"
                           " dma_received_bytes=%" PRIu64
                           " dma_bd_exhaustion_count=%" PRIu64
                           " dma_error_count=%" PRIu64 " descriptor_error_count=%" PRIu64
@@ -5865,7 +5828,7 @@ int execute_dma_rx_benchmark(const ParsedArgs *args, GlobalOptions gopt)
         if (snapshot.dma_writable == 0u) {
             ++exhaustion_count;
             integrity_ok = false;
-            storage_emit_line("dma_bd_exhausted channel=%d mode=benchmark received_bytes=%" PRIu64,
+            storage_emit_line(STORAGE_LOG_ALWAYS_CRITICAL, "dma_bd_exhausted channel=%d mode=benchmark received_bytes=%" PRIu64,
                               cfg->id, received_bytes);
             break;
         }
@@ -5880,7 +5843,7 @@ int execute_dma_rx_benchmark(const ParsedArgs *args, GlobalOptions gopt)
         now_us = storage_wall_time_us();
         if (h == 0) {
             if (now_us >= next_log_us) {
-                storage_emit_line("dma_rx_benchmark_snapshot channel=%d dma_received_bytes=%" PRIu64
+                storage_emit_line(STORAGE_LOG_DEBUG, "dma_rx_benchmark_snapshot channel=%d dma_received_bytes=%" PRIu64
                                   " dma_bd_writable=%u completed_unharvested=%u"
                                   " occupied_bytes_est=%" PRIu64 " curdesc=%u taildesc=%u"
                                   " s2mm_dmasr=0x%08x",
@@ -5906,7 +5869,7 @@ int execute_dma_rx_benchmark(const ParsedArgs *args, GlobalOptions gopt)
     {
         uint64_t observed_us = last_desc_us >= first_desc_us
                                    ? last_desc_us - first_desc_us : 0u;
-        storage_emit_line("dma_rx_benchmark_result channel=%d dma_received_bytes=%" PRIu64
+        storage_emit_line(STORAGE_LOG_SUMMARY, "dma_rx_benchmark_result channel=%d dma_received_bytes=%" PRIu64
                           " dma_observed_mib_s=%.3f min_dma_writable=%u"
                           " max_completed_unharvested=%u bd_exhaustion_count=%" PRIu64
                           " descriptor_error_count=%" PRIu64 " rxsof_count=%" PRIu64

@@ -1,6 +1,7 @@
 #include "ccb_hw.h"
 
 #include "debug_uart.h"
+#include "ccb_storage_log.h"
 
 #include <errno.h>
 #include <stdio.h>
@@ -4212,7 +4213,7 @@ static bool dma_stop_reset_safe(const ChannelRuntime *rt,
 
 static void dma_emit_quiesce_result(const ChannelRuntime *rt, const DmaStopReport *report)
 {
-    if (!rt || !report) return;
+    if (!rt || !report || !storage_log_severity_enabled(STORAGE_LOG_SUMMARY)) return;
     printf("storage_dma_quiesce_result channel=%d result=%d reason=%s"
            " CR=0x%08x SR=0x%08x CURDESC=0x%016" PRIx64
            " TAILDESC=0x%016" PRIx64
