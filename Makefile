@@ -82,3 +82,6 @@ storage-host-tests:
 	$(CC) $(CFLAGS) -Wformat=2 -ffunction-sections -fdata-sections -Iinclude \
 		tests/mock_dma_harvest_batch_test.c src/ccb_hw.c -Wl,--gc-sections -o /tmp/mock_dma_harvest_batch_test
 	/tmp/mock_dma_harvest_batch_test
+	$(CC) $(CFLAGS) -Wformat=2 -ffunction-sections -fdata-sections -Iinclude \
+		tests/mock_first_dma_timeout_test.c src/ccb_hw.c src/ccb_storage_pipeline.c -lpthread -Wl,--gc-sections -o /tmp/mock_first_dma_timeout_test
+	/tmp/mock_first_dma_timeout_test

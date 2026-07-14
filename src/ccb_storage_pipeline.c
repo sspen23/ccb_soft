@@ -77,6 +77,18 @@ int storage_run_state_mark_running(StorageRunState *state)
     return 0;
 }
 
+StorageFirstDmaDeadlineOutcome storage_first_dma_deadline_outcome(
+    bool deadline_due, bool saw_dma_data, bool stop_requested,
+    int harvest_rc, uint32_t harvest_count)
+{
+    if (harvest_rc != 0) return STORAGE_FIRST_DMA_DEADLINE_HARVEST_FAILED;
+    if (harvest_count != 0u || saw_dma_data)
+        return STORAGE_FIRST_DMA_DEADLINE_DATA;
+    if (deadline_due && !stop_requested)
+        return STORAGE_FIRST_DMA_DEADLINE_EXPIRED;
+    return STORAGE_FIRST_DMA_DEADLINE_WAIT;
+}
+
 static uint32_t *storage_count_for_state(StorageSlotCounts *c, StorageSlotState state)
 {
     switch (state) {

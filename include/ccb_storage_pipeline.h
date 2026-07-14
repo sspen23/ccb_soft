@@ -28,6 +28,16 @@ typedef struct {
     bool running_sent;
 } StorageRunState;
 
+/* The producer must decide a first-DMA deadline only after its normal
+ * harvest attempt.  Software slot counts can lag a completed hardware BD,
+ * so they are diagnostic data, not deadline evidence. */
+typedef enum {
+    STORAGE_FIRST_DMA_DEADLINE_WAIT = 0,
+    STORAGE_FIRST_DMA_DEADLINE_DATA,
+    STORAGE_FIRST_DMA_DEADLINE_HARVEST_FAILED,
+    STORAGE_FIRST_DMA_DEADLINE_EXPIRED
+} StorageFirstDmaDeadlineOutcome;
+
 typedef struct {
     uint32_t total;
     uint32_t dma_writable;
@@ -84,5 +94,8 @@ int storage_run_state_set_writer_ready(StorageRunState *state, bool success);
 int storage_run_state_set_producer_ready(StorageRunState *state, bool success);
 bool storage_run_state_can_emit_running(const StorageRunState *state);
 int storage_run_state_mark_running(StorageRunState *state);
+StorageFirstDmaDeadlineOutcome storage_first_dma_deadline_outcome(
+    bool deadline_due, bool saw_dma_data, bool stop_requested,
+    int harvest_rc, uint32_t harvest_count);
 
 #endif

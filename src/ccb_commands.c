@@ -3677,37 +3677,13 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                                      (harvest_batch_max_cfg > 16u ? 16u : harvest_batch_max_cfg);
             int harvest_rc;
             bool harvest_fatal;
+            bool first_dma_deadline_due;
             int h;
             bool stop_requested = storage_write_stop_requested() != 0 || storage_control_stop_requested();
 
-            if (first_dma_deadline_us != 0u && !saw_dma_data && !stop_requested &&
-                storage_wall_time_us() >= first_dma_deadline_us) {
-                DmaBdSnapshot first_snapshot;
-                memset(&first_snapshot, 0, sizeof(first_snapshot));
-                pthread_mutex_lock(&write_queue.lock);
-                (void)dma_get_bd_snapshot_o1(&rt, &write_queue.slot_counts, &first_snapshot);
-                pthread_mutex_unlock(&write_queue.lock);
-                /* A completed BD may already be visible while the producer
-                 * is between polling iterations.  It satisfies the first
-                 * data deadline even though it has not yet been queued; do
-                 * not turn that harmless scheduling edge into a false
-                 * fatal. */
-                if (first_snapshot.completed_unharvested == 0u) {
-                    storage_record_failure(&producer_stats, "first_dma_timeout");
-                    storage_emit_line("storage_first_dma_timeout channel=%d reason=first_dma_timeout"
-                                      " axis_source=%d cr=0x%08x sr=0x%08x curdesc=0x%08" PRIx64
-                                      " taildesc=0x%08" PRIx64
-                                      " hw_owned=%u completed_unharvested=%u",
-                                      cfg->id, (int)args->source, first_snapshot.s2mm_dmacr,
-                                      first_snapshot.s2mm_dmasr, first_snapshot.curdesc_addr,
-                                      first_snapshot.taildesc_addr,
-                                      (unsigned)__atomic_load_n(&rt.dma_hw_desc_count, __ATOMIC_ACQUIRE),
-                                      first_snapshot.completed_unharvested);
-                    (void)storage_emit_event(STORAGE_WORKER_FATAL, &rt, -1,
-                                              dma_received_bytes, "first_dma_timeout");
-                    goto out;
-                }
-            }
+            first_dma_deadline_due = first_dma_deadline_us != 0u &&
+                                     !saw_dma_data && !stop_requested &&
+                                     storage_wall_time_us() >= first_dma_deadline_us;
 
             if (bounded && stop_state.state == STORAGE_CAPTURE_ACCEPTING) {
                 harvest_limit = storage_harvest_limit_for_remaining(
@@ -3812,6 +3788,34 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                 goto out;
             }
             if (h == 0) {
+                if (storage_first_dma_deadline_outcome(first_dma_deadline_due,
+                                                       saw_dma_data, stop_requested,
+                                                       harvest_rc, harvest_count) ==
+                    STORAGE_FIRST_DMA_DEADLINE_EXPIRED) {
+                    DmaBdSnapshot first_snapshot;
+
+                    /* This O(1) snapshot is diagnostic only.  The normal
+                     * harvest above is the sole ownership-changing test for
+                     * a completed BD at the first-DMA deadline. */
+                    memset(&first_snapshot, 0, sizeof(first_snapshot));
+                    pthread_mutex_lock(&write_queue.lock);
+                    (void)dma_get_bd_snapshot_o1(&rt, &write_queue.slot_counts,
+                                                  &first_snapshot);
+                    pthread_mutex_unlock(&write_queue.lock);
+                    storage_record_failure(&producer_stats, "first_dma_timeout");
+                    storage_emit_line("storage_first_dma_timeout channel=%d reason=first_dma_timeout"
+                                      " axis_source=%d cr=0x%08x sr=0x%08x curdesc=0x%08" PRIx64
+                                      " taildesc=0x%08" PRIx64
+                                      " hw_owned=%u completed_unharvested=%u",
+                                      cfg->id, (int)args->source, first_snapshot.s2mm_dmacr,
+                                      first_snapshot.s2mm_dmasr, first_snapshot.curdesc_addr,
+                                      first_snapshot.taildesc_addr,
+                                      (unsigned)__atomic_load_n(&rt.dma_hw_desc_count, __ATOMIC_ACQUIRE),
+                                      first_snapshot.completed_unharvested);
+                    (void)storage_emit_event(STORAGE_WORKER_FATAL, &rt, -1,
+                                              dma_received_bytes, "first_dma_timeout");
+                    goto out;
+                }
                 if (stop_state.state == STORAGE_CAPTURE_HARVESTING_COMPLETED) {
                     dbg_printf("[DBG][WRITE] stopped DMA completed-BD harvest done"
                                " ch=%d captured=%" PRIu64 "\n",

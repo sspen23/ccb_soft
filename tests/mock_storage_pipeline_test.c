@@ -24,6 +24,15 @@ int main(void)
 
     storage_run_state_init(&run);
     assert(!storage_run_state_can_emit_running(&run));
+
+    assert(storage_first_dma_deadline_outcome(true, false, false, 0, 0u) ==
+           STORAGE_FIRST_DMA_DEADLINE_EXPIRED);
+    assert(storage_first_dma_deadline_outcome(true, false, false, -1, 0u) ==
+           STORAGE_FIRST_DMA_DEADLINE_HARVEST_FAILED);
+    assert(storage_first_dma_deadline_outcome(true, false, false, 0, 1u) ==
+           STORAGE_FIRST_DMA_DEADLINE_DATA);
+    assert(storage_first_dma_deadline_outcome(true, false, true, 0, 0u) ==
+           STORAGE_FIRST_DMA_DEADLINE_WAIT);
     assert(storage_run_state_enable_writer(&run) == 0);
     assert(!storage_run_state_can_emit_running(&run));
     assert(storage_run_state_set_writer_ready(&run, true) == 0);
