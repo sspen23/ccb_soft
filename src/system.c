@@ -2590,10 +2590,13 @@ typedef struct {
     uint64_t start_lba;
     uint64_t read_cmd_sectors;
     uint32_t proto_file_type;
+#ifdef CCB_BUILD_DIAG
     int verify_ddr_read;
     uint32_t verify_bytes;
+#endif
 } NetworkPipelineCtx;
 
+#ifdef CCB_BUILD_DIAG
 static void format_hex_prefix(const volatile uint8_t *data, uint32_t bytes, char *out, size_t out_len)
 {
     static const char hex[] = "0123456789ABCDEF";
@@ -2711,6 +2714,7 @@ static int network_verify_ddr_read_overwrite(NetworkPipelineCtx *ctx,
     fflush(stdout);
     return all_a5 ? -1 : 0;
 }
+#endif
 
 static void network_pipeline_set_error(NetworkPipelineCtx *ctx, int rc)
 {
@@ -2823,6 +2827,7 @@ static void *network_read_thread(void *arg)
                        network_ddr_hw);
         }
 
+#ifdef CCB_BUILD_DIAG
         if (ctx->verify_ddr_read && !ctx->gopt.dry_run) {
             uint64_t ddr_offset = network_ddr_hw - ctx->cfg->ddr_hw_base;
             uint32_t verify_bytes = ctx->verify_bytes ? ctx->verify_bytes : 4096u;
@@ -2842,6 +2847,7 @@ static void *network_read_thread(void *arg)
                 }
             }
         }
+#endif
 
         read_rc = nvme_rw(ctx->rt, false, cur_lba, read_sectors, network_ddr_hw);
         if (read_rc == -2) {
@@ -2859,6 +2865,7 @@ static void *network_read_thread(void *arg)
             network_pipeline_set_error(ctx, -1);
             return NULL;
         }
+#ifdef CCB_BUILD_DIAG
         if (network_verify_ddr_read_overwrite(ctx, slot, read_bytes) != 0) {
             fprintf(stderr,
                     "NVMe read did not overwrite DDR sentinel: task=%s file_index=%u chunk=%u lba=0x%08" PRIx64 "\n",
@@ -2869,6 +2876,7 @@ static void *network_read_thread(void *arg)
             network_pipeline_set_error(ctx, -1);
             return NULL;
         }
+#endif
 
         pthread_mutex_lock(&ctx->lock);
         slot->state = NETWORK_SLOT_READY;
@@ -3035,8 +3043,10 @@ static int network_send_serial(const ParsedArgs *args,
         uint64_t cmd_count = (read_sectors + read_cmd_sectors - 1u) / read_cmd_sectors;
         uint64_t cmd_last = cmd_first + (cmd_count ? cmd_count - 1u : 0u);
         uint64_t network_ddr_hw = cfg->ddr_hw_base + NETWORK_DDR_OFFSET_BYTES;
+#ifdef CCB_BUILD_DIAG
         NetworkPipelineCtx verify_ctx;
         NetworkPipelineSlot verify_slot;
+#endif
         TcpTransferConfig tcp_cfg;
         uint64_t chunk_start_us = system_wall_time_us();
         int read_rc;
@@ -3109,6 +3119,7 @@ static int network_send_serial(const ParsedArgs *args,
                        network_ddr_hw);
         }
 
+#ifdef CCB_BUILD_DIAG
         memset(&verify_ctx, 0, sizeof(verify_ctx));
         memset(&verify_slot, 0, sizeof(verify_slot));
         verify_ctx.task_no = args->task_no;
@@ -3145,6 +3156,7 @@ static int network_send_serial(const ParsedArgs *args,
                 }
             }
         }
+#endif
 
         read_rc = nvme_rw(rt, false, cur_lba, read_sectors, network_ddr_hw);
         if (read_rc == -2) {
@@ -3162,6 +3174,7 @@ static int network_send_serial(const ParsedArgs *args,
             rc = -1;
             break;
         }
+#ifdef CCB_BUILD_DIAG
         if (network_verify_ddr_read_overwrite(&verify_ctx, &verify_slot, read_bytes) != 0) {
             fprintf(stderr,
                     "NVMe read did not overwrite DDR sentinel: task=%s file_index=%u chunk=%u lba=0x%08" PRIx64 "\n",
@@ -3172,6 +3185,7 @@ static int network_send_serial(const ParsedArgs *args,
             rc = -1;
             break;
         }
+#endif
 
         tcp_transfer_default_config(&tcp_cfg, send_bytes, gopt);
         if (configure_tcp_for_channel(cfg, &tcp_cfg) != 0) {
@@ -3458,11 +3472,13 @@ static int network_send_existing_file(const ParsedArgs *args, GlobalOptions gopt
         pipe_ctx.start_lba = cur_lba;
         pipe_ctx.read_cmd_sectors = rt.nvme_cmd_sectors ? rt.nvme_cmd_sectors : 512u;
         pipe_ctx.proto_file_type = (uint32_t)rec.proto_file_type_code;
+#ifdef CCB_BUILD_DIAG
         pipe_ctx.verify_ddr_read = env_flag_enabled("SRC_REAL_NETWORK_VERIFY_DDR_READ");
         pipe_ctx.verify_bytes = env_u32_or_default("SRC_REAL_NETWORK_VERIFY_BYTES", 4096u);
         if (pipe_ctx.verify_bytes == 0u) {
             pipe_ctx.verify_bytes = 4096u;
         }
+#endif
 
         dbg_printf("[DBG][NET] pipeline start task=%s idx=%u chunks=%u slots=%u\n",
                    args->task_no,
@@ -4704,6 +4720,7 @@ static int run_network_worker_main(int argc, char **argv)
     return (rc == 0 || rc == -2) ? 0 : 1;
 }
 
+#ifdef CCB_BUILD_DIAG
 static int run_ddr_pattern_store_main(int argc, char **argv)
 {
     GlobalOptions gopt;
@@ -4874,15 +4891,20 @@ static int run_dma_rx_benchmark_main(int argc, char **argv)
     }
     return execute_dma_rx_benchmark(&args, gopt) == 0 ? 0 : 1;
 }
+#endif
 
 int main(int argc, char **argv)
 {
+#ifndef CCB_BUILD_DIAG
     uint8_t byte;
     const char *serial_dev;
+#endif
 
     if (storage_config_load_global() != 0) return 2;
+#ifndef CCB_BUILD_DIAG
     capture_task_init(&g_capture_task);
     serial_dev = get_serial_device_path();
+#endif
     g_program_path = (argc > 0 && argv[0]) ? argv[0] : "./src_real_app";
     (void)debug_uart_init();
     if (argc > 1) {
@@ -4891,6 +4913,7 @@ int main(int argc, char **argv)
         dbg_printf("[DBG][MAIN] process start argc=%d program=%s\n", argc, g_program_path);
     }
 
+#ifndef CCB_BUILD_DIAG
     if (argc > 1 && strcmp(argv[1], STORAGE_WORKER_ARG) == 0) {
         dbg_verbose_printf("[DBG][MAIN] entering storage worker mode\n");
         return run_storage_worker_main(argc - 1, argv + 1, true);
@@ -4899,6 +4922,7 @@ int main(int argc, char **argv)
         dbg_printf("[DBG][MAIN] entering standalone storage-write mode\n");
         return run_storage_worker_main(argc, argv, false);
     }
+#else
     if (argc > 1 && strcmp(argv[1], DDR_PATTERN_STORE_ARG) == 0) {
         dbg_printf("[DBG][MAIN] entering ddr-pattern-store mode\n");
         return run_ddr_pattern_store_main(argc, argv);
@@ -4914,6 +4938,12 @@ int main(int argc, char **argv)
     if (argc > 1 && strcmp(argv[1], DMA_RX_BENCHMARK_ARG) == 0) {
         return run_dma_rx_benchmark_main(argc, argv);
     }
+    if (argc > 1 && strcmp(argv[1], NETWORK_SEND_ARG) == 0) {
+        dbg_printf("[DBG][MAIN] entering diagnostic network-send mode\n");
+        return run_network_worker_main(argc, argv);
+    }
+#endif
+#ifndef CCB_BUILD_DIAG
     if (argc > 1 && strcmp(argv[1], NETWORK_WORKER_ARG) == 0) {
         dbg_verbose_printf("[DBG][MAIN] entering network worker mode\n");
         return run_network_worker_main(argc - 1, argv + 1);
@@ -4922,7 +4952,15 @@ int main(int argc, char **argv)
         dbg_printf("[DBG][MAIN] entering standalone network-send mode\n");
         return run_network_worker_main(argc, argv);
     }
+#else
+    fprintf(stderr,
+            "ccb_diag requires one of: ddr-pattern-store, ssd-lba-wrap-test, "
+            "ssd-continuous-pattern-test, dma-rx-benchmark, network-send\n");
+    usage();
+    return 2;
+#endif
 
+#ifndef CCB_BUILD_DIAG
     (void)signal(SIGPIPE, SIG_IGN);
     setenv("CCB_PROCESS_META_DIR", get_storage_meta_dir(), 0);
 
@@ -5050,4 +5088,5 @@ int main(int argc, char **argv)
     logger_close();
     debug_uart_close();
     return 0;
+#endif
 }

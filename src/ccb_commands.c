@@ -5850,6 +5850,7 @@ int execute_write(const ParsedArgs *args, GlobalOptions gopt) {
     return execute_write_with_result(args, gopt, NULL);
 }
 
+#ifdef CCB_BUILD_DIAG
 static void fill_dual16_increment_pattern(volatile uint8_t *base, uint64_t bytes)
 {
     uint64_t words = bytes / sizeof(uint32_t);
@@ -6812,6 +6813,7 @@ out:
     channel_runtime_close(&rt);
     return rc;
 }
+#endif
 
 int execute_read(const ParsedArgs *args, GlobalOptions gopt) {
     const ChannelConfig *cfg = find_channel(args->channel_id);

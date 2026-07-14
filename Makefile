@@ -12,6 +12,7 @@ endif
 endif
 
 TARGET := src_real_app
+DIAG_TARGET := ccb_diag
 STORAGE_CONFIG_SRC := src/storage_config.c
 STORAGE_ERROR_SRC := src/storage_error.c
 STORAGE_WORKER_SRC := src/storage_worker.c
@@ -52,15 +53,21 @@ SRCS := \
 	src/ccb_commands.c \
 	src/ccb_tcp_transfer.c
 
-.PHONY: all clean mock-bd-test storage-host-tests
+.PHONY: all diag clean mock-bd-test storage-host-tests
 
 all: $(TARGET)
 
 $(TARGET): $(SRCS)
 	$(CC) $(CFLAGS) -Iinclude -o $@ $(SRCS) $(LDFLAGS) $(LDLIBS)
 
+diag: $(DIAG_TARGET)
+
+$(DIAG_TARGET): $(SRCS)
+	$(CC) $(CFLAGS) -DCCB_BUILD_DIAG -ffunction-sections -fdata-sections -Iinclude \
+		-o $@ $(SRCS) $(LDFLAGS) -Wl,--gc-sections $(LDLIBS)
+
 clean:
-	rm -f $(TARGET) $(TARGET).exe
+	rm -f $(TARGET) $(TARGET).exe $(DIAG_TARGET) $(DIAG_TARGET).exe
 
 mock-bd-test:
 	$(CC) $(CFLAGS) -Wformat=2 -ffunction-sections -fdata-sections -Iinclude \
