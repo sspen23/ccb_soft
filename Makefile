@@ -50,6 +50,9 @@ mock-bd-test:
 	/tmp/mock_bd_ring_test
 
 storage-host-tests:
+	$(CC) $(CFLAGS) -Wformat=2 -Iinclude tests/mock_protocol_golden_test.c \
+		src/serial_proto.c src/debug_uart.c -o /tmp/mock_protocol_golden_test
+	/tmp/mock_protocol_golden_test
 	$(CC) $(CFLAGS) -Wformat=2 -Iinclude tests/mock_storage_commit_test.c \
 		src/ccb_storage_commit.c -o /tmp/mock_storage_commit_test
 	/tmp/mock_storage_commit_test

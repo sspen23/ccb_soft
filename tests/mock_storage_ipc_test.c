@@ -64,10 +64,16 @@ int main(void)
            eo.stop_epoch == 1234u && eo.stop_phase == STORAGE_WORKER_STOP_REQUESTED);
     assert(strcmp(storage_ipc_stop_phase_name(STORAGE_WORKER_FINALIZED),
                   "finalized") == 0);
+    e.size--;
+    assert(storage_ipc_write_event(p[1], &e) != 0);
+    e.size = sizeof(e);
     e.version++; assert(storage_ipc_write_event(p[1], &e) != 0);
     assert(write(p[1], &e, sizeof(e)) == (ssize_t)sizeof(e));
     assert(storage_ipc_read_event_raw(p[0], &eo) == 0);
     assert(!storage_ipc_validate_event(&eo));
+    storage_ipc_make_control(&c, STORAGE_CTRL_STOP, 3u);
+    c.size--;
+    assert(storage_ipc_write_control(p[1], &c) != 0);
     close(p[1]); assert(storage_ipc_read_control(p[0], &out) == 1); close(p[0]);
     assert(pipe(p) == 0);
     storage_ipc_make_event(&e, STORAGE_WORKER_READY, 0u, 0, 0u, "partial");

@@ -156,5 +156,18 @@ int main(void)
     assert(storage_queue_push_batch(&p, a, 1u) != 0);
     assert(p.count == 1u);
     storage_pipeline_destroy(&p);
+
+    assert(storage_pipeline_init(&p, 1u) == 0);
+    assert(storage_pipeline_mark_completed(&p, 0u) == 0);
+    assert(storage_pipeline_mark_completed(&p, 0u) != 0);
+    storage_pipeline_destroy(&p);
+
+    assert(storage_pipeline_init(&p, 1u) == 0);
+    assert(storage_pipeline_mark_completed(&p, 0u) == 0);
+    assert(storage_queue_push_batch(&p, a, 1u) == 0);
+    assert(storage_pipeline_pop(&p, &out, 0) == 0);
+    assert(storage_pipeline_complete(&p, 0u, 1) == 0);
+    assert(storage_pipeline_complete(&p, 0u, 1) != 0);
+    storage_pipeline_destroy(&p);
     puts("mock_storage_pipeline_test: ok"); return 0;
 }
