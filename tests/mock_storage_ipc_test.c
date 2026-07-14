@@ -1,15 +1,48 @@
 #include <assert.h>
 #include <fcntl.h>
+#include <errno.h>
+#include <limits.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <string.h>
+#include <sys/time.h>
 #include <unistd.h>
 #include "ccb_storage_ipc.h"
+
+static volatile sig_atomic_t ipc_alarm_count;
+
+static void ipc_alarm_handler(int signal_number)
+{
+    (void)signal_number;
+    ++ipc_alarm_count;
+}
 
 int main(void)
 {
     int p[2]; StorageControlMessage c, out; StorageWorkerEvent e, eo; _Atomic uint64_t dropped = 0u, dropped_diag = 0u;
+    {
+        int timeout_ms = 0;
+
+        errno = 0;
+        assert(storage_ipc_deadline_remaining_ms(100u, 100u, &timeout_ms) != 0);
+        assert(errno == ETIMEDOUT);
+        errno = 0;
+        assert(storage_ipc_deadline_remaining_ms(100u, 101u, &timeout_ms) != 0);
+        assert(errno == ETIMEDOUT);
+        assert(storage_ipc_deadline_remaining_ms(101u, 100u, &timeout_ms) == 0 &&
+               timeout_ms == 1);
+        assert(storage_ipc_deadline_remaining_ms(1099u, 100u, &timeout_ms) == 0 &&
+               timeout_ms == 1);
+        assert(storage_ipc_deadline_remaining_ms(1100u, 100u, &timeout_ms) == 0 &&
+               timeout_ms == 1);
+        assert(storage_ipc_deadline_remaining_ms(UINT64_MAX, 0u, &timeout_ms) == 0 &&
+               timeout_ms == INT_MAX);
+        assert(storage_ipc_deadline_remaining_ms(UINT64_MAX, UINT64_MAX - 1u,
+                                                  &timeout_ms) == 0 && timeout_ms == 1);
+    }
     assert(pipe(p) == 0);
     storage_ipc_make_control(&c, STORAGE_CTRL_ARM, 1u);
     assert(storage_ipc_write_control(p[1], &c) == 0);
@@ -38,6 +71,37 @@ int main(void)
     storage_ipc_make_event(&e, STORAGE_WORKER_DIAG_EVENT, 0u, 0, 0u, "diag");
     assert(storage_ipc_try_write_diag(p[1], &e, &dropped_diag) == 1);
     assert(atomic_load(&dropped_diag) == 1u);
+    close(p[0]); close(p[1]);
+    /* EINTR must return to the deadline loop, resample now_us, and finally
+     * report ETIMEDOUT rather than retaining a stale poll timeout. */
+    assert(pipe(p) == 0);
+    assert(fcntl(p[0], F_SETFL, fcntl(p[0], F_GETFL, 0) | O_NONBLOCK) == 0);
+    {
+        StorageControlReader reader;
+        struct sigaction action;
+        struct sigaction old_action;
+        struct itimerval timer;
+        int rc;
+        int saved_errno;
+
+        memset(&action, 0, sizeof(action));
+        action.sa_handler = ipc_alarm_handler;
+        sigemptyset(&action.sa_mask);
+        assert(sigaction(SIGALRM, &action, &old_action) == 0);
+        memset(&timer, 0, sizeof(timer));
+        timer.it_value.tv_usec = 1000;
+        timer.it_interval.tv_usec = 1000;
+        ipc_alarm_count = 0;
+        storage_ipc_control_reader_init(&reader);
+        assert(setitimer(ITIMER_REAL, &timer, NULL) == 0);
+        rc = storage_ipc_read_control_deadline(p[0], &reader, &out,
+                                               storage_ipc_monotonic_us() + 10000u);
+        saved_errno = errno;
+        memset(&timer, 0, sizeof(timer));
+        assert(setitimer(ITIMER_REAL, &timer, NULL) == 0);
+        assert(sigaction(SIGALRM, &old_action, NULL) == 0);
+        assert(rc != 0 && saved_errno == ETIMEDOUT && ipc_alarm_count > 0);
+    }
     close(p[0]); close(p[1]);
     /* ARM/RUN reader preserves a partial nonblocking control frame across a
      * deadline instead of losing the consumed prefix. */

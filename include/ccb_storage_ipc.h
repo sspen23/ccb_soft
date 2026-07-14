@@ -97,6 +97,10 @@ _Static_assert(sizeof(StorageControlMessage) <= 4096u, "control must fit PIPE_BU
 _Static_assert(sizeof(StorageWorkerEvent) <= 4096u, "event must fit PIPE_BUF");
 
 uint64_t storage_ipc_monotonic_us(void);
+/* Convert one absolute monotonic deadline using the caller's single sampled
+ * now_us.  Returns -1/ETIMEDOUT once the deadline has passed. */
+int storage_ipc_deadline_remaining_ms(uint64_t deadline_us, uint64_t now_us,
+                                      int *timeout_ms);
 uint64_t storage_ipc_saturating_add_u64(uint64_t a, uint64_t b);
 void storage_ipc_parent_stop_timeout_config(StorageParentStopTimeoutConfig *out,
                                             uint64_t worker_compat_default_us);

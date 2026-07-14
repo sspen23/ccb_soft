@@ -16,6 +16,27 @@ uint64_t storage_ipc_monotonic_us(void)
     return (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)ts.tv_nsec / 1000ull;
 }
 
+int storage_ipc_deadline_remaining_ms(uint64_t deadline_us, uint64_t now_us,
+                                      int *timeout_ms)
+{
+    uint64_t remaining_us;
+    uint64_t remaining_ms;
+
+    if (!timeout_ms) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (now_us >= deadline_us) {
+        errno = ETIMEDOUT;
+        return -1;
+    }
+    remaining_us = deadline_us - now_us;
+    remaining_ms = remaining_us / 1000u;
+    if ((remaining_us % 1000u) != 0u) ++remaining_ms;
+    *timeout_ms = remaining_ms > (uint64_t)INT_MAX ? INT_MAX : (int)remaining_ms;
+    return 0;
+}
+
 uint64_t storage_ipc_saturating_add_u64(uint64_t a, uint64_t b)
 {
     return a > UINT64_MAX - b ? UINT64_MAX : a + b;
@@ -196,9 +217,22 @@ int storage_ipc_write_control_deadline(int fd, const StorageControlMessage *msg,
         if (n >= 0) { errno = EIO; return -1; }
         if (errno == EINTR) continue;
         if (errno != EAGAIN && errno != EWOULDBLOCK) return -1;
-        if (storage_ipc_monotonic_us() >= deadline_us) { errno = ETIMEDOUT; return -1; }
-        pfd.fd = fd; pfd.events = POLLOUT; pfd.revents = 0;
-        if (poll(&pfd, 1u, 1) < 0 && errno != EINTR) return -1;
+        {
+            uint64_t now_us = storage_ipc_monotonic_us();
+            int timeout_ms;
+            int rc;
+
+            if (storage_ipc_deadline_remaining_ms(deadline_us, now_us,
+                                                  &timeout_ms) != 0)
+                return -1;
+            pfd.fd = fd;
+            pfd.events = POLLOUT;
+            pfd.revents = 0;
+            rc = poll(&pfd, 1u, timeout_ms);
+            if (rc > 0) continue;
+            if (rc == 0) { errno = ETIMEDOUT; return -1; }
+            if (errno != EINTR) return -1;
+        }
     }
 }
 int storage_ipc_read_control(int fd, StorageControlMessage *msg)
@@ -230,14 +264,18 @@ int storage_ipc_read_control_deadline(int fd, StorageControlReader *reader,
         }
         if (errno == EINTR) continue;
         if (errno != EAGAIN && errno != EWOULDBLOCK) return -1;
-        if (storage_ipc_monotonic_us() >= deadline_us) { errno = ETIMEDOUT; return -1; }
         pfd.fd = fd;
         pfd.events = POLLIN | POLLHUP;
         pfd.revents = 0;
         {
-            uint64_t remaining = deadline_us - storage_ipc_monotonic_us();
-            int timeout_ms = (int)((remaining + 999u) / 1000u);
-            int rc = poll(&pfd, 1u, timeout_ms);
+            uint64_t now_us = storage_ipc_monotonic_us();
+            int timeout_ms;
+            int rc;
+
+            if (storage_ipc_deadline_remaining_ms(deadline_us, now_us,
+                                                  &timeout_ms) != 0)
+                return -1;
+            rc = poll(&pfd, 1u, timeout_ms);
             if (rc > 0) continue;
             if (rc == 0) { errno = ETIMEDOUT; return -1; }
             if (errno != EINTR) return -1;
@@ -307,16 +345,12 @@ int storage_ipc_write_event_deadline(int fd, const StorageWorkerEvent *event,
         if (errno != EAGAIN && errno != EWOULDBLOCK) return -1;
         {
             uint64_t now_us = storage_ipc_monotonic_us();
-            uint64_t remaining_us;
             int timeout_ms;
             int rc;
 
-            if (now_us >= deadline_us) {
-                errno = ETIMEDOUT;
+            if (storage_ipc_deadline_remaining_ms(deadline_us, now_us,
+                                                  &timeout_ms) != 0)
                 return -1;
-            }
-            remaining_us = deadline_us - now_us;
-            timeout_ms = (int)((remaining_us + 999u) / 1000u);
             pfd.fd = fd;
             pfd.events = POLLOUT;
             pfd.revents = 0;
