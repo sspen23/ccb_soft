@@ -15,6 +15,7 @@ TARGET := src_real_app
 STORAGE_CONFIG_SRC := src/storage_config.c
 STORAGE_ERROR_SRC := src/storage_error.c
 STORAGE_WORKER_SRC := src/storage_worker.c
+STORAGE_QUEUE_SRC := src/storage_queue.c
 
 SRCS := \
 	src/system.c \
@@ -36,6 +37,7 @@ SRCS := \
 	src/ccb_storage_sync_outbox.c \
 	src/storage_config.c \
 	src/storage_error.c \
+	src/storage_queue.c \
 	src/storage_worker.c \
 	src/ccb_commands.c \
 	src/ccb_tcp_transfer.c
@@ -56,6 +58,9 @@ mock-bd-test:
 	/tmp/mock_bd_ring_test
 
 storage-host-tests:
+	$(CC) $(CFLAGS) -Wformat=2 -Iinclude tests/mock_storage_queue_test.c \
+		$(STORAGE_QUEUE_SRC) -o /tmp/mock_storage_queue_test
+	/tmp/mock_storage_queue_test
 	$(CC) $(CFLAGS) -Wformat=2 -Iinclude tests/mock_storage_worker_state_test.c \
 		$(STORAGE_WORKER_SRC) -o /tmp/mock_storage_worker_state_test
 	/tmp/mock_storage_worker_state_test
@@ -75,10 +80,10 @@ storage-host-tests:
 		src/ccb_storage_ipc.c $(STORAGE_CONFIG_SRC) $(STORAGE_ERROR_SRC) -o /tmp/mock_storage_ipc_test
 	/tmp/mock_storage_ipc_test
 	$(CC) $(CFLAGS) -Wformat=2 -Iinclude tests/mock_storage_pipeline_test.c \
-		src/ccb_storage_pipeline.c -lpthread -o /tmp/mock_storage_pipeline_test
+		src/ccb_storage_pipeline.c $(STORAGE_QUEUE_SRC) -lpthread -o /tmp/mock_storage_pipeline_test
 	/tmp/mock_storage_pipeline_test
 	$(CC) $(CFLAGS) -Wformat=2 -Iinclude tests/mock_storage_stop_lifecycle_test.c \
-		src/ccb_storage_pipeline.c -lpthread -o /tmp/mock_storage_stop_lifecycle_test
+		src/ccb_storage_pipeline.c $(STORAGE_QUEUE_SRC) -lpthread -o /tmp/mock_storage_stop_lifecycle_test
 	/tmp/mock_storage_stop_lifecycle_test
 	$(CC) $(CFLAGS) -Wformat=2 -Iinclude tests/mock_storage_diag_test.c \
 		src/ccb_storage_diag.c -latomic -o /tmp/mock_storage_diag_test
@@ -99,14 +104,14 @@ storage-host-tests:
 		src/ccb_storage_sync_outbox.c -o /tmp/mock_storage_sync_outbox_test
 	/tmp/mock_storage_sync_outbox_test
 	$(CC) $(CFLAGS) -Wformat=2 -Wno-unused-function -Wno-stringop-truncation -ffunction-sections -fdata-sections -Iinclude \
-		tests/mock_storage_config_test.c src/ccb_commands.c $(STORAGE_CONFIG_SRC) $(STORAGE_ERROR_SRC) $(STORAGE_WORKER_SRC) -Wl,--gc-sections -o /tmp/mock_storage_config_test
+		tests/mock_storage_config_test.c src/ccb_commands.c $(STORAGE_CONFIG_SRC) $(STORAGE_ERROR_SRC) $(STORAGE_WORKER_SRC) $(STORAGE_QUEUE_SRC) -Wl,--gc-sections -o /tmp/mock_storage_config_test
 	/tmp/mock_storage_config_test
 	$(CC) $(CFLAGS) -Wformat=2 -ffunction-sections -fdata-sections -Iinclude \
 		tests/mock_nvme_cross_slot_test.c src/ccb_hw.c src/debug_uart.c $(STORAGE_CONFIG_SRC) $(STORAGE_ERROR_SRC) -Wl,--gc-sections -o /tmp/mock_nvme_cross_slot_test
 	/tmp/mock_nvme_cross_slot_test
 	$(CC) $(CFLAGS) -Wformat=2 -Wno-unused-function -Wno-stringop-truncation \
 		-ffunction-sections -fdata-sections -Iinclude tests/mock_cross_slot_writer_lifecycle_test.c \
-		src/ccb_commands.c src/ccb_hw.c src/debug_uart.c $(STORAGE_CONFIG_SRC) $(STORAGE_ERROR_SRC) $(STORAGE_WORKER_SRC) -Wl,--gc-sections -o /tmp/mock_cross_slot_writer_lifecycle_test
+		src/ccb_commands.c src/ccb_hw.c src/debug_uart.c $(STORAGE_CONFIG_SRC) $(STORAGE_ERROR_SRC) $(STORAGE_WORKER_SRC) $(STORAGE_QUEUE_SRC) -Wl,--gc-sections -o /tmp/mock_cross_slot_writer_lifecycle_test
 	/tmp/mock_cross_slot_writer_lifecycle_test
 	$(CC) $(CFLAGS) -Wformat=2 -ffunction-sections -fdata-sections -Iinclude \
 		tests/mock_nvme_legacy_submit_test.c src/ccb_hw.c src/debug_uart.c $(STORAGE_CONFIG_SRC) $(STORAGE_ERROR_SRC) -lpthread -Wl,--gc-sections -o /tmp/mock_nvme_legacy_submit_test
@@ -115,5 +120,5 @@ storage-host-tests:
 		tests/mock_dma_harvest_batch_test.c src/ccb_hw.c $(STORAGE_CONFIG_SRC) -Wl,--gc-sections -o /tmp/mock_dma_harvest_batch_test
 	/tmp/mock_dma_harvest_batch_test
 	$(CC) $(CFLAGS) -Wformat=2 -ffunction-sections -fdata-sections -Iinclude \
-		tests/mock_first_dma_timeout_test.c src/ccb_hw.c src/ccb_storage_pipeline.c $(STORAGE_CONFIG_SRC) -lpthread -Wl,--gc-sections -o /tmp/mock_first_dma_timeout_test
+		tests/mock_first_dma_timeout_test.c src/ccb_hw.c src/ccb_storage_pipeline.c $(STORAGE_CONFIG_SRC) $(STORAGE_QUEUE_SRC) -lpthread -Wl,--gc-sections -o /tmp/mock_first_dma_timeout_test
 	/tmp/mock_first_dma_timeout_test

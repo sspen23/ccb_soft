@@ -50,16 +50,17 @@ static void test_unaligned_tail_does_not_abort_full_prefix(void)
     assert(storage_stop_tail_disposition(true, false, 419692512u,
                                          419692544u, false) ==
            STORAGE_STOP_TAIL_DEFER_UNALIGNED);
-    assert(storage_slot_transition_locked(
-               &pipeline, 1u, STORAGE_SLOT_DMA_COMPLETED_UNHARVESTED,
-               STORAGE_SLOT_FREE) == 0);
+    assert(storage_slot_transition(&pipeline.slots, 1u,
+                                   STORAGE_SLOT_DMA_COMPLETED_UNHARVESTED,
+                                   STORAGE_SLOT_FREE) == 0);
     assert(!pipeline.error && !producer_done && pipeline.count == 1u);
     assert(storage_pipeline_pop(&pipeline, &out, 0) == 0 && out.slot == 0u);
     assert(storage_pipeline_complete(&pipeline, 0u, 0) == 0);
     producer_done = true;
     assert(producer_done && pipeline.count == 0u &&
-           pipeline.counts.completed_unharvested == 0u &&
-           pipeline.counts.ready == 0u && pipeline.counts.nvme_busy == 0u &&
+           pipeline.slots.counts.completed_unharvested == 0u &&
+           pipeline.slots.counts.ready == 0u &&
+           pipeline.slots.counts.nvme_busy == 0u &&
            storage_pipeline_counts_valid(&pipeline));
     storage_pipeline_destroy(&pipeline);
 }

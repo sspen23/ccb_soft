@@ -158,34 +158,11 @@ StorageFirstDmaDeadlineOutcome storage_first_dma_deadline_outcome(
     return STORAGE_FIRST_DMA_DEADLINE_WAIT;
 }
 
-static uint32_t *storage_count_for_state(StorageSlotCounts *c, StorageSlotState state)
-{
-    switch (state) {
-    case STORAGE_SLOT_DMA_WRITABLE: return &c->dma_writable;
-    case STORAGE_SLOT_DMA_COMPLETED_UNHARVESTED: return &c->completed_unharvested;
-    case STORAGE_SLOT_READY_FOR_NVME: return &c->ready;
-    case STORAGE_SLOT_NVME_BUSY: return &c->nvme_busy;
-    case STORAGE_SLOT_REQUEUE_PENDING: return &c->requeue_pending;
-    case STORAGE_SLOT_FREE: return &c->free_count;
-    default: return NULL;
-    }
-}
-
 int storage_pipeline_counts_valid(const StoragePipeline *p)
 {
-    const StorageSlotCounts *c;
-    uint64_t sum;
     if (!p) return 0;
-    c = &p->counts;
-    sum = (uint64_t)c->dma_writable + c->completed_unharvested + c->ready +
-          c->nvme_busy + c->requeue_pending + c->free_count;
-    return p->count <= p->capacity &&
-           c->dma_writable <= c->total &&
-           c->completed_unharvested <= c->total &&
-           c->ready <= c->total && c->nvme_busy <= c->total &&
-           c->requeue_pending <= c->total && c->free_count <= c->total &&
-           c->total == p->capacity &&
-           (uint64_t)c->total == sum;
+    return p->count <= p->slots.capacity &&
+           storage_slot_table_valid(&p->slots);
 }
 
 uint32_t storage_harvest_limit_for_remaining(uint64_t remaining_bytes,
@@ -204,14 +181,14 @@ int storage_pipeline_init(StoragePipeline *p, uint32_t slots)
     if (!p || slots == 0u) return -1;
     memset(p, 0, sizeof(*p));
     p->items = calloc(slots, sizeof(*p->items));
-    p->states = calloc(slots, sizeof(*p->states));
-    if (!p->items || !p->states || pthread_mutex_init(&p->lock, NULL) != 0 ||
+    if (!p->items || storage_slot_table_init(&p->slots, slots) != 0 ||
+        pthread_mutex_init(&p->lock, NULL) != 0 ||
         pthread_cond_init(&p->not_empty, NULL) != 0) {
-        free(p->items); free(p->states); memset(p, 0, sizeof(*p)); return -1;
+        free(p->items);
+        storage_slot_table_destroy(&p->slots);
+        memset(p, 0, sizeof(*p));
+        return -1;
     }
-    p->capacity = slots;
-    p->counts.total = slots;
-    p->counts.dma_writable = slots;
     return 0;
 }
 
@@ -220,24 +197,9 @@ void storage_pipeline_destroy(StoragePipeline *p)
     if (!p) return;
     (void)pthread_cond_destroy(&p->not_empty);
     (void)pthread_mutex_destroy(&p->lock);
-    free(p->items); free(p->states); memset(p, 0, sizeof(*p));
-}
-
-int storage_slot_transition_locked(StoragePipeline *p, uint32_t slot,
-                                   StorageSlotState expected, StorageSlotState next)
-{
-    uint32_t *old_count;
-    uint32_t *new_count;
-    if (!p || slot >= p->capacity || p->states[slot] != expected || !storage_pipeline_counts_valid(p)) {
-        if (p) p->error = 1;
-        return -1;
-    }
-    old_count = storage_count_for_state(&p->counts, expected);
-    new_count = storage_count_for_state(&p->counts, next);
-    if (!old_count || !new_count || *old_count == 0u) { p->error = 1; return -1; }
-    --*old_count; ++*new_count; p->states[slot] = next;
-    if (!storage_pipeline_counts_valid(p)) { p->error = 1; return -1; }
-    return 0;
+    free(p->items);
+    storage_slot_table_destroy(&p->slots);
+    memset(p, 0, sizeof(*p));
 }
 
 int storage_pipeline_mark_completed(StoragePipeline *p, uint32_t slot)
@@ -245,8 +207,9 @@ int storage_pipeline_mark_completed(StoragePipeline *p, uint32_t slot)
     int rc;
     if (!p) return -1;
     pthread_mutex_lock(&p->lock);
-    rc = storage_slot_transition_locked(p, slot, STORAGE_SLOT_DMA_WRITABLE,
-                                        STORAGE_SLOT_DMA_COMPLETED_UNHARVESTED);
+    rc = storage_slot_transition(&p->slots, slot, STORAGE_SLOT_DMA_WRITABLE,
+                                 STORAGE_SLOT_DMA_COMPLETED_UNHARVESTED);
+    if (rc != 0) p->error = 1;
     pthread_mutex_unlock(&p->lock);
     return rc;
 }
@@ -257,13 +220,15 @@ int storage_queue_push_batch(StoragePipeline *p, const StoragePipelineItem *item
     uint32_t i, j, tail;
     if (!p || !items || item_count == 0u) return -1;
     pthread_mutex_lock(&p->lock);
-    if (p->error || p->count > p->capacity || !storage_pipeline_counts_valid(p) ||
-        item_count > p->capacity - p->count || item_count > p->counts.completed_unharvested) goto bad;
+    if (p->error || p->count > p->slots.capacity || !storage_pipeline_counts_valid(p) ||
+        item_count > p->slots.capacity - p->count ||
+        item_count > p->slots.counts.completed_unharvested) goto bad;
     for (i = 0u; i < item_count; ++i) {
         uint64_t expected_sectors;
         if (items[i].bytes == 0u || items[i].sectors == 0u ||
-            items[i].slot >= p->capacity ||
-            p->states[items[i].slot] != STORAGE_SLOT_DMA_COMPLETED_UNHARVESTED)
+            items[i].slot >= p->slots.capacity ||
+            storage_slot_state(&p->slots, items[i].slot) !=
+                STORAGE_SLOT_DMA_COMPLETED_UNHARVESTED)
             goto bad;
         expected_sectors = items[i].bytes / 512u;
         if ((items[i].bytes % 512u) != 0u) ++expected_sectors;
@@ -274,13 +239,14 @@ int storage_queue_push_batch(StoragePipeline *p, const StoragePipelineItem *item
     tail = p->tail;
     for (i = 0u; i < item_count; ++i) {
         p->items[tail] = items[i];
-        tail = (tail + 1u) % p->capacity;
-        p->states[items[i].slot] = STORAGE_SLOT_READY_FOR_NVME;
+        tail = (tail + 1u) % p->slots.capacity;
+        if (storage_slot_transition(&p->slots, items[i].slot,
+                                    STORAGE_SLOT_DMA_COMPLETED_UNHARVESTED,
+                                    STORAGE_SLOT_READY_FOR_NVME) != 0)
+            goto bad;
     }
     p->tail = tail;
     p->count += item_count;
-    p->counts.completed_unharvested -= item_count;
-    p->counts.ready += item_count;
     pthread_cond_signal(&p->not_empty);
     pthread_mutex_unlock(&p->lock);
     return 0;
@@ -300,9 +266,15 @@ int storage_pipeline_pop(StoragePipeline *p, StoragePipelineItem *out, int wait)
     if (p->error) rc = -1;
     else if (p->count == 0u) rc = 1;
     else {
-        *out = p->items[p->head]; p->head = (p->head + 1u) % p->capacity; --p->count;
-        if (storage_slot_transition_locked(p, out->slot, STORAGE_SLOT_READY_FOR_NVME,
-                                           STORAGE_SLOT_NVME_BUSY) != 0) rc = -1;
+        *out = p->items[p->head];
+        p->head = (p->head + 1u) % p->slots.capacity;
+        --p->count;
+        if (storage_slot_transition(&p->slots, out->slot,
+                                    STORAGE_SLOT_READY_FOR_NVME,
+                                    STORAGE_SLOT_NVME_BUSY) != 0) {
+            p->error = 1;
+            rc = -1;
+        }
     }
     pthread_mutex_unlock(&p->lock);
     return rc;
@@ -313,8 +285,10 @@ int storage_pipeline_complete(StoragePipeline *p, uint32_t slot, int requeue)
     int rc;
     if (!p) return -1;
     pthread_mutex_lock(&p->lock);
-    rc = storage_slot_transition_locked(p, slot, STORAGE_SLOT_NVME_BUSY,
-                                        requeue ? STORAGE_SLOT_REQUEUE_PENDING : STORAGE_SLOT_FREE);
+    rc = storage_slot_transition(&p->slots, slot, STORAGE_SLOT_NVME_BUSY,
+                                 requeue ? STORAGE_SLOT_REQUEUE_PENDING
+                                         : STORAGE_SLOT_FREE);
+    if (rc != 0) p->error = 1;
     pthread_mutex_unlock(&p->lock);
     return rc;
 }

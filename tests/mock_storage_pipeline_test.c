@@ -78,8 +78,8 @@ int main(void)
     assert(storage_pipeline_pop(&p, &out, 0) == 0 && out.slot == 0u &&
            out.chunk_index == 7u && out.file_offset == 0u && out.start_lba == 100u);
     assert(storage_pipeline_complete(&p, 0u, 1) == 0);
-    assert(storage_slot_transition_locked(&p, 0u, STORAGE_SLOT_REQUEUE_PENDING,
-                                          STORAGE_SLOT_DMA_WRITABLE) == 0);
+    assert(storage_slot_transition(&p.slots, 0u, STORAGE_SLOT_REQUEUE_PENDING,
+                                   STORAGE_SLOT_DMA_WRITABLE) == 0);
     assert(storage_pipeline_pop(&p, &out, 0) == 0 && out.slot == 1u &&
            out.chunk_index == 8u && out.file_offset == 512u && out.start_lba == 101u);
     assert(storage_pipeline_complete(&p, 1u, 0) == 0);
@@ -92,7 +92,9 @@ int main(void)
         StoragePipelineItem duplicate[2] = {
             {.slot=0u,.bytes=512u,.sectors=1u}, {.slot=0u,.bytes=512u,.sectors=1u}};
         assert(storage_queue_push_batch(&p, duplicate, 2u) != 0);
-        assert(p.count == 0u && p.tail == 0u && p.states[0] == STORAGE_SLOT_DMA_COMPLETED_UNHARVESTED);
+        assert(p.count == 0u && p.tail == 0u &&
+               storage_slot_state(&p.slots, 0u) ==
+                   STORAGE_SLOT_DMA_COMPLETED_UNHARVESTED);
         assert(storage_pipeline_counts_valid(&p));
     }
     storage_pipeline_destroy(&p);
@@ -101,7 +103,8 @@ int main(void)
     {
         StoragePipelineItem wrong_state = {.slot=0u,.bytes=512u,.sectors=1u};
         assert(storage_queue_push_batch(&p, &wrong_state, 1u) != 0);
-        assert(p.count == 0u && p.states[0] == STORAGE_SLOT_DMA_WRITABLE);
+        assert(p.count == 0u && storage_slot_state(&p.slots, 0u) ==
+                                    STORAGE_SLOT_DMA_WRITABLE);
         assert(storage_pipeline_counts_valid(&p));
     }
     storage_pipeline_destroy(&p);
@@ -123,7 +126,8 @@ int main(void)
     {
         StoragePipelineItem bad = {.slot=0u,.bytes=512u,.sectors=2u};
         assert(storage_queue_push_batch(&p, &bad, 1u) != 0);
-        assert(p.count == 0u && p.states[0] == STORAGE_SLOT_DMA_COMPLETED_UNHARVESTED);
+        assert(p.count == 0u && storage_slot_state(&p.slots, 0u) ==
+                                    STORAGE_SLOT_DMA_COMPLETED_UNHARVESTED);
     }
     storage_pipeline_destroy(&p);
 

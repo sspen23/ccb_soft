@@ -204,7 +204,8 @@ typedef enum {
     STORAGE_SLOT_READY_FOR_NVME = 2,
     STORAGE_SLOT_NVME_BUSY = 3,
     STORAGE_SLOT_REQUEUE_PENDING = 4,
-    STORAGE_SLOT_FREE = 5
+    STORAGE_SLOT_FREE = 5,
+    STORAGE_SLOT_INVALID = 255
 } StorageSlotState;
 
 typedef struct {

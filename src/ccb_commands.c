@@ -106,9 +106,7 @@ typedef struct {
 typedef struct {
     ChannelRuntime *rt;
     PendingDdrSlot *items;
-    bool *slot_busy;
-    uint8_t *slot_state;
-    StorageSlotCounts slot_counts;
+    StorageSlotTable slots;
     StorageEventRing producer_event_ring;
     StorageEventRing writer_event_ring;
     uint32_t capacity;
@@ -118,7 +116,6 @@ typedef struct {
     uint64_t ready_depth_sum;
     uint64_t ready_depth_samples;
     uint32_t ready_depth_max;
-    uint32_t busy_count;
     uint32_t max_busy_count;
     uint64_t buffered_bytes;
     uint64_t max_buffered_bytes;
@@ -179,18 +176,9 @@ typedef struct {
 
 static bool storage_queue_slot_counts_valid_locked(const StorageWriteQueue *q)
 {
-    const StorageSlotCounts *c;
-    uint64_t sum;
-
     if (!q) return false;
-    c = &q->slot_counts;
-    sum = (uint64_t)c->dma_writable + c->completed_unharvested + c->ready +
-          c->nvme_busy + c->requeue_pending + c->free_count;
-    return q->count <= q->capacity && c->total == q->capacity &&
-           c->dma_writable <= c->total && c->completed_unharvested <= c->total &&
-           c->ready <= c->total && c->nvme_busy <= c->total &&
-           c->requeue_pending <= c->total && c->free_count <= c->total &&
-           sum == (uint64_t)c->total;
+    return q->count <= q->capacity && q->capacity == q->slots.capacity &&
+           storage_slot_table_valid(&q->slots);
 }
 
 static int storage_queue_transition_locked(StorageWriteQueue *q,
@@ -486,7 +474,7 @@ static void storage_emit_final_perf_window(ChannelRuntime *rt,
     if (!rt || !stats || !q || stats->perf_window_start_us == 0u) return;
     memset(&bd_snapshot, 0, sizeof(bd_snapshot));
     pthread_mutex_lock(&q->lock);
-    (void)dma_get_bd_snapshot_o1(rt, &q->slot_counts, &bd_snapshot);
+    (void)dma_get_bd_snapshot_o1(rt, &q->slots.counts, &bd_snapshot);
     pthread_mutex_unlock(&q->lock);
     nvme_bytes = __atomic_load_n(&rt->nvme_write_bytes_done, __ATOMIC_ACQUIRE);
     dma_delta = received_bytes >= stats->perf_window_received_bytes
@@ -1592,41 +1580,14 @@ static int storage_trace_chunk_enabled(uint64_t chunk_index, uint32_t slot)
     return 1;
 }
 
-static uint32_t *storage_local_count_for_state(StorageSlotCounts *c, StorageSlotState state)
-{
-    switch (state) {
-    case STORAGE_SLOT_DMA_WRITABLE: return &c->dma_writable;
-    case STORAGE_SLOT_DMA_COMPLETED_UNHARVESTED: return &c->completed_unharvested;
-    case STORAGE_SLOT_READY_FOR_NVME: return &c->ready;
-    case STORAGE_SLOT_NVME_BUSY: return &c->nvme_busy;
-    case STORAGE_SLOT_REQUEUE_PENDING: return &c->requeue_pending;
-    case STORAGE_SLOT_FREE: return &c->free_count;
-    default: return NULL;
-    }
-}
-
 static int storage_local_slot_transition_locked(StorageWriteQueue *q, uint32_t slot,
                                                 StorageSlotState expected, StorageSlotState next)
 {
-    uint32_t *from, *to;
-    StorageSlotCounts *c;
-    if (!q || slot >= q->capacity || q->slot_state[slot] != expected) goto bad;
-    c = &q->slot_counts;
-    from = storage_local_count_for_state(c, expected); to = storage_local_count_for_state(c, next);
-    if (!from || !to || *from == 0u) goto bad;
-    --*from; ++*to; q->slot_state[slot] = (uint8_t)next;
-    if (c->total != q->capacity ||
-        c->total != c->dma_writable + c->completed_unharvested + c->ready +
-                    c->nvme_busy + c->requeue_pending + c->free_count) {
-        ++*from;
-        --*to;
-        q->slot_state[slot] = (uint8_t)expected;
-        goto bad;
+    if (!q || storage_slot_transition(&q->slots, slot, expected, next) != 0) {
+        if (q) q->error = true;
+        return -1;
     }
     return 0;
-bad:
-    if (q) q->error = true;
-    return -1;
 }
 
 /* A harvester can consume a descriptor before discovering a malformed length
@@ -1637,7 +1598,7 @@ static void storage_mark_harvest_slot_failed(StorageWriteQueue *q, uint32_t slot
 {
     if (!q || slot >= q->capacity) return;
     pthread_mutex_lock(&q->lock);
-    if (q->slot_state[slot] == STORAGE_SLOT_DMA_WRITABLE)
+    if (storage_slot_state(&q->slots, slot) == STORAGE_SLOT_DMA_WRITABLE)
         (void)storage_local_slot_transition_locked(
             q, slot, STORAGE_SLOT_DMA_WRITABLE, STORAGE_SLOT_DMA_COMPLETED_UNHARVESTED);
     q->error = true;
@@ -1674,29 +1635,23 @@ static int storage_queue_init(StorageWriteQueue *q,
     }
     memset(q, 0, sizeof(*q));
     q->items = (PendingDdrSlot *)calloc(rt->dma_desc_count, sizeof(q->items[0]));
-    q->slot_busy = (bool *)calloc(rt->dma_desc_count, sizeof(q->slot_busy[0]));
-    q->slot_state = (uint8_t *)calloc(rt->dma_desc_count, sizeof(q->slot_state[0]));
-    if (!q->items || !q->slot_busy || !q->slot_state) {
+    if (!q->items || storage_slot_table_init(&q->slots, rt->dma_desc_count) != 0) {
         free(q->items);
-        free(q->slot_busy);
-        free(q->slot_state);
+        storage_slot_table_destroy(&q->slots);
         q->items = NULL;
-        q->slot_busy = NULL;
-        q->slot_state = NULL;
         return -1;
     }
-    memset(q->slot_state, STORAGE_SLOT_DMA_WRITABLE, rt->dma_desc_count);
     q->rt = rt;
     q->capacity = rt->dma_desc_count;
-    q->slot_counts.total = q->capacity;
-    q->slot_counts.dma_writable = q->capacity;
     if (storage_event_ring_init(&q->producer_event_ring,
                                 storage_env_u32_limit("SRC_REAL_EVENT_RING_SIZE", 1024u, 65536u)) != 0 ||
         storage_event_ring_init(&q->writer_event_ring,
                                 storage_env_u32_limit("SRC_REAL_EVENT_RING_SIZE", 1024u, 65536u)) != 0) {
         storage_event_ring_destroy(&q->producer_event_ring);
         storage_event_ring_destroy(&q->writer_event_ring);
-        free(q->items); free(q->slot_busy); free(q->slot_state); return -1;
+        free(q->items);
+        storage_slot_table_destroy(&q->slots);
+        return -1;
     }
     q->file_index = file_index;
     q->metadata_slot = metadata_slot;
@@ -1711,11 +1666,8 @@ static int storage_queue_init(StorageWriteQueue *q,
         pthread_cond_init(&q->not_empty, NULL) != 0 ||
         pthread_cond_init(&q->not_full, NULL) != 0) {
         free(q->items);
-        free(q->slot_busy);
-        free(q->slot_state);
+        storage_slot_table_destroy(&q->slots);
         q->items = NULL;
-        q->slot_busy = NULL;
-        q->slot_state = NULL;
         return -1;
     }
     return 0;
@@ -1730,13 +1682,10 @@ static void storage_queue_destroy(StorageWriteQueue *q) {
     (void)pthread_cond_destroy(&q->not_empty);
     (void)pthread_mutex_destroy(&q->lock);
     free(q->items);
-    free(q->slot_busy);
-    free(q->slot_state);
+    storage_slot_table_destroy(&q->slots);
     storage_event_ring_destroy(&q->producer_event_ring);
     storage_event_ring_destroy(&q->writer_event_ring);
     q->items = NULL;
-    q->slot_busy = NULL;
-    q->slot_state = NULL;
 }
 
 static void storage_queue_record_depth_locked(StorageWriteQueue *q) {
@@ -1762,7 +1711,7 @@ static int storage_local_queue_push_batch(StorageWriteQueue *q, const PendingDdr
     if (q->error || q->rt->dma_desc_bytes == 0u ||
         !storage_queue_slot_counts_valid_locked(q) ||
         item_count > q->capacity - q->count ||
-        item_count > q->slot_counts.dma_writable ||
+        item_count > q->slots.counts.dma_writable ||
         item_count == 0u) goto bad;
     for (i = 0u; i < item_count; ++i) {
         uint64_t expected_sectors;
@@ -1770,8 +1719,8 @@ static int storage_local_queue_push_batch(StorageWriteQueue *q, const PendingDdr
         uint64_t expected_hw_addr;
         if (items[i].bytes == 0u || items[i].bytes > q->rt->dma_desc_bytes ||
             items[i].sectors == 0u || items[i].slot >= q->capacity ||
-            q->slot_busy[items[i].slot] ||
-            q->slot_state[items[i].slot] != STORAGE_SLOT_DMA_WRITABLE) goto bad;
+            storage_slot_state(&q->slots, items[i].slot) !=
+                STORAGE_SLOT_DMA_WRITABLE) goto bad;
         expected_sectors = bytes_to_sectors(items[i].bytes);
         if ((uint64_t)items[i].slot >
             (UINT64_MAX - q->rt->cfg->ddr_hw_base) / q->rt->dma_desc_bytes) goto bad;
@@ -1801,20 +1750,22 @@ static int storage_local_queue_push_batch(StorageWriteQueue *q, const PendingDdr
         uint32_t slot = items[i].slot;
         q->items[tail] = items[i];
         tail = (tail + 1u) % q->capacity;
-        q->slot_busy[slot] = true;
-        q->slot_state[slot] = STORAGE_SLOT_DMA_COMPLETED_UNHARVESTED;
-        --q->slot_counts.dma_writable;
-        ++q->slot_counts.completed_unharvested;
-        q->slot_state[slot] = STORAGE_SLOT_READY_FOR_NVME;
-        --q->slot_counts.completed_unharvested;
-        ++q->slot_counts.ready;
+        if (storage_local_slot_transition_locked(
+                q, slot, STORAGE_SLOT_DMA_WRITABLE,
+                STORAGE_SLOT_DMA_COMPLETED_UNHARVESTED) != 0 ||
+            storage_local_slot_transition_locked(
+                q, slot, STORAGE_SLOT_DMA_COMPLETED_UNHARVESTED,
+                STORAGE_SLOT_READY_FOR_NVME) != 0)
+            goto bad;
     }
     q->tail = tail;
     q->count += item_count;
-    q->busy_count += item_count;
     q->buffered_bytes += batch_bytes;
     q->queued_slot_count += item_count;
-    if (q->busy_count > q->max_busy_count) q->max_busy_count = q->busy_count;
+    {
+        uint32_t busy_count = storage_slot_busy_count(&q->slots);
+        if (busy_count > q->max_busy_count) q->max_busy_count = busy_count;
+    }
     if (q->buffered_bytes > q->max_buffered_bytes) q->max_buffered_bytes = q->buffered_bytes;
     storage_queue_record_depth_locked(q);
     pthread_cond_signal(&q->not_empty);
@@ -2012,7 +1963,7 @@ static uint32_t storage_queue_busy_count(StorageWriteQueue *q, uint32_t *max_bus
         return 0u;
     }
     pthread_mutex_lock(&q->lock);
-    busy_count = q->busy_count;
+    busy_count = storage_slot_busy_count(&q->slots);
     if (max_busy_count) {
         *max_busy_count = q->max_busy_count;
     }
@@ -2053,7 +2004,7 @@ static void storage_queue_snapshot(StorageWriteQueue *q, StorageQueueSnapshot *o
                                ? (uint32_t)(q->ready_depth_sum / q->ready_depth_samples)
                                : q->count;
     out->ready_depth_max = q->ready_depth_max;
-    out->busy_count = q->busy_count;
+    out->busy_count = storage_slot_busy_count(&q->slots);
     out->buffered_bytes = q->buffered_bytes;
     out->writer_idle_us = q->writer_idle_us;
     out->queue_empty_wait_us = q->queue_empty_wait_us;
@@ -2070,12 +2021,12 @@ static void storage_queue_snapshot(StorageWriteQueue *q, StorageQueueSnapshot *o
     out->writer_rt_enabled = __atomic_load_n(&q->writer_rt_enabled, __ATOMIC_ACQUIRE);
     out->writer_rt_policy = __atomic_load_n(&q->writer_rt_policy, __ATOMIC_ACQUIRE);
     out->writer_rt_prio = __atomic_load_n(&q->writer_rt_prio, __ATOMIC_ACQUIRE);
-    out->free_slots = q->slot_counts.free_count;
-    out->dma_writable_slots = q->slot_counts.dma_writable;
-    out->completed_unharvested_slots = q->slot_counts.completed_unharvested;
-    out->ready_for_nvme_slots = q->slot_counts.ready;
-    out->nvme_busy_slots = q->slot_counts.nvme_busy;
-    out->requeue_pending_slots = q->slot_counts.requeue_pending;
+    out->free_slots = q->slots.counts.free_count;
+    out->dma_writable_slots = q->slots.counts.dma_writable;
+    out->completed_unharvested_slots = q->slots.counts.completed_unharvested;
+    out->ready_for_nvme_slots = q->slots.counts.ready;
+    out->nvme_busy_slots = q->slots.counts.nvme_busy;
+    out->requeue_pending_slots = q->slots.counts.requeue_pending;
     if (!storage_queue_slot_counts_valid_locked(q)) q->error = true;
     pthread_mutex_unlock(&q->lock);
 }
@@ -2141,7 +2092,7 @@ static int storage_capture_bd_snapshot(StorageProducerStats *stats,
         return 0;
     }
     pthread_mutex_lock(&q->lock);
-    rc = dma_get_bd_snapshot_o1((ChannelRuntime *)rt, &q->slot_counts, out);
+    rc = dma_get_bd_snapshot_o1((ChannelRuntime *)rt, &q->slots.counts, out);
     pthread_mutex_unlock(&q->lock);
     if (rc != 0) {
         storage_record_failure(stats, "slot_ownership_invariant_failed");
@@ -2407,7 +2358,8 @@ static void storage_stats_print_periodic(StorageProducerStats *stats,
     storage_stats_finish_harvest_batch(stats);
     storage_queue_snapshot(q, &snapshot);
     pthread_mutex_lock(&q->lock);
-    if (dma_get_bd_snapshot_o1((ChannelRuntime *)rt, &q->slot_counts, &bd_snapshot) != 0) {
+    if (dma_get_bd_snapshot_o1((ChannelRuntime *)rt, &q->slots.counts,
+                               &bd_snapshot) != 0) {
         memset(&bd_snapshot, 0, sizeof(bd_snapshot));
     }
     pthread_mutex_unlock(&q->lock);
@@ -2583,7 +2535,7 @@ static int storage_complete_slot(StorageWriteQueue *q, const PendingDdrSlot *ite
         return -1;
     }
     pthread_mutex_lock(&q->lock);
-    if (!q->slot_busy[item->slot]) {
+    if (storage_slot_state(&q->slots, item->slot) != STORAGE_SLOT_NVME_BUSY) {
         q->error = true;
         pthread_cond_broadcast(&q->not_full);
         pthread_cond_broadcast(&q->not_empty);
@@ -2604,10 +2556,6 @@ static int storage_complete_slot(StorageWriteQueue *q, const PendingDdrSlot *ite
     (void)__atomic_add_fetch(&q->bytes_written, item->bytes, __ATOMIC_RELEASE);
     ++q->chunks;
     ++q->completed_slot_count;
-    q->slot_busy[item->slot] = false;
-    if (q->busy_count > 0u) {
-        --q->busy_count;
-    }
     if (q->buffered_bytes >= item->bytes) {
         q->buffered_bytes -= item->bytes;
     } else {
@@ -4266,7 +4214,7 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                         DmaStopResult quiesce_result =
                             dma_quiesce_s2mm_with_state(
                                 &rt, stop_state.deadline_us,
-                                write_queue.slot_state, &dma_stop_report);
+                                write_queue.slots.states, &dma_stop_report);
                         if (quiesce_result == DMA_STOP_FAILED) {
                             storage_record_failure(
                                 &producer_stats,
@@ -4318,7 +4266,7 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                                          stop_timeouts.dma_quiesce_us;
                 {
                     DmaStopResult quiesce_result = dma_quiesce_s2mm_with_state(
-                        &rt, stop_state.deadline_us, write_queue.slot_state,
+                        &rt, stop_state.deadline_us, write_queue.slots.states,
                         &dma_stop_report);
                     if (quiesce_result == DMA_STOP_FAILED) {
                     storage_record_failure(&producer_stats,
@@ -4397,7 +4345,7 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                      * a completed BD at the first-DMA deadline. */
                     memset(&first_snapshot, 0, sizeof(first_snapshot));
                     pthread_mutex_lock(&write_queue.lock);
-                    (void)dma_get_bd_snapshot_o1(&rt, &write_queue.slot_counts,
+                    (void)dma_get_bd_snapshot_o1(&rt, &write_queue.slots.counts,
                                                   &first_snapshot);
                     pthread_mutex_unlock(&write_queue.lock);
                     storage_record_error(&producer_stats, STORAGE_ERR_DMA_DESCRIPTOR,
@@ -4421,7 +4369,7 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                     uint64_t now_us = storage_wall_time_us();
 
                     memset(&stop_snapshot, 0, sizeof(stop_snapshot));
-                    if (dma_get_bd_snapshot(&rt, write_queue.slot_state,
+                    if (dma_get_bd_snapshot(&rt, write_queue.slots.states,
                                             &stop_snapshot) != 0) {
                         storage_record_error(&producer_stats, STORAGE_ERR_OWNERSHIP,
                                              "slot_ownership_invariant_failed");
@@ -4846,7 +4794,7 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
      * NVMe completions have drained before hardware state is destroyed. */
     {
         DmaStopResult finalize_result = dma_finalize_stop_s2mm_with_state(
-            &rt, write_queue.slot_state, &dma_stop_report);
+            &rt, write_queue.slots.states, &dma_stop_report);
         if (dma_quiesced && dma_stop_result != DMA_STOP_RESET_RECOVERED)
             dma_stop_result = finalize_result;
     }
@@ -5407,7 +5355,8 @@ out:
         }
         if (!dma_quiesced) {
             DmaStopResult quiesce_result = dma_quiesce_s2mm_with_state(
-                &rt, stop_state.deadline_us, write_queue.slot_state, &dma_stop_report);
+                &rt, stop_state.deadline_us, write_queue.slots.states,
+                &dma_stop_report);
             if (quiesce_result != DMA_STOP_FAILED) {
                 dma_quiesced = true;
                 dma_stop_result = quiesce_result;
@@ -5445,7 +5394,7 @@ out:
                     uint64_t now_us = storage_wall_time_us();
 
                     memset(&stop_snapshot, 0, sizeof(stop_snapshot));
-                    if (dma_get_bd_snapshot(&rt, write_queue.slot_state,
+                    if (dma_get_bd_snapshot(&rt, write_queue.slots.states,
                                             &stop_snapshot) != 0) {
                         storage_record_failure(&producer_stats,
                                                "slot_ownership_invariant_failed");
@@ -5645,7 +5594,7 @@ out:
     if (!writer_started && dma_stop_attempted && dma_quiesced &&
         dma_stop_result != DMA_STOP_RESET_RECOVERED) {
         DmaStopResult finalize_result = dma_finalize_stop_s2mm_with_state(
-            &rt, write_queue.slot_state, &dma_stop_report);
+            &rt, write_queue.slots.states, &dma_stop_report);
         dma_stop_result = finalize_result;
         if (finalize_result == DMA_STOP_FAILED) {
             dma_stop_failed = true;
@@ -6746,7 +6695,8 @@ int execute_dma_rx_benchmark(const ParsedArgs *args, GlobalOptions gopt)
 {
     const ChannelConfig *cfg;
     ChannelRuntime rt;
-    uint8_t *slot_state = NULL;
+    StorageSlotTable slots;
+    bool slots_ready = false;
     uint64_t start_us;
     uint64_t end_us;
     uint64_t next_log_us;
@@ -6760,6 +6710,8 @@ int execute_dma_rx_benchmark(const ParsedArgs *args, GlobalOptions gopt)
     bool integrity_ok = true;
     int rc = -1;
 
+    memset(&slots, 0, sizeof(slots));
+
     if (!args || !args->has_channel || args->channel_all ||
         !args->has_duration_sec || !args->has_source) return -1;
     cfg = find_channel(args->channel_id);
@@ -6771,9 +6723,8 @@ int execute_dma_rx_benchmark(const ParsedArgs *args, GlobalOptions gopt)
                                                        : storage_default_dma_desc_bytes(cfg)) != 0) {
         goto out;
     }
-    slot_state = calloc(rt.dma_desc_count, sizeof(*slot_state));
-    if (!slot_state) goto out;
-    memset(slot_state, STORAGE_SLOT_DMA_WRITABLE, rt.dma_desc_count);
+    if (storage_slot_table_init(&slots, rt.dma_desc_count) != 0) goto out;
+    slots_ready = true;
     if (dma_start_s2mm_ring(&rt) != 0) goto out;
     start_us = storage_wall_time_us();
     end_us = start_us + (uint64_t)args->duration_sec * 1000000ull;
@@ -6785,7 +6736,7 @@ int execute_dma_rx_benchmark(const ParsedArgs *args, GlobalOptions gopt)
         uint64_t now_us;
         int h;
 
-        if (dma_get_bd_snapshot(&rt, slot_state, &snapshot) != 0) {
+        if (dma_get_bd_snapshot(&rt, slots.states, &snapshot) != 0) {
             integrity_ok = false;
             break;
         }
@@ -6827,12 +6778,23 @@ int execute_dma_rx_benchmark(const ParsedArgs *args, GlobalOptions gopt)
         if (first_desc_us == 0u) first_desc_us = now_us;
         last_desc_us = now_us;
         received_bytes += actual;
-        slot_state[slot] = STORAGE_SLOT_REQUEUE_PENDING;
+        if (storage_slot_transition(&slots, slot, STORAGE_SLOT_DMA_WRITABLE,
+                                    STORAGE_SLOT_DMA_COMPLETED_UNHARVESTED) != 0 ||
+            storage_slot_transition(&slots, slot,
+                                    STORAGE_SLOT_DMA_COMPLETED_UNHARVESTED,
+                                    STORAGE_SLOT_REQUEUE_PENDING) != 0) {
+            integrity_ok = false;
+            break;
+        }
         if (dma_requeue_one(&rt, slot) != 0) {
             integrity_ok = false;
             break;
         }
-        slot_state[slot] = STORAGE_SLOT_DMA_WRITABLE;
+        if (storage_slot_transition(&slots, slot, STORAGE_SLOT_REQUEUE_PENDING,
+                                    STORAGE_SLOT_DMA_WRITABLE) != 0) {
+            integrity_ok = false;
+            break;
+        }
     }
     {
         uint64_t observed_us = last_desc_us >= first_desc_us
@@ -6852,7 +6814,7 @@ int execute_dma_rx_benchmark(const ParsedArgs *args, GlobalOptions gopt)
     }
     rc = integrity_ok ? 0 : -1;
 out:
-    free(slot_state);
+    if (slots_ready) storage_slot_table_destroy(&slots);
     (void)dma_stop_s2mm(&rt, NULL);
     channel_runtime_close(&rt);
     return rc;
