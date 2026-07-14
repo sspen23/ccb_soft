@@ -9,7 +9,8 @@ int main(void)
     StorageWorkerEvent e; FILE *f; char line[2048];
     setenv("SRC_REAL_PERF_LOG_FILE", "/tmp/mock_storage_perf.log", 1);
     setenv("SRC_REAL_PERF_LOG_ENABLE", "1", 1); unlink("/tmp/mock_storage_perf.log");
-    storage_ipc_make_event(&e, STORAGE_WORKER_PERF_SAMPLE, 1u, 0, 42u, "sample");
+    storage_ipc_make_event(&e, STORAGE_WORKER_PERF_SAMPLE, 1u,
+                           STORAGE_ERR_NONE, 42u, "sample");
     assert(storage_perf_log_event(&e, "task") == 0);
     storage_perf_log_close(); f = fopen("/tmp/mock_storage_perf.log", "r"); assert(f);
     e.perf.window_start_us = 1u; e.perf.window_end_us = 2u;
@@ -34,9 +35,11 @@ int main(void)
            strstr(line, "submit_mmio_count=18") && strstr(line, "queue_empty_wait_us=22") &&
            strstr(line, "writer_no_progress_sleep_count=25") &&
            strstr(line, "dropped_perf_samples=17") && strstr(line, "dropped_diag_events=26")); fclose(f);
-    storage_ipc_make_event(&e, STORAGE_WORKER_FATAL, 1u, -3, 9u, "fatal_reason");
+    storage_ipc_make_event(&e, STORAGE_WORKER_FATAL, 1u,
+                           STORAGE_ERR_UNKNOWN_CID, 9u, "fatal_reason");
     assert(storage_perf_log_event(&e, "task") == 0);
-    storage_ipc_make_event(&e, STORAGE_WORKER_FINAL_RESULT, 1u, 0, 9u, "final_reason");
+    storage_ipc_make_event(&e, STORAGE_WORKER_FINAL_RESULT, 1u,
+                           STORAGE_ERR_NONE, 9u, "final_reason");
     e.result.dma_received_bytes = e.result.nvme_completed_bytes = e.result.file_bytes = 9u;
     e.result.dma_observed_bytes = 11u;
     e.result.dma_harvested_payload_bytes = 9u;
@@ -48,7 +51,8 @@ int main(void)
     snprintf(e.result.integrity_risk, sizeof(e.result.integrity_risk), "%s", "primary_reason");
     snprintf(e.result.secondary_reason, sizeof(e.result.secondary_reason), "%s", "secondary_reason");
     assert(storage_perf_log_event(&e, "task") == 0);
-    storage_ipc_make_event(&e, STORAGE_WORKER_DIAG_EVENT, 1u, 0, 0u, "diag");
+    storage_ipc_make_event(&e, STORAGE_WORKER_DIAG_EVENT, 1u,
+                           STORAGE_ERR_NONE, 0u, "diag");
     e.diag.sequence = 3u; e.diag.event_id = STORAGE_EVENT_WORKER_FATAL;
     assert(storage_perf_log_event(&e, "task") == 0);
     storage_perf_log_close(); f = fopen("/tmp/mock_storage_perf.log", "r"); assert(f);

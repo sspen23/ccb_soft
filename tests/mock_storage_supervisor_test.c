@@ -8,7 +8,10 @@ static StorageWorkerEvent event(uint32_t type, uint32_t channel)
 {
     StorageWorkerEvent value;
 
-    storage_ipc_make_event(&value, type, channel, 0, 0u, "worker_fatal");
+    storage_ipc_make_event(&value, type, channel,
+                           type == STORAGE_WORKER_FATAL
+                               ? STORAGE_ERR_INTERNAL : STORAGE_ERR_NONE,
+                           0u, "worker_fatal");
     value.result.data_persisted = true;
     value.result.receive_integrity_ok = true;
     value.result.storage_integrity_ok = true;
@@ -102,6 +105,7 @@ static void test_stop_send_state(void)
     value = event(STORAGE_WORKER_FATAL, 0u);
     assert(storage_supervisor_handle_event(&s, &value) == 0);
     assert(storage_supervisor_peek_stop_mask(&s) == 3u);
+    assert(s.primary_error == STORAGE_ERR_INTERNAL);
     assert(s.stop_sent_mask == 0u);
 
     storage_supervisor_mark_stop_failed(&s, 0u);
@@ -131,6 +135,7 @@ static void test_invalid_sequences(void)
     assert(storage_supervisor_handle_event(&s, &value) == 0);
     assert(storage_supervisor_handle_event(&s, &value) != 0);
     assert_reason(&s, "invalid_ready_sequence");
+    assert(s.primary_error == STORAGE_ERR_IPC_SEQUENCE);
 
     storage_supervisor_init(&s, 1u);
     value = event(STORAGE_WORKER_FATAL, 0u);
@@ -287,6 +292,7 @@ static void test_one_channel_failure_rejects_aggregate(void)
     assert(s.aggregate_ready);
     assert(storage_supervisor_result_status(&s) == STORAGE_TASK_FAILED);
     assert_reason(&s, "storage_integrity_failed");
+    assert(s.primary_error == STORAGE_ERR_INTEGRITY);
 }
 
 static void test_payload_media_accounting(void)
@@ -345,11 +351,13 @@ static void test_multichannel_stop_epoch_and_deferred_isolation(void)
     assert(storage_supervisor_handle_event(&s, &value) == 0);
     value = stop_phase(0u, 88u, STORAGE_WORKER_DMA_QUIESCED,
                        "boundary_timeout_quiesced");
+    value.error_code = STORAGE_ERR_STOP_BOUNDARY_TIMEOUT;
     assert(storage_supervisor_handle_event(&s, &value) == 0);
     assert(!s.first_fatal && s.stop_requested_mask == 0u);
     value = stop_phase(1u, 89u, STORAGE_WORKER_STOP_REQUESTED, "stop_requested");
     assert(storage_supervisor_handle_event(&s, &value) != 0);
     assert_reason(&s, "stop_epoch_mismatch");
+    assert(s.primary_error == STORAGE_ERR_IPC_SEQUENCE);
 }
 
 int main(void)

@@ -229,14 +229,11 @@ static void test_enabled_and_invalid_fallback(void)
 
 static void test_stop_error_classification(void)
 {
-    assert(storage_stop_error_is_deferred(
-        "unaligned_payload_not_safely_paddable"));
-    assert(storage_stop_error_is_deferred("partial_tail_unqueued"));
-    assert(storage_stop_error_is_deferred("stop_packet_boundary_timeout"));
-    assert(storage_stop_error_is_deferred("late_completed_descriptor"));
-    assert(storage_stop_error_is_deferred("stop_harvest_timeout"));
-    assert(!storage_stop_error_is_deferred("unknown_completion_cid"));
-    assert(!storage_stop_error_is_deferred("duplicate_completion_cid"));
+    assert(storage_error_class(STORAGE_ERR_TAIL_UNALIGNED) == STORAGE_ERROR_DEFERRED);
+    assert(storage_error_class(STORAGE_ERR_STOP_BOUNDARY_TIMEOUT) == STORAGE_ERROR_DEFERRED);
+    assert(storage_error_class(STORAGE_ERR_STOP_HARVEST_TIMEOUT) == STORAGE_ERROR_DEFERRED);
+    assert(storage_error_class(STORAGE_ERR_UNKNOWN_CID) == STORAGE_ERROR_FATAL);
+    assert(storage_error_class(STORAGE_ERR_DUPLICATE_CID) == STORAGE_ERROR_FATAL);
 }
 
 int main(void)

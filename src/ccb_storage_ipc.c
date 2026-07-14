@@ -174,7 +174,7 @@ void storage_ipc_make_control(StorageControlMessage *msg, StorageControlType typ
 }
 
 void storage_ipc_make_event(StorageWorkerEvent *event, StorageWorkerEventType type,
-                            uint32_t channel, int32_t error_code,
+                            uint32_t channel, StorageErrorCode error_code,
                             uint64_t received_bytes, const char *reason)
 {
     memset(event, 0, sizeof(*event));
@@ -200,9 +200,22 @@ static int storage_ipc_control_valid(const StorageControlMessage *msg)
 
 int storage_ipc_validate_event(const StorageWorkerEvent *event)
 {
-    return event && event->magic == STORAGE_IPC_MAGIC &&
-           event->version == STORAGE_IPC_VERSION && event->size == sizeof(*event) &&
-           event->type >= STORAGE_WORKER_READY && event->type <= STORAGE_WORKER_STOP_PHASE;
+    if (!event || event->magic != STORAGE_IPC_MAGIC ||
+        event->version != STORAGE_IPC_VERSION || event->size != sizeof(*event) ||
+        event->type < STORAGE_WORKER_READY || event->type > STORAGE_WORKER_STOP_PHASE ||
+        !storage_error_code_valid(event->error_code))
+        return 0;
+    if (event->type == STORAGE_WORKER_FATAL)
+        return storage_error_class(event->error_code) == STORAGE_ERROR_FATAL;
+    if (event->type == STORAGE_WORKER_FINAL_RESULT)
+        return true;
+    if (event->type == STORAGE_WORKER_STOP_PHASE) {
+        if (event->stop_phase == STORAGE_WORKER_FAILED_FATAL)
+            return storage_error_class(event->error_code) == STORAGE_ERROR_FATAL;
+        return event->error_code == STORAGE_ERR_NONE ||
+               storage_error_class(event->error_code) == STORAGE_ERROR_DEFERRED;
+    }
+    return event->error_code == STORAGE_ERR_NONE;
 }
 
 const char *storage_ipc_stop_phase_name(StorageWorkerStopPhase phase)

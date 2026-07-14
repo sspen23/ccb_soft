@@ -2,6 +2,7 @@
 #define CCB_COMMANDS_H
 
 #include "ccb_types.h"
+#include "storage_error.h"
 
 typedef struct {
     int channel_id;
@@ -59,6 +60,8 @@ typedef struct {
     uint64_t max_occupied_bytes_est;
     uint64_t writer_schedule_gap_max_us;
     uint64_t submit_stall_max_us;
+    StorageErrorCode primary_error;
+    StorageErrorCode secondary_error;
     char integrity_risk[64];
     char secondary_reason[64];
     char task_no[12];
@@ -87,8 +90,6 @@ void storage_write_reset_stop(void);
 void storage_write_request_stop(void);
 void storage_write_flush_deferred_diag(void);
 bool storage_write_fatal_event_sent(void);
-
-bool storage_stop_error_is_deferred(const char *reason);
 
 typedef enum {
     STORAGE_CROSS_SLOT_CONFIG_ENABLED = 0,

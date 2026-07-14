@@ -190,6 +190,7 @@ static void test_completion_failures(void)
     queue_completion(&mock, mock.submitted[0], 0);
     assert(nvme_cross_slot_engine_step(value, 300u, done, &mock) != 0);
     assert(strcmp(nvme_cross_slot_engine_last_error(value), "duplicate_completion_cid") == 0);
+    assert(rt.nvme_primary_error == STORAGE_ERR_DUPLICATE_CID);
     assert(nvme_cross_slot_engine_state(value) == NVME_CROSS_SLOT_ABORT_REQUESTED);
     queue_completion(&mock, mock.submitted[1], 0);
     assert(nvme_cross_slot_engine_drain_abort(value, mock.now_us + 100u) == 0);
@@ -201,6 +202,7 @@ static void test_completion_failures(void)
     queue_completion(&mock, 0xffffu, 0);
     assert(nvme_cross_slot_engine_step(value, 300u, done, &mock) != 0);
     assert(strcmp(nvme_cross_slot_engine_last_error(value), "unknown_completion_cid") == 0);
+    assert(rt.nvme_primary_error == STORAGE_ERR_UNKNOWN_CID);
     assert(nvme_cross_slot_engine_state(value) == NVME_CROSS_SLOT_ABORT_REQUESTED);
     queue_completion(&mock, mock.submitted[0], 0);
     queue_completion(&mock, mock.submitted[1], 0);

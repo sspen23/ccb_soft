@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include "storage_error.h"
 
 /* Supported data channels in the current FPGA image: ch0, ch1, and ch2. */
 #define NUM_CHANNELS 3
@@ -282,6 +283,8 @@ typedef struct {
     uint32_t nvme_active_qd_event_min;
     uint64_t nvme_refill_count;
     uint64_t nvme_completion_count;
+    StorageErrorCode nvme_primary_error;
+    StorageErrorCode nvme_secondary_error;
     char nvme_last_error[64];
     /* Set only after a posted NVMe doorbell cannot be drained and no
      * confirmed controller/queue reset exists.  Such a runtime must retain

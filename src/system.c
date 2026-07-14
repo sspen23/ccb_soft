@@ -1823,7 +1823,7 @@ static void drain_storage_events(Task *task, bool report_eof)
             StorageWorkerEvent protocol_fatal;
 
             storage_ipc_make_event(&protocol_fatal, STORAGE_WORKER_FATAL,
-                                   expected_channel, -1, 0u,
+                                   expected_channel, STORAGE_ERR_IPC, 0u,
                                    g_storage_supervisor.fatal_reason[0] != '\0'
                                        ? g_storage_supervisor.fatal_reason
                                        : "event_protocol_invalid");
@@ -1873,7 +1873,7 @@ static void drain_storage_events(Task *task, bool report_eof)
                                          "event_read_integrity_failed");
         task->fatal_seen = true;
         storage_ipc_make_event(&task->first_fatal, STORAGE_WORKER_FATAL,
-                               expected_channel, -1, 0u,
+                               expected_channel, STORAGE_ERR_IPC, 0u,
                                "event_read_integrity_failed");
     }
     if (rc == 1 && task->event_fd >= 0 && report_eof) {
@@ -4488,7 +4488,7 @@ static int run_storage_worker_main(int argc, char **argv, bool supervised)
             event_channel_present = true;
             if (rc == 0) {
                 storage_ipc_make_event(&event, STORAGE_WORKER_DRAINED, (uint32_t)args.channel_id,
-                                       0, result.dma_received_bytes, "drained");
+                                       STORAGE_ERR_NONE, result.dma_received_bytes, "drained");
                 if (storage_ipc_write_event_deadline(
                         event_fd, &event,
                         storage_ipc_monotonic_us() + 1000000ull) != 0) {
@@ -4501,7 +4501,10 @@ static int run_storage_worker_main(int argc, char **argv, bool supervised)
             if (rc != 0) {
                 if (!storage_write_fatal_event_sent()) {
                     storage_ipc_make_event(&event, STORAGE_WORKER_FATAL, (uint32_t)args.channel_id,
-                                           rc, result.dma_received_bytes,
+                                           result.primary_error != STORAGE_ERR_NONE
+                                               ? result.primary_error
+                                               : STORAGE_ERR_INTERNAL,
+                                           result.dma_received_bytes,
                                            result.integrity_risk[0] ? result.integrity_risk : "worker_failed");
                     fatal_delivery_ok = storage_ipc_write_event_deadline(
                         event_fd, &event,
@@ -4516,7 +4519,11 @@ static int run_storage_worker_main(int argc, char **argv, bool supervised)
              * the EOF explicitly instead of accepting an uncaused failure. */
             if (rc == 0 || fatal_delivery_ok) {
                 storage_ipc_make_event(&event, STORAGE_WORKER_FINAL_RESULT,
-                                       (uint32_t)args.channel_id, rc,
+                                       (uint32_t)args.channel_id,
+                                       rc == 0 ? STORAGE_ERR_NONE
+                                               : (result.primary_error != STORAGE_ERR_NONE
+                                                      ? result.primary_error
+                                                      : STORAGE_ERR_INTERNAL),
                                        result.dma_received_bytes,
                                        rc == 0 ? "final" : "failed");
                 event.result = result;

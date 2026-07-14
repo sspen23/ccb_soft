@@ -682,10 +682,22 @@ static void atomic_update_max_u64(uint64_t *target, uint64_t value) {
     }
 }
 
-static void nvme_set_last_error(ChannelRuntime *rt, const char *reason) {
+static void nvme_set_error(ChannelRuntime *rt, StorageErrorCode code,
+                           const char *reason) {
+    StorageErrorCode previous_primary;
+
     if (rt && reason) {
+        previous_primary = rt->nvme_primary_error;
+        storage_error_record(&rt->nvme_primary_error,
+                             &rt->nvme_secondary_error, code);
+        if (previous_primary != STORAGE_ERR_NONE) return;
         (void)snprintf(rt->nvme_last_error, sizeof(rt->nvme_last_error), "%s", reason);
     }
+}
+
+static void nvme_set_last_error(ChannelRuntime *rt, const char *reason)
+{
+    nvme_set_error(rt, STORAGE_ERR_INTERNAL, reason);
 }
 
 static void nvme_record_submit_stall(ChannelRuntime *rt, uint64_t submit_us) {
@@ -1494,7 +1506,8 @@ static int nvme_handle_write_completion(ChannelRuntime *rt,
 
     entry = nvme_find_pending_by_cid(pending, capacity, completion->cid);
     if (!entry) {
-        nvme_set_last_error(rt, "completion_without_pending_cid");
+        nvme_set_error(rt, STORAGE_ERR_UNKNOWN_CID,
+                       "completion_without_pending_cid");
         fprintf(stderr,
                 "NVMe completion has no pending CID channel=%d slot=%u cid=%u cq=0x%08x"
                 " inflight=%u submitted=%u completed=%u\n",
@@ -1558,8 +1571,11 @@ static void nvme_mark_ownership_unresolved(ChannelRuntime *rt,
 {
     if (!rt) return;
     rt->nvme_ownership_unresolved = true;
+    storage_error_record(&rt->nvme_primary_error, &rt->nvme_secondary_error,
+                         STORAGE_ERR_OWNERSHIP);
     if (rt->nvme_last_error[0] == '\0' && primary_reason) {
-        nvme_set_last_error(rt, primary_reason);
+        (void)snprintf(rt->nvme_last_error, sizeof(rt->nvme_last_error), "%s",
+                       primary_reason);
     }
     fprintf(stderr,
             "NVMe ownership unresolved channel=%d primary_reason=%s"
@@ -1887,6 +1903,7 @@ int nvme_write_contiguous_tight_qd_payload(ChannelRuntime *rt,
             }
             entry = nvme_find_pending_by_cid(pending, NVME_PENDING_CAPACITY, completion.cid);
             if (!entry) {
+                nvme_set_error(rt, STORAGE_ERR_UNKNOWN_CID, "unknown_cid");
                 nvme_tight_error(rt,
                                  "unknown_cid",
                                  completion.cid,
@@ -2249,7 +2266,8 @@ static int nvme_handle_multi_write_completion(ChannelRuntime *rt,
 
     entry = nvme_find_pending_by_cid(pending, capacity, completion->cid);
     if (!entry) {
-        nvme_set_last_error(rt, "completion_without_pending_cid");
+        nvme_set_error(rt, STORAGE_ERR_UNKNOWN_CID,
+                       "completion_without_pending_cid");
         fprintf(stderr,
                 "NVMe completion has no pending CID channel=%d cid=%u cq=0x%08x active_qd=%u\n",
                 rt->cfg->id,
@@ -2460,17 +2478,23 @@ static void cross_slot_clear_cq_empty(NvmeCrossSlotEngine *e, uint64_t now_us)
     }
 }
 
-static int cross_slot_fail(NvmeCrossSlotEngine *e, const char *reason)
+static int cross_slot_fail_code(NvmeCrossSlotEngine *e, StorageErrorCode code,
+                                const char *reason)
 {
     if (e) {
         if (e->last_error[0] == '\0') {
             snprintf(e->last_error, sizeof(e->last_error), "%s", reason);
-            nvme_set_last_error(e->rt, reason);
+            nvme_set_error(e->rt, code, reason);
         }
         if (cross_slot_state_load(e) == NVME_CROSS_SLOT_RUNNING)
             cross_slot_state_store(e, NVME_CROSS_SLOT_ABORT_REQUESTED);
     }
     return -1;
+}
+
+static int cross_slot_fail(NvmeCrossSlotEngine *e, const char *reason)
+{
+    return cross_slot_fail_code(e, STORAGE_ERR_INTERNAL, reason);
 }
 
 static int cross_slot_validate(NvmeCrossSlotEngine *e)
@@ -2527,8 +2551,13 @@ static int cross_slot_handle_completion(NvmeCrossSlotEngine *e, const NvmeComple
     uint64_t completion_us = 0u;
     if (!e || !completion) return -1;
     entry = nvme_find_pending_by_cid(e->pending, NVME_PENDING_CAPACITY, completion->cid);
-    if (!entry) return cross_slot_fail(e, e->completed_cid_seen[completion->cid] ?
-                                      "duplicate_completion_cid" : "unknown_completion_cid");
+    if (!entry) {
+        bool duplicate = e->completed_cid_seen[completion->cid];
+
+        return cross_slot_fail_code(
+            e, duplicate ? STORAGE_ERR_DUPLICATE_CID : STORAGE_ERR_UNKNOWN_CID,
+            duplicate ? "duplicate_completion_cid" : "unknown_completion_cid");
+    }
     ctx = nvme_find_slot_context(e->contexts, NVME_PENDING_CAPACITY, entry->slot);
     if (!ctx || ctx->inflight_cmds == 0u || e->global_inflight == 0u)
         return cross_slot_fail(e, "pending_cid_state_inconsistent");

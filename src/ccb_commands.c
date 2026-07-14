@@ -165,7 +165,7 @@ typedef struct {
     bool run_enabled;
     bool error;
     char error_reason[64];
-    bool deferred_stop_error;
+    StorageErrorCode deferred_stop_error;
     char deferred_stop_reason[64];
     bool nvme_engine_quiesced;
     /* Published while the cross-slot writer owns the engine.  Stop/error
@@ -207,6 +207,8 @@ typedef struct {
     uint64_t dma_harvest_interval_max_us;
     uint64_t first_dma_desc_us;
     uint64_t last_dma_desc_us;
+    StorageErrorCode primary_error;
+    StorageErrorCode secondary_error;
     char secondary_reason[64];
     uint64_t window_backlog_bytes;
     uint64_t ring_full_count;
@@ -252,22 +254,32 @@ typedef struct {
     uint64_t last_bd_snapshot_us;
 } StorageProducerStats;
 
-static void storage_record_failure(StorageProducerStats *stats, const char *reason)
+static void storage_record_error(StorageProducerStats *stats,
+                                 StorageErrorCode code, const char *reason)
 {
+    StorageErrorCode previous_primary;
+    StorageErrorCode previous_secondary;
+
     if (!stats || !reason || reason[0] == '\0') return;
     stats->receive_integrity_ok = false;
-    if (stats->receive_integrity_risk[0] == '\0' ||
-        strcmp(stats->receive_integrity_risk, "none") == 0) {
+    previous_primary = stats->primary_error;
+    previous_secondary = stats->secondary_error;
+    storage_error_record(&stats->primary_error, &stats->secondary_error, code);
+    if (previous_primary == STORAGE_ERR_NONE &&
+        stats->primary_error != STORAGE_ERR_NONE) {
         (void)snprintf(stats->receive_integrity_risk,
                        sizeof(stats->receive_integrity_risk), "%s", reason);
         return;
     }
-    if (strcmp(stats->receive_integrity_risk, reason) == 0) return;
-    if (stats->secondary_reason[0] == '\0') {
+    if (previous_secondary == STORAGE_ERR_NONE &&
+        stats->secondary_error != STORAGE_ERR_NONE) {
         (void)snprintf(stats->secondary_reason,
                        sizeof(stats->secondary_reason), "%s", reason);
     }
 }
+
+#define storage_record_failure(stats_, reason_) \
+    storage_record_error((stats_), STORAGE_ERR_INTERNAL, (reason_))
 
 typedef struct {
     uint64_t submit_calls;
@@ -298,6 +310,7 @@ static int storage_zero_tail_padding(ChannelRuntime *rt,
                                      uint64_t buffer_offset);
 static void storage_fail_fatal(StorageWriteQueue *q);
 static void storage_record_deferred_stop_error(StorageWriteQueue *q,
+                                               StorageErrorCode code,
                                                const char *reason);
 static void storage_set_writer_error_reason(StorageWriteQueue *q, const char *reason);
 static void storage_copy_writer_error_reason(StorageWriteQueue *q, char *out, size_t out_size);
@@ -322,16 +335,6 @@ static bool storage_env_string_is(const char *name, const char *expected);
 static bool storage_text_output_enabled(void);
 static uint64_t storage_timeout_us(const char *us_name, const char *ms_name,
                                    uint64_t fallback_us);
-
-bool storage_stop_error_is_deferred(const char *reason)
-{
-    return reason &&
-           (strcmp(reason, "unaligned_payload_not_safely_paddable") == 0 ||
-            strcmp(reason, "partial_tail_unqueued") == 0 ||
-            strcmp(reason, "stop_packet_boundary_timeout") == 0 ||
-            strcmp(reason, "late_completed_descriptor") == 0 ||
-            strcmp(reason, "stop_harvest_timeout") == 0);
-}
 
 static uint64_t storage_wall_time_us(void) {
     struct timespec ts;
@@ -365,7 +368,8 @@ static int storage_env_fd(const char *name)
 }
 
 static int storage_emit_event(StorageWorkerEventType type, const ChannelRuntime *rt,
-                              int error_code, uint64_t bytes, const char *reason)
+                              StorageErrorCode error_code, uint64_t bytes,
+                              const char *reason)
 {
     StorageWorkerEvent event;
     int fd = storage_env_fd("SRC_REAL_STORAGE_EVENT_FD");
@@ -385,6 +389,7 @@ static int storage_emit_event(StorageWorkerEventType type, const ChannelRuntime 
 
 static int storage_emit_stop_phase(const ChannelRuntime *rt,
                                    StorageWorkerStopPhase phase,
+                                   StorageErrorCode error_code,
                                    uint64_t bytes,
                                    const char *reason)
 {
@@ -394,7 +399,7 @@ static int storage_emit_stop_phase(const ChannelRuntime *rt,
     if (fd < 0) return 0;
     storage_ipc_make_event(&event, STORAGE_WORKER_STOP_PHASE,
                            rt && rt->cfg ? (uint32_t)rt->cfg->id : UINT32_MAX,
-                           phase == STORAGE_WORKER_FAILED_FATAL ? -1 : 0,
+                           error_code,
                            bytes, reason);
     event.stop_epoch = g_storage_stop_epoch;
     event.stop_phase = (uint32_t)phase;
@@ -411,7 +416,7 @@ static void storage_emit_perf_event(const ChannelRuntime *rt, const StorageProdu
     int fd = storage_env_fd("SRC_REAL_STORAGE_EVENT_FD");
     if (fd < 0 || !rt || !stats || !q || !bd) return;
     storage_ipc_make_event(&event, STORAGE_WORKER_PERF_SAMPLE, (uint32_t)rt->cfg->id,
-                           0, dma_delta, "perf_sample");
+                           STORAGE_ERR_NONE, dma_delta, "perf_sample");
     event.perf.window_start_us = start_us; event.perf.window_end_us = end_us;
     event.perf.dma_bytes_delta = dma_delta; event.perf.nvme_bytes_delta = nvme_delta;
     event.perf.dma_writable = bd->dma_writable; event.perf.completed_unharvested = bd->completed_unharvested;
@@ -482,7 +487,7 @@ static void storage_emit_diag_event(const ChannelRuntime *rt, const StorageEvent
     if (fd < 0 || !record) return;
     storage_ipc_make_event(&event, STORAGE_WORKER_DIAG_EVENT,
                            rt && rt->cfg ? (uint32_t)rt->cfg->id : record->channel,
-                           0, 0u, "diag_event");
+                           STORAGE_ERR_NONE, 0u, "diag_event");
     event.diag = *record;
     (void)storage_ipc_try_write_diag(fd, &event, &g_storage_dropped_diag_events);
 }
@@ -567,7 +572,8 @@ static int storage_wait_start_gate(ChannelRuntime *rt, uint64_t *start_skew_us,
             if (failure_reason) *failure_reason = "control_fd_nonblocking_failed";
             return -1;
         }
-        if (storage_emit_event(STORAGE_WORKER_READY, rt, 0, 0u, "ready") != 0) {
+        if (storage_emit_event(STORAGE_WORKER_READY, rt, STORAGE_ERR_NONE,
+                               0u, "ready") != 0) {
             if (failure_reason) *failure_reason = "ready_event_send_failed";
             return -1;
         }
@@ -589,7 +595,8 @@ static int storage_wait_start_gate(ChannelRuntime *rt, uint64_t *start_skew_us,
             return -1;
         }
         if (dma_start_s2mm_ring(rt) != 0) { if (failure_reason) *failure_reason = "dma_start_failed"; return -1; }
-        if (storage_emit_event(STORAGE_WORKER_ARMED, rt, 0, 0u, "armed") != 0) {
+        if (storage_emit_event(STORAGE_WORKER_ARMED, rt, STORAGE_ERR_NONE,
+                               0u, "armed") != 0) {
             if (failure_reason) *failure_reason = "armed_event_send_failed";
             return -1;
         }
@@ -2597,12 +2604,13 @@ static void storage_fail_fatal(StorageWriteQueue *q) {
 }
 
 static void storage_record_deferred_stop_error(StorageWriteQueue *q,
+                                               StorageErrorCode code,
                                                const char *reason)
 {
-    if (!q || !storage_stop_error_is_deferred(reason)) return;
+    if (!q || storage_error_class(code) != STORAGE_ERROR_DEFERRED) return;
     pthread_mutex_lock(&q->lock);
-    if (!q->deferred_stop_error) {
-        q->deferred_stop_error = true;
+    if (q->deferred_stop_error == STORAGE_ERR_NONE) {
+        q->deferred_stop_error = code;
         (void)snprintf(q->deferred_stop_reason,
                        sizeof(q->deferred_stop_reason), "%s", reason);
     }
@@ -3946,13 +3954,16 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
         const char *gate_failure_reason = "start_gate_failed";
         if (storage_wait_start_gate(&rt, &start_skew_us, &start_gate_mode,
                                     &gate_failure_reason) != 0) {
-        storage_record_failure(&producer_stats, gate_failure_reason);
-        (void)storage_emit_event(STORAGE_WORKER_FATAL, &rt, -1, 0u, gate_failure_reason);
+        storage_record_error(&producer_stats, STORAGE_ERR_IPC_SEQUENCE,
+                             gate_failure_reason);
+        (void)storage_emit_event(STORAGE_WORKER_FATAL, &rt, STORAGE_ERR_IPC_SEQUENCE,
+                                 0u, gate_failure_reason);
         goto out;
         }
     }
     if (storage_queue_enable_run(&write_queue) != 0) {
-        storage_record_failure(&producer_stats, "writer_enable_failed");
+        storage_record_error(&producer_stats, STORAGE_ERR_QUEUE,
+                             "writer_enable_failed");
         goto out;
     }
     {
@@ -3963,19 +3974,21 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
         uint64_t ready_deadline_us = storage_wall_time_us() + ready_timeout_us;
 
         if (storage_queue_wait_writer_ready(&write_queue, ready_deadline_us) != 0) {
-            storage_record_failure(&producer_stats,
-                                   errno == ETIMEDOUT ? "writer_run_ready_timeout" : "writer_schedule_failed");
-            (void)storage_emit_event(STORAGE_WORKER_FATAL, &rt, -1, 0u,
+            storage_record_error(&producer_stats, STORAGE_ERR_QUEUE,
+                                 errno == ETIMEDOUT ? "writer_run_ready_timeout"
+                                                   : "writer_schedule_failed");
+            (void)storage_emit_event(STORAGE_WORKER_FATAL, &rt, STORAGE_ERR_QUEUE, 0u,
                                      producer_stats.receive_integrity_risk);
             goto out;
         }
     }
     if (storage_apply_producer_rt(&rt, &producer_rt_policy, &producer_rt_prio) != 0 ||
         storage_queue_set_producer_ready(&write_queue, true) != 0) {
-        storage_record_failure(&producer_stats, "producer_schedule_failed");
+        storage_record_error(&producer_stats, STORAGE_ERR_QUEUE,
+                             "producer_schedule_failed");
         (void)storage_queue_set_producer_ready(&write_queue, false);
         storage_fail_fatal(&write_queue);
-        (void)storage_emit_event(STORAGE_WORKER_FATAL, &rt, -1, 0u,
+        (void)storage_emit_event(STORAGE_WORKER_FATAL, &rt, STORAGE_ERR_QUEUE, 0u,
                                  producer_stats.receive_integrity_risk);
         goto out;
     }
@@ -3988,14 +4001,17 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
     producer_stats.perf_next_us = capture_start_us +
                                   (uint64_t)storage_perf_log_interval_ms() * 1000ull;
     if (storage_queue_mark_running(&write_queue) != 0) {
-        storage_record_failure(&producer_stats, "invalid_running_sequence");
-        (void)storage_emit_event(STORAGE_WORKER_FATAL, &rt, -1, 0u,
+        storage_record_error(&producer_stats, STORAGE_ERR_IPC_SEQUENCE,
+                             "invalid_running_sequence");
+        (void)storage_emit_event(STORAGE_WORKER_FATAL, &rt, STORAGE_ERR_IPC_SEQUENCE, 0u,
                                  "invalid_running_sequence");
         storage_fail_fatal(&write_queue);
         goto out;
     }
-    if (storage_emit_event(STORAGE_WORKER_RUNNING, &rt, 0, 0u, "running") != 0) {
-        storage_record_failure(&producer_stats, "running_event_send_failed");
+    if (storage_emit_event(STORAGE_WORKER_RUNNING, &rt, STORAGE_ERR_NONE,
+                           0u, "running") != 0) {
+        storage_record_error(&producer_stats, STORAGE_ERR_IPC,
+                             "running_event_send_failed");
         storage_fail_fatal(&write_queue);
         goto out;
     }
@@ -4047,8 +4063,10 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                 if (queue_reason[0] == '\0')
                     (void)snprintf(queue_reason, sizeof(queue_reason), "%s",
                                    "storage_queue_error");
-                storage_record_failure(&producer_stats, queue_reason);
-                storage_emit_event(STORAGE_WORKER_FATAL, &rt, -1, dma_received_bytes,
+                storage_record_error(&producer_stats, STORAGE_ERR_QUEUE,
+                                     queue_reason);
+                storage_emit_event(STORAGE_WORKER_FATAL, &rt, STORAGE_ERR_QUEUE,
+                                   dma_received_bytes,
                                    queue_reason);
                 dbg_printf("[DBG][WRITE] writer thread error observed ch=%d captured=%" PRIu64 "\n",
                            cfg->id, bytes_captured);
@@ -4074,6 +4092,7 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                 (void)storage_stop_state_advance(&stop_state,
                                                  STORAGE_STOP_WAIT_BOUNDARY);
                 if (storage_emit_stop_phase(&rt, STORAGE_WORKER_STOP_REQUESTED,
+                                            STORAGE_ERR_NONE,
                                             dma_received_bytes,
                                             auto_idle_done ? "auto_idle" : "stop_requested") != 0) {
                     storage_record_failure(&producer_stats,
@@ -4091,12 +4110,14 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                         &stop_state, boundary_now_us);
 
                     if (boundary_timed_out && rt.dma_rx_packet_open) {
-                        storage_record_failure(&producer_stats,
-                                               "stop_packet_boundary_timeout");
+                        storage_record_error(&producer_stats,
+                                             STORAGE_ERR_STOP_BOUNDARY_TIMEOUT,
+                                             "stop_packet_boundary_timeout");
                     }
                     if (!boundary_timed_out &&
                         storage_emit_stop_phase(
                             &rt, STORAGE_WORKER_PACKET_BOUNDARY_REACHED,
+                            STORAGE_ERR_NONE,
                             dma_received_bytes, "packet_boundary_reached") != 0) {
                         storage_record_failure(
                             &producer_stats,
@@ -4122,7 +4143,7 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                                     ? dma_stop_report.reason
                                     : "dma_quiesce_failed");
                             (void)storage_emit_event(
-                                STORAGE_WORKER_FATAL, &rt, -1,
+                                STORAGE_WORKER_FATAL, &rt, STORAGE_ERR_DMA_STOP,
                                 dma_received_bytes,
                                 producer_stats.receive_integrity_risk);
                             storage_stop_state_fail(&stop_state);
@@ -4134,6 +4155,9 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                     dma_quiesced_us = storage_wall_time_us();
                     if (storage_emit_stop_phase(
                             &rt, STORAGE_WORKER_DMA_QUIESCED,
+                            boundary_timed_out
+                                ? STORAGE_ERR_STOP_BOUNDARY_TIMEOUT
+                                : STORAGE_ERR_NONE,
                             dma_received_bytes,
                             boundary_timed_out ? "boundary_timeout_quiesced"
                                                : "dma_quiesced") != 0) {
@@ -4164,7 +4188,8 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                     storage_record_failure(&producer_stats,
                                            dma_stop_report.reason[0] != '\0'
                                                ? dma_stop_report.reason : "dma_quiesce_failed");
-                    (void)storage_emit_event(STORAGE_WORKER_FATAL, &rt, -1,
+                    (void)storage_emit_event(STORAGE_WORKER_FATAL, &rt,
+                                             STORAGE_ERR_DMA_STOP,
                                              dma_received_bytes,
                                              producer_stats.receive_integrity_risk);
                     goto out;
@@ -4204,14 +4229,16 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                                        STORAGE_EVENT_DMA_ERROR, &rt,
                                        rt.dma_last_completed_status, 0u, true);
                 }
-                storage_record_failure(&producer_stats, "dma_harvest_failed");
+                storage_record_error(&producer_stats, STORAGE_ERR_DMA_DESCRIPTOR,
+                                     "dma_harvest_failed");
                 storage_emit_line(STORAGE_LOG_ALWAYS_CRITICAL, "storage_receive_failed channel=%d task=%s file_index=%u"
                                   " reason=%s received_bytes=%" PRIu64
                                   " descriptor_status=0x%08x",
                                   cfg->id, args->task_no, (unsigned)effective_file_index,
                                   producer_stats.receive_integrity_risk,
                                   dma_received_bytes, rt.dma_last_completed_status);
-                storage_emit_event(STORAGE_WORKER_FATAL, &rt, -1, dma_received_bytes,
+                storage_emit_event(STORAGE_WORKER_FATAL, &rt,
+                                   STORAGE_ERR_DMA_DESCRIPTOR, dma_received_bytes,
                                    producer_stats.receive_integrity_risk);
                 dbg_printf("[DBG][WRITE] dma harvest error ch=%d written=%" PRIu64 " captured=%" PRIu64 "\n",
                            cfg->id, bytes_written, bytes_captured);
@@ -4232,7 +4259,8 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                     (void)dma_get_bd_snapshot_o1(&rt, &write_queue.slot_counts,
                                                   &first_snapshot);
                     pthread_mutex_unlock(&write_queue.lock);
-                    storage_record_failure(&producer_stats, "first_dma_timeout");
+                    storage_record_error(&producer_stats, STORAGE_ERR_DMA_DESCRIPTOR,
+                                         "first_dma_timeout");
                     storage_emit_line(STORAGE_LOG_ALWAYS_CRITICAL, "storage_first_dma_timeout channel=%d reason=first_dma_timeout"
                                       " axis_source=%d cr=0x%08x sr=0x%08x curdesc=0x%08" PRIx64
                                       " taildesc=0x%08" PRIx64
@@ -4242,7 +4270,8 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                                       first_snapshot.taildesc_addr,
                                       (unsigned)__atomic_load_n(&rt.dma_hw_desc_count, __ATOMIC_ACQUIRE),
                                       first_snapshot.completed_unharvested);
-                    (void)storage_emit_event(STORAGE_WORKER_FATAL, &rt, -1,
+                    (void)storage_emit_event(STORAGE_WORKER_FATAL, &rt,
+                                              STORAGE_ERR_DMA_DESCRIPTOR,
                                               dma_received_bytes, "first_dma_timeout");
                     goto out;
                 }
@@ -4253,9 +4282,10 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                     memset(&stop_snapshot, 0, sizeof(stop_snapshot));
                     if (dma_get_bd_snapshot(&rt, write_queue.slot_state,
                                             &stop_snapshot) != 0) {
-                        storage_record_failure(&producer_stats,
-                                               "slot_ownership_invariant_failed");
-                        (void)storage_emit_event(STORAGE_WORKER_FATAL, &rt, -1,
+                        storage_record_error(&producer_stats, STORAGE_ERR_OWNERSHIP,
+                                             "slot_ownership_invariant_failed");
+                        (void)storage_emit_event(STORAGE_WORKER_FATAL, &rt,
+                                                 STORAGE_ERR_OWNERSHIP,
                                                  dma_received_bytes,
                                                  producer_stats.receive_integrity_risk);
                         storage_stop_state_fail(&stop_state);
@@ -4273,6 +4303,7 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                         stop_harvest_stable = true;
                         if (storage_emit_stop_phase(
                                 &rt, STORAGE_WORKER_HARVEST_STABLE_EMPTY,
+                                STORAGE_ERR_NONE,
                                 dma_received_bytes, "harvest_stable_empty") != 0) {
                             storage_record_failure(
                                 &producer_stats,
@@ -4282,7 +4313,9 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                         break;
                     }
                     if (storage_stop_state_expired(&stop_state, now_us)) {
-                        storage_record_failure(&producer_stats, "stop_harvest_timeout");
+                        storage_record_error(&producer_stats,
+                                             STORAGE_ERR_STOP_HARVEST_TIMEOUT,
+                                             "stop_harvest_timeout");
                         storage_stop_state_fail(&stop_state);
                         goto out;
                     }
@@ -4319,7 +4352,8 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                                        STORAGE_EVENT_DMA_BD_EXHAUSTED, &rt,
                                        bd_snapshot.completed_unharvested,
                                        bd_snapshot.ready_slots, true);
-                    storage_record_failure(&producer_stats, "dma_bd_exhausted");
+                    storage_record_error(&producer_stats, STORAGE_ERR_DMA_DESCRIPTOR,
+                                         "dma_bd_exhausted");
                     if (!ring_full_logged) {
                         storage_emit_line(STORAGE_LOG_ALWAYS_CRITICAL, "storage_ddr_full channel=%d busy_slots=%u total_slots=%u"
                                           " buffered_bytes=%" PRIu64 " captured_bytes=%" PRIu64,
@@ -4328,7 +4362,8 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                                           bytes_captured);
                         ring_full_logged = true;
                     }
-                    storage_emit_event(STORAGE_WORKER_FATAL, &rt, -1, dma_received_bytes,
+                    storage_emit_event(STORAGE_WORKER_FATAL, &rt,
+                                       STORAGE_ERR_DMA_DESCRIPTOR, dma_received_bytes,
                                        "dma_bd_exhausted");
                     goto out;
                 }
@@ -4458,10 +4493,12 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                                 batch_item_invalid = true;
                                 break;
                             }
-                            storage_record_failure(&producer_stats,
-                                                   "late_completed_descriptor");
+                            storage_record_error(&producer_stats,
+                                                 STORAGE_ERR_LATE_COMPLETION,
+                                                 "late_completed_descriptor");
                             storage_record_deferred_stop_error(
-                                &write_queue, "late_completed_descriptor");
+                                &write_queue, STORAGE_ERR_LATE_COMPLETION,
+                                "late_completed_descriptor");
                             if (storage_release_harvested_slot(
                                     &write_queue, harvest_items[i].slot) != 0) {
                                 batch_item_invalid = true;
@@ -4515,6 +4552,10 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                             tail_disposition == STORAGE_STOP_TAIL_DEFER_LATE
                                 ? "late_completed_descriptor"
                                 : "unaligned_payload_not_safely_paddable";
+                        StorageErrorCode deferred_error =
+                            tail_disposition == STORAGE_STOP_TAIL_DEFER_LATE
+                                ? STORAGE_ERR_LATE_COMPLETION
+                                : STORAGE_ERR_TAIL_UNALIGNED;
 
                         if (tail_unqueued_bytes > UINT64_MAX - queued_bytes ||
                             storage_release_harvested_slot(
@@ -4526,8 +4567,10 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                         }
                         tail_unqueued_bytes += queued_bytes;
                         stop_tail_seen = true;
-                        storage_record_failure(&producer_stats, deferred_reason);
+                        storage_record_error(&producer_stats, deferred_error,
+                                             deferred_reason);
                         storage_record_deferred_stop_error(&write_queue,
+                                                           deferred_error,
                                                            deferred_reason);
                         continue;
                     }
@@ -4564,9 +4607,10 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                     storage_ring_event(&write_queue.producer_event_ring,
                                        STORAGE_EVENT_QUEUE_FULL, &rt,
                                        valid_count, write_queue.capacity, true);
-                    storage_record_failure(&producer_stats,
-                                           "storage_queue_full_or_state_error");
-                    storage_emit_event(STORAGE_WORKER_FATAL, &rt, -1, dma_received_bytes,
+                    storage_record_error(&producer_stats, STORAGE_ERR_QUEUE,
+                                         "storage_queue_full_or_state_error");
+                    storage_emit_event(STORAGE_WORKER_FATAL, &rt, STORAGE_ERR_QUEUE,
+                                       dma_received_bytes,
                                        "storage_queue_full_or_state_error");
                     goto out;
                 }
@@ -4588,8 +4632,10 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                 if (harvest_fatal || batch_item_invalid) {
                     if (batch_item_invalid && !harvest_fatal)
                         storage_record_failure(&producer_stats, "invalid_dma_harvest_bytes");
-                    storage_record_failure(&producer_stats, "dma_harvest_failed");
-                    storage_emit_event(STORAGE_WORKER_FATAL, &rt, -1, dma_received_bytes,
+                    storage_record_error(&producer_stats, STORAGE_ERR_DMA_DESCRIPTOR,
+                                         "dma_harvest_failed");
+                    storage_emit_event(STORAGE_WORKER_FATAL, &rt,
+                                       STORAGE_ERR_DMA_DESCRIPTOR, dma_received_bytes,
                                        producer_stats.receive_integrity_risk);
                     goto out;
                 }
@@ -4622,7 +4668,8 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
     }
     tail_incomplete = dma_s2mm_tail_incomplete(&rt);
     if (tail_incomplete) {
-        storage_record_failure(&producer_stats, "tail_descriptor_incomplete");
+        storage_record_error(&producer_stats, STORAGE_ERR_TAIL_UNALIGNED,
+                             "tail_descriptor_incomplete");
     }
     (void)storage_stop_state_advance(&stop_state, STORAGE_STOP_PRODUCER_DONE);
     producer_done_us = storage_wall_time_us();
@@ -4631,8 +4678,10 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
     dma_stop_attempted = true;
     stop_state.deadline_us = storage_wall_time_us() + stop_timeouts.writer_drain_us;
     if (storage_join_writer_deadline(writer_thread, stop_state.deadline_us) != 0) {
-        storage_record_failure(&producer_stats, "writer_drain_timeout");
-        (void)storage_emit_event(STORAGE_WORKER_FATAL, &rt, -1, dma_received_bytes,
+        storage_record_error(&producer_stats, STORAGE_ERR_NVME_TIMEOUT,
+                             "writer_drain_timeout");
+        (void)storage_emit_event(STORAGE_WORKER_FATAL, &rt, STORAGE_ERR_NVME_TIMEOUT,
+                                 dma_received_bytes,
                                  producer_stats.receive_integrity_risk);
         storage_queue_request_abort(&write_queue);
         stop_state.deadline_us = storage_wall_time_us() + stop_timeouts.nvme_abort_us;
@@ -4646,6 +4695,7 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
     writer_started = false;
     writer_drained_us = storage_wall_time_us();
     if (storage_emit_stop_phase(&rt, STORAGE_WORKER_WRITER_DRAINED,
+                                STORAGE_ERR_NONE,
                                 dma_received_bytes, "writer_drained") != 0) {
         storage_record_failure(&producer_stats,
                                "writer_drained_event_send_failed");
@@ -4661,7 +4711,8 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
     }
     if (dma_stop_result == DMA_STOP_FAILED) {
         dma_stop_failed = true;
-        storage_record_failure(&producer_stats, "dma_stop_recovery_failed");
+        storage_record_error(&producer_stats, STORAGE_ERR_DMA_STOP,
+                             "dma_stop_recovery_failed");
         dbg_printf("[DBG][WRITE] dma S2MM finalization failed ch=%d task=%s idx=%u\n",
                    cfg->id, args->task_no, (unsigned)effective_file_index);
     }
@@ -4696,6 +4747,7 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
     write_queue_ready = false;
     final_us = storage_wall_time_us();
     if (storage_emit_stop_phase(&rt, STORAGE_WORKER_FINALIZED,
+                                STORAGE_ERR_NONE,
                                 dma_received_bytes, "finalized") != 0) {
         storage_record_failure(&producer_stats, "finalized_event_send_failed");
         goto out;
@@ -5129,6 +5181,12 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
             result->max_completed_unharvested = producer_stats.max_completed_unharvested;
             result->max_occupied_bytes_est = producer_stats.max_occupied_bytes_est;
             result->submit_stall_max_us = rt.nvme_submit_stall_max_us;
+            result->primary_error = producer_stats.primary_error != STORAGE_ERR_NONE
+                                        ? producer_stats.primary_error
+                                        : rt.nvme_primary_error;
+            result->secondary_error = producer_stats.secondary_error != STORAGE_ERR_NONE
+                                          ? producer_stats.secondary_error
+                                          : rt.nvme_secondary_error;
             snprintf(result->integrity_risk,
                      sizeof(result->integrity_risk),
                      "%s",
@@ -5217,7 +5275,9 @@ out:
                 uint32_t i;
 
                 if (storage_stop_state_expired(&stop_state, storage_wall_time_us())) {
-                    storage_record_failure(&producer_stats, "stop_harvest_timeout");
+                    storage_record_error(&producer_stats,
+                                         STORAGE_ERR_STOP_HARVEST_TIMEOUT,
+                                         "stop_harvest_timeout");
                     break;
                 }
                 if (dma_harvest_completed_batch(&rt, stopped_items, 16u,
@@ -5315,6 +5375,9 @@ out:
                                 const char *reason = stop_tail_seen
                                     ? "late_completed_descriptor"
                                     : "unaligned_payload_not_safely_paddable";
+                                StorageErrorCode deferred_error = stop_tail_seen
+                                    ? STORAGE_ERR_LATE_COMPLETION
+                                    : STORAGE_ERR_TAIL_UNALIGNED;
                                 if (tail_unqueued_bytes > UINT64_MAX - bytes ||
                                     storage_release_harvested_slot(
                                         &write_queue, stopped_items[i].slot) != 0) {
@@ -5325,8 +5388,10 @@ out:
                                 }
                                 tail_unqueued_bytes += bytes;
                                 stop_tail_seen = true;
-                                storage_record_failure(&producer_stats, reason);
+                                storage_record_error(&producer_stats,
+                                                     deferred_error, reason);
                                 storage_record_deferred_stop_error(&write_queue,
+                                                                   deferred_error,
                                                                    reason);
                                 continue;
                             }
@@ -5378,7 +5443,8 @@ out:
         if (manual_stop_seen && !tail_incomplete && dma_quiesced) {
             tail_incomplete = dma_s2mm_tail_incomplete(&rt);
             if (tail_incomplete) {
-                storage_record_failure(&producer_stats, "tail_descriptor_incomplete");
+                storage_record_error(&producer_stats, STORAGE_ERR_TAIL_UNALIGNED,
+                                     "tail_descriptor_incomplete");
             }
         }
         if (stop_state.state == STORAGE_STOP_DMA_QUIESCING) {
@@ -5403,7 +5469,8 @@ out:
     if (writer_started) {
         stop_state.deadline_us = storage_wall_time_us() + stop_timeouts.writer_drain_us;
         if (storage_join_writer_deadline(writer_thread, stop_state.deadline_us) != 0) {
-            storage_record_failure(&producer_stats, "writer_drain_timeout");
+            storage_record_error(&producer_stats, STORAGE_ERR_NVME_TIMEOUT,
+                                 "writer_drain_timeout");
             storage_queue_request_abort(&write_queue);
             stop_state.deadline_us = storage_wall_time_us() + stop_timeouts.nvme_abort_us;
             if (storage_join_writer_deadline(writer_thread, stop_state.deadline_us) != 0) {
@@ -5427,7 +5494,8 @@ out:
         dma_stop_result = finalize_result;
         if (finalize_result == DMA_STOP_FAILED) {
             dma_stop_failed = true;
-            storage_record_failure(&producer_stats, "dma_stop_recovery_failed");
+            storage_record_error(&producer_stats, STORAGE_ERR_DMA_STOP,
+                                 "dma_stop_recovery_failed");
         }
     }
     if (!stop_failed_phase_sent && capture_start_us != 0u &&
@@ -5437,7 +5505,10 @@ out:
             if (g_storage_stop_epoch == 0u) g_storage_stop_epoch = 1u;
         }
         (void)storage_emit_stop_phase(
-            &rt, STORAGE_WORKER_FAILED_FATAL, dma_received_bytes,
+            &rt, STORAGE_WORKER_FAILED_FATAL,
+            producer_stats.primary_error != STORAGE_ERR_NONE
+                ? producer_stats.primary_error : STORAGE_ERR_INTERNAL,
+            dma_received_bytes,
             producer_stats.receive_integrity_risk[0] != '\0'
                 ? producer_stats.receive_integrity_risk : "storage_fatal");
         stop_failed_phase_sent = true;
@@ -5526,6 +5597,14 @@ out:
             result->max_completed_unharvested = producer_stats.max_completed_unharvested;
             result->max_occupied_bytes_est = producer_stats.max_occupied_bytes_est;
             result->submit_stall_max_us = rt.nvme_submit_stall_max_us;
+            result->primary_error = producer_stats.primary_error != STORAGE_ERR_NONE
+                                        ? producer_stats.primary_error
+                                        : (rt.nvme_primary_error != STORAGE_ERR_NONE
+                                               ? rt.nvme_primary_error
+                                               : STORAGE_ERR_INTERNAL);
+            result->secondary_error = producer_stats.secondary_error != STORAGE_ERR_NONE
+                                          ? producer_stats.secondary_error
+                                          : rt.nvme_secondary_error;
             snprintf(result->integrity_risk, sizeof(result->integrity_risk), "%s",
                      producer_stats.receive_integrity_risk[0] ?
                      producer_stats.receive_integrity_risk : "storage_error");

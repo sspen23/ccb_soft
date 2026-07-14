@@ -7,7 +7,7 @@
 #include <stdatomic.h>
 
 #define STORAGE_IPC_MAGIC 0x53544732u
-#define STORAGE_IPC_VERSION 5u
+#define STORAGE_IPC_VERSION 6u
 
 typedef enum {
     STORAGE_CTRL_ARM = 1,
@@ -96,7 +96,7 @@ typedef struct {
     uint32_t type;
     uint32_t channel;
     uint64_t timestamp_us;
-    int32_t error_code;
+    StorageErrorCode error_code;
     uint32_t reserved;
     uint64_t received_bytes;
     uint64_t stop_epoch;
@@ -126,7 +126,7 @@ bool storage_ipc_parent_stop_should_force_reap(bool worker_live, bool already_fo
 void storage_ipc_make_control(StorageControlMessage *msg, StorageControlType type,
                               uint64_t timestamp_us);
 void storage_ipc_make_event(StorageWorkerEvent *event, StorageWorkerEventType type,
-                            uint32_t channel, int32_t error_code,
+                            uint32_t channel, StorageErrorCode error_code,
                             uint64_t received_bytes, const char *reason);
 int storage_ipc_write_control(int fd, const StorageControlMessage *msg);
 int storage_ipc_write_control_deadline(int fd, const StorageControlMessage *msg,
