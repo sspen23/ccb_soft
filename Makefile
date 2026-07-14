@@ -19,6 +19,8 @@ STORAGE_QUEUE_SRC := src/storage_queue.c
 STORAGE_STOP_SRC := src/storage_stop.c
 STORAGE_WRITER_SRC := src/storage_writer.c
 STORAGE_HEALTH_SRC := src/storage_health.c
+STORAGE_CONTROLLER_SRC := src/storage_controller.c
+STORAGE_PROCESS_SRC := src/storage_process.c
 
 SRCS := \
 	src/system.c \
@@ -39,9 +41,11 @@ SRCS := \
 	src/ccb_storage_commit.c \
 	src/ccb_storage_sync_outbox.c \
 	src/storage_config.c \
+	src/storage_controller.c \
 	src/storage_error.c \
 	src/storage_health.c \
 	src/storage_queue.c \
+	src/storage_process.c \
 	src/storage_stop.c \
 	src/storage_worker.c \
 	src/storage_writer.c \
@@ -64,6 +68,9 @@ mock-bd-test:
 	/tmp/mock_bd_ring_test
 
 storage-host-tests:
+	$(CC) $(CFLAGS) -Wformat=2 -Iinclude tests/mock_storage_controller_test.c \
+		$(STORAGE_CONTROLLER_SRC) $(STORAGE_ERROR_SRC) -o /tmp/mock_storage_controller_test
+	/tmp/mock_storage_controller_test
 	$(CC) $(CFLAGS) -Wformat=2 -Iinclude tests/mock_storage_health_test.c \
 		$(STORAGE_HEALTH_SRC) -lpthread -o /tmp/mock_storage_health_test
 	/tmp/mock_storage_health_test
