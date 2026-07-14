@@ -2,6 +2,8 @@
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdatomic.h>
+#include <stdlib.h>
+#include <stdint.h>
 #include <unistd.h>
 #include "ccb_storage_ipc.h"
 
@@ -74,5 +76,55 @@ int main(void)
     assert(storage_ipc_write_event_deadline(
                p[1], &e, storage_ipc_monotonic_us()) != 0);
     close(p[0]); close(p[1]);
+    {
+        StorageParentStopTimeoutConfig stop_config;
+
+        unsetenv("SRC_REAL_STORAGE_PARENT_STOP_TIMEOUT_US");
+        unsetenv("SRC_REAL_STORAGE_PARENT_STOP_TIMEOUT_MS");
+        setenv("SRC_REAL_DMA_QUIESCE_TIMEOUT_US", "100000", 1);
+        setenv("SRC_REAL_STOP_HARVEST_TIMEOUT_US", "100000", 1);
+        setenv("SRC_REAL_WRITER_DRAIN_TIMEOUT_US", "100000", 1);
+        setenv("SRC_REAL_NVME_ABORT_TIMEOUT_US", "100000", 1);
+        storage_ipc_parent_stop_timeout_config(&stop_config, 5000000u);
+        assert(stop_config.source == STORAGE_PARENT_STOP_TIMEOUT_CALCULATED);
+        assert(stop_config.stage_total_us == 400000u);
+        assert(stop_config.margin_us == 5000000u);
+        assert(stop_config.parent_timeout_us == 5400000u);
+        /* A worker still inside its writer-drain phase is not reaped. */
+        assert(!storage_ipc_parent_stop_should_force_reap(
+            true, false, 300000u, stop_config.parent_timeout_us));
+
+        setenv("SRC_REAL_STORAGE_PARENT_STOP_TIMEOUT_MS", "321", 1);
+        setenv("SRC_REAL_STORAGE_PARENT_STOP_TIMEOUT_US", "123456", 1);
+        storage_ipc_parent_stop_timeout_config(&stop_config, 5000000u);
+        assert(stop_config.source == STORAGE_PARENT_STOP_TIMEOUT_EXPLICIT_US);
+        assert(stop_config.parent_timeout_us == 123456u);
+        unsetenv("SRC_REAL_STORAGE_PARENT_STOP_TIMEOUT_US");
+        storage_ipc_parent_stop_timeout_config(&stop_config, 5000000u);
+        assert(stop_config.source == STORAGE_PARENT_STOP_TIMEOUT_EXPLICIT_MS);
+        assert(stop_config.parent_timeout_us == 321000u);
+        unsetenv("SRC_REAL_STORAGE_PARENT_STOP_TIMEOUT_MS");
+
+        setenv("SRC_REAL_DMA_QUIESCE_TIMEOUT_US", "18446744073709551615", 1);
+        setenv("SRC_REAL_STOP_HARVEST_TIMEOUT_US", "18446744073709551615", 1);
+        setenv("SRC_REAL_WRITER_DRAIN_TIMEOUT_US", "18446744073709551615", 1);
+        setenv("SRC_REAL_NVME_ABORT_TIMEOUT_US", "18446744073709551615", 1);
+        storage_ipc_parent_stop_timeout_config(&stop_config, 5000000u);
+        assert(stop_config.stage_total_us == UINT64_MAX);
+        assert(stop_config.parent_timeout_us == UINT64_MAX);
+        assert(storage_ipc_saturating_add_u64(UINT64_MAX - 1u, 100u) == UINT64_MAX);
+
+        /* A reaped worker never escalates; a live worker crosses the parent
+         * deadline once, then the pending STOP latch suppresses repeats. */
+        assert(!storage_ipc_parent_stop_should_force_reap(false, false, 10u, 1u));
+        assert(!storage_ipc_parent_stop_should_force_reap(true, false, 9u, 10u));
+        assert(storage_ipc_parent_stop_should_force_reap(true, false, 10u, 10u));
+        assert(!storage_ipc_parent_stop_should_force_reap(true, true, 11u, 10u));
+
+        unsetenv("SRC_REAL_DMA_QUIESCE_TIMEOUT_US");
+        unsetenv("SRC_REAL_STOP_HARVEST_TIMEOUT_US");
+        unsetenv("SRC_REAL_WRITER_DRAIN_TIMEOUT_US");
+        unsetenv("SRC_REAL_NVME_ABORT_TIMEOUT_US");
+    }
     puts("mock_storage_ipc_test: ok"); return 0;
 }

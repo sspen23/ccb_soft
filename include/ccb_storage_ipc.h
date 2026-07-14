@@ -32,6 +32,23 @@ typedef struct {
 } StorageControlReader;
 
 typedef enum {
+    STORAGE_PARENT_STOP_TIMEOUT_EXPLICIT_US = 0,
+    STORAGE_PARENT_STOP_TIMEOUT_EXPLICIT_MS,
+    STORAGE_PARENT_STOP_TIMEOUT_CALCULATED
+} StorageParentStopTimeoutSource;
+
+typedef struct {
+    uint64_t parent_timeout_us;
+    uint64_t dma_quiesce_us;
+    uint64_t stop_harvest_us;
+    uint64_t writer_drain_us;
+    uint64_t nvme_abort_us;
+    uint64_t stage_total_us;
+    uint64_t margin_us;
+    StorageParentStopTimeoutSource source;
+} StorageParentStopTimeoutConfig;
+
+typedef enum {
     STORAGE_WORKER_READY = 1,
     STORAGE_WORKER_ARMED = 2,
     STORAGE_WORKER_RUNNING = 3,
@@ -80,6 +97,13 @@ _Static_assert(sizeof(StorageControlMessage) <= 4096u, "control must fit PIPE_BU
 _Static_assert(sizeof(StorageWorkerEvent) <= 4096u, "event must fit PIPE_BUF");
 
 uint64_t storage_ipc_monotonic_us(void);
+uint64_t storage_ipc_saturating_add_u64(uint64_t a, uint64_t b);
+void storage_ipc_parent_stop_timeout_config(StorageParentStopTimeoutConfig *out,
+                                            uint64_t worker_compat_default_us);
+const char *storage_ipc_parent_stop_timeout_source(
+    StorageParentStopTimeoutSource source);
+bool storage_ipc_parent_stop_should_force_reap(bool worker_live, bool already_forced,
+                                               uint64_t now_us, uint64_t deadline_us);
 void storage_ipc_make_control(StorageControlMessage *msg, StorageControlType type,
                               uint64_t timestamp_us);
 void storage_ipc_make_event(StorageWorkerEvent *event, StorageWorkerEventType type,

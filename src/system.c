@@ -1334,29 +1334,6 @@ static void network_throttle_after_chunk(uint64_t chunk_start_us,
     }
 }
 
-static uint64_t storage_parent_stop_timeout_us(void)
-{
-    const char *value = getenv("SRC_REAL_STORAGE_STOP_TIMEOUT_US");
-    char *end = NULL;
-    unsigned long long parsed;
-
-    if (value && value[0] != '\0') {
-        errno = 0;
-        parsed = strtoull(value, &end, 0);
-        if (errno == 0 && end != value && *end == '\0' && parsed > 0u)
-            return (uint64_t)parsed;
-    }
-    value = getenv("SRC_REAL_STORAGE_STOP_TIMEOUT_MS");
-    if (value && value[0] != '\0') {
-        errno = 0;
-        parsed = strtoull(value, &end, 0);
-        if (errno == 0 && end != value && *end == '\0' && parsed > 0u &&
-            parsed <= UINT64_MAX / 1000ull)
-            return (uint64_t)parsed * 1000ull;
-    }
-    return 120000ull * 1000ull;
-}
-
 /* STOP is serviced from the main loop rather than from the UART frame
  * handler.  This keeps UART input and worker event draining alive while the
  * independent DMA/NVMe/writer deadlines run in the child processes. */
@@ -1367,9 +1344,9 @@ static void storage_service_pending_stop(void)
 
     if (!g_pending_storage_stop.active) return;
     if (storage_any_live_worker()) {
-        if (!g_pending_storage_stop.forced_reap &&
-            g_pending_storage_stop.deadline_us != 0u &&
-            storage_ipc_monotonic_us() >= g_pending_storage_stop.deadline_us) {
+        if (storage_ipc_parent_stop_should_force_reap(
+                true, g_pending_storage_stop.forced_reap,
+                storage_ipc_monotonic_us(), g_pending_storage_stop.deadline_us)) {
             LOG_ERROR("STORAGE", "pending STOP deadline expired task=%s; forcing reap",
                       g_pending_storage_stop.task_id);
             g_pending_storage_stop.forced_reap = true;
@@ -4257,6 +4234,8 @@ void handle_frame(uint8_t *f)
                          g_pending_storage_stop.task_id);
                 break;
             } else {
+                StorageParentStopTimeoutConfig parent_stop_config;
+                uint64_t stop_started_us;
                 if (g_pending_storage_start.active) {
                     /* A manual STOP supersedes a still-pending PREP/START
                      * barrier; its deferred 0x11 failure ACK is completed by
@@ -4280,8 +4259,26 @@ void handle_frame(uint8_t *f)
                 g_pending_storage_stop.acq_type = acq_type;
                 g_pending_storage_stop.failure_type = failure_type;
                 g_pending_storage_stop.requested_workers = stopped;
-                g_pending_storage_stop.deadline_us = storage_ipc_monotonic_us() +
-                    storage_parent_stop_timeout_us();
+                storage_ipc_parent_stop_timeout_config(&parent_stop_config,
+                                                       DEFAULT_TIMEOUT_US);
+                stop_started_us = storage_ipc_monotonic_us();
+                g_pending_storage_stop.deadline_us = storage_ipc_saturating_add_u64(
+                    stop_started_us, parent_stop_config.parent_timeout_us);
+                system_emit_line("storage_parent_stop_config task=%s parent_timeout_us=%" PRIu64
+                                 " source=%s dma_quiesce_us=%" PRIu64
+                                 " stop_harvest_us=%" PRIu64
+                                 " writer_drain_us=%" PRIu64
+                                 " nvme_abort_us=%" PRIu64
+                                 " margin_us=%" PRIu64,
+                                 g_pending_storage_stop.task_id,
+                                 parent_stop_config.parent_timeout_us,
+                                 storage_ipc_parent_stop_timeout_source(
+                                     parent_stop_config.source),
+                                 parent_stop_config.dma_quiesce_us,
+                                 parent_stop_config.stop_harvest_us,
+                                 parent_stop_config.writer_drain_us,
+                                 parent_stop_config.nvme_abort_us,
+                                 parent_stop_config.margin_us);
                 /* The binary STOP ACK is deferred until all worker terminals
                  * are observed.  No text ACK is emitted here. */
                 return;

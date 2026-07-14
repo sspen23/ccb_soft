@@ -1,8 +1,10 @@
 #include "ccb_storage_ipc.h"
 
 #include <errno.h>
+#include <limits.h>
 #include <poll.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
@@ -12,6 +14,103 @@ uint64_t storage_ipc_monotonic_us(void)
     struct timespec ts;
     if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0u;
     return (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)ts.tv_nsec / 1000ull;
+}
+
+uint64_t storage_ipc_saturating_add_u64(uint64_t a, uint64_t b)
+{
+    return a > UINT64_MAX - b ? UINT64_MAX : a + b;
+}
+
+static uint64_t storage_ipc_saturating_mul_u64(uint64_t a, uint64_t b)
+{
+    if (a == 0u || b == 0u) return 0u;
+    return a > UINT64_MAX / b ? UINT64_MAX : a * b;
+}
+
+static bool storage_ipc_parse_u64_env(const char *name, uint64_t *out)
+{
+    const char *value;
+    char *end = NULL;
+    unsigned long long parsed;
+
+    if (!name || !out || !(value = getenv(name)) || value[0] == '\0') return false;
+    errno = 0;
+    parsed = strtoull(value, &end, 0);
+    if (errno != 0 || end == value || *end != '\0' || parsed == 0u) return false;
+    *out = (uint64_t)parsed;
+    return true;
+}
+
+static uint64_t storage_ipc_timeout_env_us(const char *us_name, const char *ms_name,
+                                           uint64_t fallback_us)
+{
+    uint64_t value;
+
+    if (storage_ipc_parse_u64_env(us_name, &value)) return value;
+    if (storage_ipc_parse_u64_env(ms_name, &value))
+        return storage_ipc_saturating_mul_u64(value, 1000u);
+    return fallback_us;
+}
+
+const char *storage_ipc_parent_stop_timeout_source(
+    StorageParentStopTimeoutSource source)
+{
+    switch (source) {
+    case STORAGE_PARENT_STOP_TIMEOUT_EXPLICIT_US: return "explicit_us";
+    case STORAGE_PARENT_STOP_TIMEOUT_EXPLICIT_MS: return "explicit_ms";
+    case STORAGE_PARENT_STOP_TIMEOUT_CALCULATED: return "calculated";
+    default: return "calculated";
+    }
+}
+
+void storage_ipc_parent_stop_timeout_config(StorageParentStopTimeoutConfig *out,
+                                            uint64_t worker_compat_default_us)
+{
+    uint64_t compat_us;
+    uint64_t explicit_value;
+
+    if (!out) return;
+    memset(out, 0, sizeof(*out));
+    compat_us = storage_ipc_timeout_env_us("SRC_REAL_STORAGE_STOP_TIMEOUT_US",
+                                           "SRC_REAL_STORAGE_STOP_TIMEOUT_MS",
+                                           worker_compat_default_us);
+    out->dma_quiesce_us = storage_ipc_timeout_env_us(
+        "SRC_REAL_DMA_QUIESCE_TIMEOUT_US", NULL, compat_us);
+    out->stop_harvest_us = storage_ipc_timeout_env_us(
+        "SRC_REAL_STOP_HARVEST_TIMEOUT_US", NULL, compat_us);
+    out->writer_drain_us = storage_ipc_timeout_env_us(
+        "SRC_REAL_WRITER_DRAIN_TIMEOUT_US", NULL, compat_us);
+    out->nvme_abort_us = storage_ipc_timeout_env_us(
+        "SRC_REAL_NVME_ABORT_TIMEOUT_US", NULL,
+        out->writer_drain_us < compat_us ? compat_us : out->writer_drain_us);
+    out->stage_total_us = storage_ipc_saturating_add_u64(out->dma_quiesce_us,
+                                                          out->stop_harvest_us);
+    out->stage_total_us = storage_ipc_saturating_add_u64(out->stage_total_us,
+                                                          out->writer_drain_us);
+    out->stage_total_us = storage_ipc_saturating_add_u64(out->stage_total_us,
+                                                          out->nvme_abort_us);
+    out->margin_us = out->stage_total_us / 10u;
+    if (out->margin_us < 5000000u) out->margin_us = 5000000u;
+
+    if (storage_ipc_parse_u64_env("SRC_REAL_STORAGE_PARENT_STOP_TIMEOUT_US",
+                                  &explicit_value)) {
+        out->parent_timeout_us = explicit_value;
+        out->source = STORAGE_PARENT_STOP_TIMEOUT_EXPLICIT_US;
+    } else if (storage_ipc_parse_u64_env("SRC_REAL_STORAGE_PARENT_STOP_TIMEOUT_MS",
+                                         &explicit_value)) {
+        out->parent_timeout_us = storage_ipc_saturating_mul_u64(explicit_value, 1000u);
+        out->source = STORAGE_PARENT_STOP_TIMEOUT_EXPLICIT_MS;
+    } else {
+        out->parent_timeout_us = storage_ipc_saturating_add_u64(out->stage_total_us,
+                                                                 out->margin_us);
+        out->source = STORAGE_PARENT_STOP_TIMEOUT_CALCULATED;
+    }
+}
+
+bool storage_ipc_parent_stop_should_force_reap(bool worker_live, bool already_forced,
+                                               uint64_t now_us, uint64_t deadline_us)
+{
+    return worker_live && !already_forced && deadline_us != 0u && now_us >= deadline_us;
 }
 
 static int storage_ipc_write_full(int fd, const void *buf, size_t size)
