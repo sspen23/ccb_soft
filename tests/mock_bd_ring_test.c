@@ -129,6 +129,20 @@ int main(void)
     assert(dma_harvest_completed_batch(&rt, harvested, 4u, &harvested_count) == 0);
     assert(harvested_count == 0u);
 
+    /* STOP harvesting must not treat the first empty observation as final:
+     * a descriptor can become visible on a later scan after S2MM quiesces. */
+    init_runtime(&rt, &cfg, desc, dma_regs);
+    dma_regs[TEST_S2MM_DMASR / 4u] = 1u;
+    assert(dma_quiesce_s2mm(&rt, 1u, &stop_report) == 0);
+    assert(dma_harvest_completed_batch(&rt, harvested, 4u, &harvested_count) == 0);
+    assert(harvested_count == 0u && rt.next_harvest_bd == 0u);
+    desc[0].status = TEST_DESC_CMPLT | 768u;
+    assert(dma_harvest_completed_batch(&rt, harvested, 4u, &harvested_count) == 0);
+    assert(harvested_count == 1u && harvested[0].slot == 0u &&
+           harvested[0].actual_bytes == 768u && rt.next_harvest_bd == 1u);
+    assert(dma_harvest_completed_batch(&rt, harvested, 4u, &harvested_count) == 0);
+    assert(harvested_count == 0u && rt.next_harvest_bd == 1u);
+
     init_runtime(&rt, &cfg, desc, dma_regs);
     desc[0].status = TEST_DESC_CMPLT | 512u;
     dma_regs[TEST_S2MM_DMASR / 4u] = 1u;

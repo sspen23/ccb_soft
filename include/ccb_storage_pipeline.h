@@ -6,18 +6,27 @@
 #include <pthread.h>
 
 typedef enum {
-    STORAGE_CAPTURE_ACCEPTING = 0,
-    STORAGE_CAPTURE_STOP_LATCHED,
-    STORAGE_CAPTURE_DMA_QUIESCING,
-    STORAGE_CAPTURE_HARVESTING_COMPLETED,
-    STORAGE_CAPTURE_WRITER_DRAINING,
-    STORAGE_CAPTURE_FINALIZING
-} StorageCaptureState;
+    STORAGE_STOP_NONE = 0,
+    STORAGE_STOP_REQUESTED,
+    STORAGE_STOP_WAIT_BOUNDARY,
+    STORAGE_STOP_DMA_QUIESCING,
+    STORAGE_STOP_HARVESTING,
+    STORAGE_STOP_PRODUCER_DONE,
+    STORAGE_STOP_WRITER_DRAINING,
+    STORAGE_STOP_FINALIZING,
+    STORAGE_STOP_FINISHED,
+    STORAGE_STOP_FAILED
+} StorageStopPhase;
 
 typedef struct {
-    StorageCaptureState state;
+    StorageStopPhase state;
     uint64_t deadline_us;
 } StorageStopState;
+
+typedef struct {
+    uint32_t consecutive_empty_scans;
+    uint64_t empty_since_us;
+} StorageStopHarvestState;
 
 typedef struct {
     bool writer_enabled;
@@ -86,8 +95,18 @@ uint32_t storage_harvest_limit_for_remaining(uint64_t remaining_bytes,
                                              uint32_t max_batch);
 void storage_stop_state_init(StorageStopState *state);
 bool storage_stop_state_latch(StorageStopState *state, uint64_t deadline_us);
-int storage_stop_state_advance(StorageStopState *state, StorageCaptureState next);
+int storage_stop_state_advance(StorageStopState *state, StorageStopPhase next);
+void storage_stop_state_fail(StorageStopState *state);
 bool storage_stop_state_expired(const StorageStopState *state, uint64_t now_us);
+void storage_stop_harvest_state_init(StorageStopHarvestState *state);
+bool storage_stop_harvest_observe(StorageStopHarvestState *state,
+                                  bool dma_quiesced,
+                                  uint32_t harvested_count,
+                                  uint32_t completed_unharvested,
+                                  bool rx_packet_open,
+                                  uint64_t now_us,
+                                  uint32_t required_empty_scans,
+                                  uint64_t stable_window_us);
 void storage_run_state_init(StorageRunState *state);
 int storage_run_state_enable_writer(StorageRunState *state);
 int storage_run_state_set_writer_ready(StorageRunState *state, bool success);
