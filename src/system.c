@@ -6,6 +6,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -43,6 +44,7 @@
 #include "ccb_tcp_transfer.h"
 #include "debug_uart.h"
 #include "storage_config.h"
+#include "storage_health.h"
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
@@ -161,6 +163,13 @@ typedef struct {
 } StoragePendingStart;
 
 static StoragePendingStart g_pending_storage_start;
+
+typedef struct {
+    bool active;
+    uint64_t deadline_us;
+} NetworkPendingStop;
+
+static NetworkPendingStop g_pending_network_stop;
 
 #define STORAGE_START_PENDING 0xFEu
 
@@ -1362,37 +1371,21 @@ static int network_output_has_stop_request(const Task *task)
             strstr(task->output, "network_send_stopped") != NULL);
 }
 
-static uint8_t wait_network_worker_finished_after_stop(void)
+static void service_pending_network_stop(void)
 {
-    uint32_t waited_ms = 0u;
-    uint32_t timeout_ms = env_u32_or_default("SRC_REAL_NETWORK_STOP_TIMEOUT_MS", 30000u);
+    uint8_t result;
 
-    while (transfer_task.state == RUNNING) {
-        check_task(&transfer_task);
-        if (transfer_task.state != RUNNING) {
-            break;
-        }
-        if (waited_ms >= timeout_ms) {
-            LOG_ERROR("NETWORK",
-                      "Timed out waiting for network worker to stop: pid=%d timeout_ms=%u",
-                      transfer_task.pid,
-                      (unsigned)timeout_ms);
-            dbg_printf("[DBG][NET] stop wait timeout pid=%d timeout_ms=%u\n",
-                       transfer_task.pid,
-                       (unsigned)timeout_ms);
-            kill(transfer_task.pid, SIGKILL);
-            (void)waitpid(transfer_task.pid, NULL, 0);
-            if (transfer_task.output_fd >= 0) {
-                close(transfer_task.output_fd);
-                transfer_task.output_fd = -1;
-            }
-            transfer_task.state = ERROR;
-            return ACK_FAILED;
-        }
-        usleep(1000);
-        ++waited_ms;
+    if (!g_pending_network_stop.active) return;
+    if (transfer_task.state == RUNNING &&
+        storage_ipc_monotonic_us() < g_pending_network_stop.deadline_us)
+        return;
+    result = ACK_SUCCESS;
+    if (transfer_task.state == RUNNING) {
+        LOG_ERROR("NETWORK", "Timed out waiting for network worker to stop: pid=%d",
+                  transfer_task.pid);
+        (void)kill(transfer_task.pid, SIGKILL);
+        result = ACK_FAILED;
     }
-
     if (transfer_task.state == ERROR) {
         if (network_output_has_stop_request(&transfer_task)) {
             LOG_INFO("NETWORK", "Network worker stopped by request: output=%s",
@@ -1400,16 +1393,16 @@ static uint8_t wait_network_worker_finished_after_stop(void)
             dbg_printf("[DBG][NET] stop wait accepted requested stop output=%s\n",
                        transfer_task.output);
             transfer_task.state = IDLE;
-            return ACK_SUCCESS;
+            result = ACK_SUCCESS;
+        } else {
+            LOG_ERROR("NETWORK", "Network worker failed while stopping: output=%s",
+                      transfer_task.output);
+            dbg_printf("[DBG][NET] stop wait failed output=%s\n", transfer_task.output);
+            result = ACK_FAILED;
         }
-        LOG_ERROR("NETWORK", "Network worker failed while stopping: output=%s",
-                  transfer_task.output);
-        dbg_printf("[DBG][NET] stop wait failed output=%s\n", transfer_task.output);
-        return ACK_FAILED;
     }
-
-    dbg_printf("[DBG][NET] stop wait done waited_ms=%u\n", (unsigned)waited_ms);
-    return ACK_SUCCESS;
+    proto_send_ack(CMD_STOP_TRANSFER, result);
+    memset(&g_pending_network_stop, 0, sizeof(g_pending_network_stop));
 }
 
 static const char *file_type_name_from_proto(uint32_t proto_file_type)
@@ -3869,6 +3862,89 @@ static uint8_t delete_file_from_command(const CmdFileOp *op)
     return ACK_SUCCESS;
 }
 
+typedef enum {
+    MAINTENANCE_NONE = 0,
+    MAINTENANCE_SYNC_FLASH,
+    MAINTENANCE_CLEAR_FILES,
+    MAINTENANCE_DELETE_FILE
+} MaintenanceOperation;
+
+typedef struct {
+    pthread_t thread;
+    atomic_bool done;
+    bool active;
+    MaintenanceOperation operation;
+    uint8_t response_cmd;
+    uint8_t result;
+    CmdFileOp file_op;
+} MaintenanceJob;
+
+static MaintenanceJob g_maintenance_job;
+
+static void *maintenance_job_thread(void *unused)
+{
+    uint8_t result = ACK_FAILED;
+
+    (void)unused;
+    switch (g_maintenance_job.operation) {
+    case MAINTENANCE_SYNC_FLASH:
+        result = sync_filelist_db_to_flash();
+        break;
+    case MAINTENANCE_CLEAR_FILES:
+        result = clear_file_list_records();
+        break;
+    case MAINTENANCE_DELETE_FILE:
+        result = delete_file_from_command(&g_maintenance_job.file_op);
+        break;
+    default:
+        result = ACK_INVALID_PARAM;
+        break;
+    }
+    g_maintenance_job.result = result;
+    atomic_store_explicit(&g_maintenance_job.done, true,
+                          memory_order_release);
+    return NULL;
+}
+
+static int start_maintenance_job(MaintenanceOperation operation,
+                                 uint8_t response_cmd,
+                                 const CmdFileOp *file_op)
+{
+    if (g_maintenance_job.active || operation == MAINTENANCE_NONE) return -1;
+    memset(&g_maintenance_job, 0, sizeof(g_maintenance_job));
+    g_maintenance_job.active = true;
+    g_maintenance_job.operation = operation;
+    g_maintenance_job.response_cmd = response_cmd;
+    if (file_op) g_maintenance_job.file_op = *file_op;
+    atomic_init(&g_maintenance_job.done, false);
+    if (pthread_create(&g_maintenance_job.thread, NULL,
+                       maintenance_job_thread, NULL) != 0) {
+        memset(&g_maintenance_job, 0, sizeof(g_maintenance_job));
+        return -1;
+    }
+    return 0;
+}
+
+static void service_maintenance_job(void)
+{
+    uint8_t response_cmd;
+    uint8_t result;
+
+    if (!g_maintenance_job.active ||
+        !atomic_load_explicit(&g_maintenance_job.done, memory_order_acquire))
+        return;
+    (void)pthread_join(g_maintenance_job.thread, NULL);
+    response_cmd = g_maintenance_job.response_cmd;
+    result = g_maintenance_job.result;
+    memset(&g_maintenance_job, 0, sizeof(g_maintenance_job));
+    if (response_cmd == CMD_FILE_LIST && result == ACK_SUCCESS) {
+        proto_send_file_list("", ACK_SUCCESS, 0u, 0u, 0u, 0u, 0u, 0u,
+                             FILE_LIST_FLAG_END, 0u);
+    } else {
+        proto_send_ack(response_cmd, result);
+    }
+}
+
 static uint8_t start_network_from_command(const CmdFileOp *op)
 {
     char task_id[12];
@@ -3917,93 +3993,57 @@ static uint8_t start_network_from_command(const CmdFileOp *op)
     return ACK_SUCCESS;
 }
 
-static int probe_one_storage_channel(const ChannelConfig *cfg, GlobalOptions gopt)
+static StorageErrorCode probe_one_storage_channel(
+    uint32_t channel, void *ctx, StorageHealthSnapshot *snapshot)
 {
+    const ChannelConfig *cfg = find_channel((int)channel);
+    const AppConfig *config = storage_config_get();
+    GlobalOptions gopt;
     ChannelRuntime rt;
-    int rc = -1;
 
-    if (!cfg) {
-        return -1;
-    }
+    (void)ctx;
+    if (!snapshot) return STORAGE_ERR_INTERNAL;
+    memset(snapshot, 0, sizeof(*snapshot));
+    snapshot->channel = channel;
+    memset(&gopt, 0, sizeof(gopt));
+    gopt.timeout_us = config && config->status_timeout_ms <= UINT32_MAX / 1000u
+                           ? config->status_timeout_ms * 1000u
+                           : DEFAULT_TIMEOUT_US;
+    if (!cfg) return STORAGE_ERR_CONFIG;
 
     memset(&rt, 0, sizeof(rt));
-    dbg_verbose_printf("[DBG][DISK] probe start ch=%d name=%s timeout_us=%u\n",
-                       cfg->id, cfg->name, (unsigned)gopt.timeout_us);
-
-    if (channel_runtime_open(&rt, cfg, gopt) != 0) {
-        LOG_ERROR("DISK", "Channel open failed: ch=%d name=%s", cfg->id, cfg->name);
-        dbg_printf("[DBG][DISK] open failed ch=%d name=%s\n", cfg->id, cfg->name);
-        return -1;
-    }
+    if (channel_runtime_open(&rt, cfg, gopt) != 0)
+        return STORAGE_ERR_PCIE_LINK;
+    snapshot->pcie_link = true;
 
     if (nvme_probe(&rt) != 0) {
-        LOG_ERROR("DISK", "NVMe probe failed: ch=%d name=%s", cfg->id, cfg->name);
-        dbg_printf("[DBG][DISK] nvme_probe failed ch=%d name=%s\n", cfg->id, cfg->name);
-        goto out;
+        channel_runtime_close(&rt);
+        return STORAGE_ERR_NVME_PROBE;
     }
+    snapshot->nvme_ready = true;
 
     if (rt.nvme_block_size == 0u ||
-        rt.nvme_max_dts_bytes < rt.nvme_block_size) {
-        LOG_ERROR("DISK",
-                  "Invalid NVMe capability: ch=%d block=%u max_dts=%u max_lba=0x%08" PRIx64,
-                  cfg->id,
-                  rt.nvme_block_size,
-                  rt.nvme_max_dts_bytes,
-                  rt.nvme_max_lba);
-        dbg_printf("[DBG][DISK] capability failed ch=%d block=%u max_dts=%u max_lba=0x%08" PRIx64 "\n",
-                   cfg->id,
-                   rt.nvme_block_size,
-                   rt.nvme_max_dts_bytes,
-                   rt.nvme_max_lba);
-        goto out;
+        rt.nvme_max_dts_bytes < rt.nvme_block_size ||
+        rt.nvme_max_lba == 0u) {
+        channel_runtime_close(&rt);
+        return STORAGE_ERR_NVME_PROBE;
     }
-    if (rt.nvme_max_lba == 0u) {
-        LOG_ERROR("DISK", "NVMe max_lba unavailable: ch=%d name=%s", cfg->id, cfg->name);
-        dbg_printf("[DBG][DISK] max_lba unavailable ch=%d name=%s\n", cfg->id, cfg->name);
-        goto out;
-    }
-
-    LOG_INFO("DISK",
-             "NVMe probe OK: ch=%d name=%s block=%u max_dts=%u max_lba=0x%08" PRIx64,
-             cfg->id,
-             cfg->name,
-             rt.nvme_block_size,
-             rt.nvme_max_dts_bytes,
-             rt.nvme_max_lba);
-    dbg_verbose_printf("[DBG][DISK] probe ok ch=%d name=%s block=%u max_dts=%u max_lba=0x%08" PRIx64 "\n",
-                       cfg->id,
-                       cfg->name,
-                       rt.nvme_block_size,
-                       rt.nvme_max_dts_bytes,
-                       rt.nvme_max_lba);
-    rc = 0;
-
-out:
+    snapshot->capacity_valid = true;
     channel_runtime_close(&rt);
-    return rc;
+    return STORAGE_ERR_NONE;
 }
 
 static uint8_t get_status_query_result(void)
 {
-    const int required_channels[] = {HIGH_I_CHANNEL_ID, HIGH_Q_CHANNEL_ID, LOW_SPEED_CHANNEL_ID};
-    GlobalOptions gopt;
-    size_t i;
+    StorageHealthSnapshot snapshots[NUM_CHANNELS];
+    StorageHealthResult result = storage_health_query(15000000ull, snapshots);
 
-    memset(&gopt, 0, sizeof(gopt));
-    gopt.timeout_us = env_u32_or_default("SRC_REAL_STATUS_TIMEOUT_US", DEFAULT_TIMEOUT_US);
-    gopt.dry_run = false;
-    gopt.skip_link_check = false;
-
-    for (i = 0u; i < (sizeof(required_channels) / sizeof(required_channels[0])); ++i) {
-        const ChannelConfig *cfg = find_channel(required_channels[i]);
-        dbg_printf("[DBG][DISK] status check probe ch=%d\n", required_channels[i]);
-        if (!cfg || probe_one_storage_channel(cfg, gopt) != 0) {
-            dbg_printf("[DBG][DISK] status check failed ch=%d\n", required_channels[i]);
-            return ACK_FAILED;
-        }
+    if (result == STORAGE_HEALTH_OK) return ACK_SUCCESS;
+    if (result == STORAGE_HEALTH_RETRYING) {
+        storage_health_request_refresh();
+        return ACK_RETRYING;
     }
-    dbg_verbose_printf("[DBG][DISK] status check ok channels=ch0,ch1,ch2\n");
-    return ACK_SUCCESS;
+    return ACK_FAILED;
 }
 
 void handle_frame(uint8_t *f)
@@ -4047,7 +4087,7 @@ void handle_frame(uint8_t *f)
         }
         if (storage_any_running() || storage_any_live_worker() ||
             g_pending_storage_start.active || g_pending_storage_stop.active ||
-            transfer_task.state == RUNNING) {
+            transfer_task.state == RUNNING || g_maintenance_job.active) {
             LOG_WARN("SYSTEM", "Reject 0x11 while worker is running: storage_state=%d transfer_state=%d",
                      storage_state_summary(),
                      transfer_task.state);
@@ -4282,7 +4322,12 @@ void handle_frame(uint8_t *f)
         CmdFileList *file_cmd = (CmdFileList *)f;
         if (file_cmd->control == FILE_LIST_READ) {
             TaskFileListRecord records[32];
-            int count = task_file_list_query(records, 32);
+            int count;
+            if (g_maintenance_job.active) {
+                proto_send_ack(cmd, ACK_RETRYING);
+                break;
+            }
+            count = task_file_list_query(records, 32);
             LOG_INFO("PROTO", "FILE LIST REQ: merged rows=%d", count);
             dbg_printf("[DBG][PROTO] RX 0x41 list count=%d\n", count);
             if (count >= 0) {
@@ -4304,27 +4349,13 @@ void handle_frame(uint8_t *f)
                 proto_send_ack(cmd, ACK_FAILED);
             }
         } else if (file_cmd->control == FILE_LIST_SYNC_FLASH) {
-            uint8_t sync_result;
             LOG_INFO("PROTO", "FILE LIST flash sync request received");
-            sync_result = sync_filelist_db_to_flash();
-            dbg_printf("[DBG][PROTO] RX 0x41 sync flash result=0x%02X\n", sync_result);
-            if (sync_result == ACK_SUCCESS) {
-                proto_send_file_list("", ACK_SUCCESS, 0u, 0u, 0u, 0u, 0u, 0u,
-                                     FILE_LIST_FLAG_END, 0u);
-            } else {
-                proto_send_ack(cmd, sync_result);
-            }
+            if (start_maintenance_job(MAINTENANCE_SYNC_FLASH, cmd, NULL) != 0)
+                proto_send_ack(cmd, ACK_RETRYING);
         } else if (file_cmd->control == FILE_LIST_CLEAR) {
-            uint8_t clear_result;
             LOG_INFO("PROTO", "FILE LIST clear request received");
-            clear_result = clear_file_list_records();
-            dbg_printf("[DBG][PROTO] RX 0x41 clear result=0x%02X\n", clear_result);
-            if (clear_result == ACK_SUCCESS) {
-                proto_send_file_list("", ACK_SUCCESS, 0u, 0u, 0u, 0u, 0u, 0u,
-                                     FILE_LIST_FLAG_END, 0u);
-            } else {
-                proto_send_ack(cmd, clear_result);
-            }
+            if (start_maintenance_job(MAINTENANCE_CLEAR_FILES, cmd, NULL) != 0)
+                proto_send_ack(cmd, ACK_RETRYING);
         } else {
             LOG_WARN("PROTO", "FILE LIST invalid control: 0x%02X", file_cmd->control);
             proto_send_ack(cmd, ACK_INVALID_PARAM);
@@ -4337,12 +4368,18 @@ void handle_frame(uint8_t *f)
         CmdFileOp *file_op = (CmdFileOp *)f;
         uint8_t result;
 
+        if (g_maintenance_job.active) {
+            proto_send_ack(cmd, ACK_RETRYING);
+            break;
+        }
         if (file_op->operation == FILE_OP_DELETE_ALL) {
-            result = clear_file_list_records();
-            dbg_printf("[DBG][PROTO] RX 0x51 delete all result=0x%02X\n", result);
+            if (start_maintenance_job(MAINTENANCE_CLEAR_FILES, cmd, NULL) == 0)
+                break;
+            result = ACK_RETRYING;
         } else if (file_op->operation == FILE_OP_DELETE_ONE) {
-            result = delete_file_from_command(file_op);
-            dbg_printf("[DBG][PROTO] RX 0x51 delete one result=0x%02X\n", result);
+            if (start_maintenance_job(MAINTENANCE_DELETE_FILE, cmd, file_op) == 0)
+                break;
+            result = ACK_RETRYING;
         } else if (file_op->operation == FILE_OP_DOWNLOAD) {
             result = start_network_from_command(file_op);
             dbg_printf("[DBG][PROTO] RX 0x51 network start result=0x%02X\n", result);
@@ -4367,7 +4404,13 @@ void handle_frame(uint8_t *f)
     {
         uint8_t result = ACK_SUCCESS;
 
+        if (g_pending_network_stop.active) {
+            proto_send_ack(cmd, ACK_RETRYING);
+            break;
+        }
         if (transfer_task.state == RUNNING) {
+            uint32_t timeout_ms = env_u32_or_default(
+                "SRC_REAL_NETWORK_STOP_TIMEOUT_MS", 30000u);
             LOG_INFO("NETWORK", "Stop network transfer requested");
             dbg_printf("[DBG][PROTO] RX 0x71 stop network pid=%d\n", transfer_task.pid);
             if (kill(transfer_task.pid, SIGTERM) != 0) {
@@ -4377,7 +4420,12 @@ void handle_frame(uint8_t *f)
                            transfer_task.pid, errno);
                 result = ACK_FAILED;
             } else {
-                result = wait_network_worker_finished_after_stop();
+                g_pending_network_stop.active = true;
+                g_pending_network_stop.deadline_us =
+                    storage_ipc_saturating_add_u64(
+                        storage_ipc_monotonic_us(),
+                        (uint64_t)timeout_ms * 1000ull);
+                break;
             }
         } else {
             dbg_printf("[DBG][PROTO] RX 0x71 stop network idle\n");
@@ -4899,6 +4947,8 @@ int main(int argc, char **argv)
                      storage->cq_batch);
         }
     }
+    if (storage_health_start(probe_one_storage_channel, NULL, 5000u) != 0)
+        LOG_ERROR("SYSTEM", "Failed to start background storage health service");
     dbg_printf("[DBG][MAIN] uart1=%s log_db=%s file_db=%s meta_dir=%s\n",
                serial_dev, LOG_DB_PATH, FILELIST_DB_PATH, get_storage_meta_dir());
 
@@ -4945,10 +4995,16 @@ int main(int argc, char **argv)
         storage_service_pending_start();
         storage_service_pending_stop();
         check_task(&transfer_task);
+        service_pending_network_stop();
+        service_maintenance_job();
+        storage_health_set_busy(storage_any_live_worker() ||
+                                transfer_task.state == RUNNING ||
+                                g_maintenance_job.active);
     }
 
     /* Unreachable for current daemon-style loop. */
     close(serial_fd);
+    storage_health_stop();
     file_list_close();
     logger_close();
     debug_uart_close();
