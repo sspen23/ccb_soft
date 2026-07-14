@@ -4232,9 +4232,6 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                     }
                     if (storage_stop_state_expired(&stop_state, now_us)) {
                         storage_record_failure(&producer_stats, "stop_harvest_timeout");
-                        (void)storage_emit_event(STORAGE_WORKER_FATAL, &rt, -1,
-                                                 dma_received_bytes,
-                                                 producer_stats.receive_integrity_risk);
                         storage_stop_state_fail(&stop_state);
                         goto out;
                     }
