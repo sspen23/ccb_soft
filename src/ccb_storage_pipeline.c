@@ -39,6 +39,14 @@ bool storage_stop_state_expired(const StorageStopState *state, uint64_t now_us)
            state->deadline_us != 0u && now_us >= state->deadline_us;
 }
 
+bool storage_stop_boundary_should_quiesce(const StorageStopState *state,
+                                          bool rx_packet_open,
+                                          uint64_t now_us)
+{
+    return state && state->state == STORAGE_STOP_WAIT_BOUNDARY &&
+           (!rx_packet_open || storage_stop_state_expired(state, now_us));
+}
+
 void storage_stop_harvest_state_init(StorageStopHarvestState *state)
 {
     if (state) memset(state, 0, sizeof(*state));

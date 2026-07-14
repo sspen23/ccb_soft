@@ -118,6 +118,9 @@ bool storage_stop_state_latch(StorageStopState *state, uint64_t deadline_us);
 int storage_stop_state_advance(StorageStopState *state, StorageStopPhase next);
 void storage_stop_state_fail(StorageStopState *state);
 bool storage_stop_state_expired(const StorageStopState *state, uint64_t now_us);
+bool storage_stop_boundary_should_quiesce(const StorageStopState *state,
+                                          bool rx_packet_open,
+                                          uint64_t now_us);
 void storage_stop_harvest_state_init(StorageStopHarvestState *state);
 bool storage_stop_harvest_observe(StorageStopHarvestState *state,
                                   bool dma_quiesced,

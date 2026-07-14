@@ -20,6 +20,18 @@ static void test_stable_empty_requires_repeated_observation(void)
                                         1200u, 3u, 100u));
 }
 
+static void test_boundary_deadline_is_independent_of_harvest_activity(void)
+{
+    StorageStopState stop;
+
+    storage_stop_state_init(&stop);
+    assert(storage_stop_state_latch(&stop, 1100u));
+    assert(storage_stop_state_advance(&stop, STORAGE_STOP_WAIT_BOUNDARY) == 0);
+    assert(!storage_stop_boundary_should_quiesce(&stop, true, 1099u));
+    assert(storage_stop_boundary_should_quiesce(&stop, true, 1100u));
+    assert(storage_stop_boundary_should_quiesce(&stop, false, 1001u));
+}
+
 static void test_unaligned_tail_does_not_abort_full_prefix(void)
 {
     StoragePipeline pipeline;
@@ -108,6 +120,7 @@ static void test_ring_pressure_policy_is_bounded(void)
 int main(void)
 {
     test_stable_empty_requires_repeated_observation();
+    test_boundary_deadline_is_independent_of_harvest_activity();
     test_unaligned_tail_does_not_abort_full_prefix();
     test_stop_is_idempotent_and_inflight_blocks_finish();
     test_ring_pressure_policy_is_bounded();

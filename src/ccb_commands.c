@@ -4078,6 +4078,75 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                     goto out;
                 }
             }
+            if (stop_state.state == STORAGE_STOP_WAIT_BOUNDARY &&
+                !rt.gopt.dry_run) {
+                uint64_t boundary_now_us = storage_wall_time_us();
+
+                if (storage_stop_boundary_should_quiesce(
+                        &stop_state, rt.dma_rx_packet_open, boundary_now_us)) {
+                    bool boundary_timed_out = storage_stop_state_expired(
+                        &stop_state, boundary_now_us);
+
+                    if (boundary_timed_out && rt.dma_rx_packet_open) {
+                        storage_record_failure(&producer_stats,
+                                               "stop_packet_boundary_timeout");
+                    }
+                    if (!boundary_timed_out &&
+                        storage_emit_stop_phase(
+                            &rt, STORAGE_WORKER_PACKET_BOUNDARY_REACHED,
+                            dma_received_bytes, "packet_boundary_reached") != 0) {
+                        storage_record_failure(
+                            &producer_stats,
+                            "packet_boundary_event_send_failed");
+                        goto out;
+                    }
+                    if (!boundary_timed_out)
+                        packet_boundary_us = boundary_now_us;
+                    (void)storage_queue_latch_stop(&write_queue);
+                    (void)storage_stop_state_advance(
+                        &stop_state, STORAGE_STOP_DMA_QUIESCING);
+                    stop_state.deadline_us = storage_wall_time_us() +
+                                             stop_timeouts.dma_quiesce_us;
+                    {
+                        DmaStopResult quiesce_result =
+                            dma_quiesce_s2mm_with_state(
+                                &rt, stop_state.deadline_us,
+                                write_queue.slot_state, &dma_stop_report);
+                        if (quiesce_result == DMA_STOP_FAILED) {
+                            storage_record_failure(
+                                &producer_stats,
+                                dma_stop_report.reason[0] != '\0'
+                                    ? dma_stop_report.reason
+                                    : "dma_quiesce_failed");
+                            (void)storage_emit_event(
+                                STORAGE_WORKER_FATAL, &rt, -1,
+                                dma_received_bytes,
+                                producer_stats.receive_integrity_risk);
+                            storage_stop_state_fail(&stop_state);
+                            goto out;
+                        }
+                        dma_stop_result = quiesce_result;
+                    }
+                    dma_quiesced = true;
+                    dma_quiesced_us = storage_wall_time_us();
+                    if (storage_emit_stop_phase(
+                            &rt, STORAGE_WORKER_DMA_QUIESCED,
+                            dma_received_bytes,
+                            boundary_timed_out ? "boundary_timeout_quiesced"
+                                               : "dma_quiesced") != 0) {
+                        storage_record_failure(
+                            &producer_stats,
+                            "dma_quiesced_event_send_failed");
+                        goto out;
+                    }
+                    stop_state.deadline_us = storage_wall_time_us() +
+                                             stop_timeouts.stop_harvest_us;
+                    (void)storage_stop_state_advance(
+                        &stop_state, STORAGE_STOP_HARVESTING);
+                    storage_stop_harvest_state_init(&stop_harvest_state);
+                    continue;
+                }
+            }
             if (stop_state.state == STORAGE_STOP_WAIT_BOUNDARY && rt.gopt.dry_run) {
                 (void)storage_queue_latch_stop(&write_queue);
                 (void)storage_stop_state_advance(&stop_state,
@@ -4173,66 +4242,6 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                     (void)storage_emit_event(STORAGE_WORKER_FATAL, &rt, -1,
                                               dma_received_bytes, "first_dma_timeout");
                     goto out;
-                }
-                if (stop_state.state == STORAGE_STOP_WAIT_BOUNDARY) {
-                    bool boundary_timed_out = storage_stop_state_expired(
-                        &stop_state, storage_wall_time_us());
-
-                    if (!rt.dma_rx_packet_open || boundary_timed_out) {
-                        if (boundary_timed_out && rt.dma_rx_packet_open) {
-                            storage_record_failure(&producer_stats,
-                                                   "stop_packet_boundary_timeout");
-                        }
-                        if (!boundary_timed_out &&
-                            storage_emit_stop_phase(
-                                &rt, STORAGE_WORKER_PACKET_BOUNDARY_REACHED,
-                                dma_received_bytes, "packet_boundary_reached") != 0) {
-                            storage_record_failure(
-                                &producer_stats,
-                                "packet_boundary_event_send_failed");
-                            goto out;
-                        }
-                        if (!boundary_timed_out) packet_boundary_us = storage_wall_time_us();
-                        (void)storage_queue_latch_stop(&write_queue);
-                        (void)storage_stop_state_advance(
-                            &stop_state, STORAGE_STOP_DMA_QUIESCING);
-                        stop_state.deadline_us = storage_wall_time_us() +
-                                                 stop_timeouts.dma_quiesce_us;
-                        {
-                            DmaStopResult quiesce_result = dma_quiesce_s2mm_with_state(
-                                &rt, stop_state.deadline_us, write_queue.slot_state,
-                                &dma_stop_report);
-                            if (quiesce_result == DMA_STOP_FAILED) {
-                                storage_record_failure(
-                                    &producer_stats,
-                                    dma_stop_report.reason[0] != '\0'
-                                        ? dma_stop_report.reason : "dma_quiesce_failed");
-                                (void)storage_emit_event(
-                                    STORAGE_WORKER_FATAL, &rt, -1, dma_received_bytes,
-                                    producer_stats.receive_integrity_risk);
-                                storage_stop_state_fail(&stop_state);
-                                goto out;
-                            }
-                            dma_stop_result = quiesce_result;
-                        }
-                        dma_quiesced = true;
-                        dma_quiesced_us = storage_wall_time_us();
-                        if (storage_emit_stop_phase(
-                                &rt, STORAGE_WORKER_DMA_QUIESCED,
-                                dma_received_bytes,
-                                boundary_timed_out ? "boundary_timeout_quiesced"
-                                                   : "dma_quiesced") != 0) {
-                            storage_record_failure(&producer_stats,
-                                                   "dma_quiesced_event_send_failed");
-                            goto out;
-                        }
-                        stop_state.deadline_us = storage_wall_time_us() +
-                                                 stop_timeouts.stop_harvest_us;
-                        (void)storage_stop_state_advance(
-                            &stop_state, STORAGE_STOP_HARVESTING);
-                        storage_stop_harvest_state_init(&stop_harvest_state);
-                        continue;
-                    }
                 }
                 if (stop_state.state == STORAGE_STOP_HARVESTING) {
                     DmaBdSnapshot stop_snapshot;
