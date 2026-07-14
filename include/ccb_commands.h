@@ -61,6 +61,37 @@ void storage_write_reset_stop(void);
 void storage_write_request_stop(void);
 void storage_write_flush_deferred_diag(void);
 bool storage_write_fatal_event_sent(void);
+
+typedef enum {
+    STORAGE_CROSS_SLOT_CONFIG_ENABLED = 0,
+    STORAGE_CROSS_SLOT_CONFIG_MAX_ACTIVE,
+    STORAGE_CROSS_SLOT_CONFIG_TARGET_QD,
+    STORAGE_CROSS_SLOT_CONFIG_CQ_BATCH,
+    STORAGE_CROSS_SLOT_CONFIG_WRITER_BUDGET_US,
+    STORAGE_CROSS_SLOT_CONFIG_BUSY_POLL_US,
+    STORAGE_CROSS_SLOT_CONFIG_EMPTY_SLEEP_US,
+    STORAGE_CROSS_SLOT_CONFIG_NO_PROGRESS_TIMEOUT_US
+} StorageCrossSlotConfigParam;
+
+typedef enum {
+    STORAGE_CROSS_SLOT_SOURCE_CHANNEL_NEW = 0,
+    STORAGE_CROSS_SLOT_SOURCE_CHANNEL_LEGACY,
+    STORAGE_CROSS_SLOT_SOURCE_GLOBAL_NEW,
+    STORAGE_CROSS_SLOT_SOURCE_GLOBAL_LEGACY,
+    STORAGE_CROSS_SLOT_SOURCE_DEFAULT
+} StorageCrossSlotSourceKind;
+
+typedef struct {
+    uint32_t value;
+    StorageCrossSlotSourceKind source_kind;
+    char source_name[96];
+    char invalid_source_name[96];
+    char fallback_source_name[96];
+} StorageCrossSlotResolution;
+
+StorageCrossSlotResolution storage_cross_slot_resolve_config(
+    int channel_id, StorageCrossSlotConfigParam param);
+const char *storage_cross_slot_source_kind_name(StorageCrossSlotSourceKind kind);
 bool storage_cross_slot_enabled_for_channel(int channel_id);
 uint32_t storage_cross_slot_active_slots_for_channel(int channel_id);
 uint32_t storage_cross_slot_default_target_qd(int channel_id);

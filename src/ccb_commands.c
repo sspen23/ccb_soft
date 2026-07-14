@@ -789,133 +789,230 @@ static uint64_t storage_first_dma_timeout_us(const ChannelConfig *cfg)
     return (uint64_t)storage_env_u32_limit(name, fallback, UINT32_MAX);
 }
 
-uint32_t storage_cross_slot_active_slots_for_channel(int channel_id)
-{
-    char names[6][80];
-    uint32_t fallback;
-
-    fallback = channel_id == 2 ? 1u : 4u;
-    /* The four deployment names have a strict priority.  Additional legacy
-     * spellings are consulted only after those names so introducing a new
-     * override cannot be shadowed by an old environment left in a boot
-     * script. */
-    snprintf(names[0], sizeof(names[0]), "SRC_REAL_MAX_ACTIVE_CH%d", channel_id);
-    snprintf(names[1], sizeof(names[1]), "SRC_REAL_CROSS_SLOT_BATCH_CH%d", channel_id);
-    if (getenv(names[0])) return storage_env_u32_limit(names[0], fallback, 64u);
-    if (getenv(names[1])) return storage_env_u32_limit(names[1], fallback, 64u);
-    if (getenv("SRC_REAL_MAX_ACTIVE"))
-        return storage_env_u32_limit("SRC_REAL_MAX_ACTIVE", fallback, 64u);
-    if (getenv("SRC_REAL_CROSS_SLOT_BATCH"))
-        return storage_env_u32_limit("SRC_REAL_CROSS_SLOT_BATCH", fallback, 64u);
-
-    snprintf(names[0], sizeof(names[0]),
-             "SRC_REAL_NVME_CROSS_SLOT_MAX_ACTIVE_CH%d", channel_id);
-    snprintf(names[1], sizeof(names[1]),
-             "SRC_REAL_NVME_CROSS_SLOT_BATCH_CH%d", channel_id);
-    snprintf(names[2], sizeof(names[2]), "SRC_REAL_CH%d_NVME_CROSS_SLOT_MAX_ACTIVE", channel_id);
-    snprintf(names[3], sizeof(names[3]), "SRC_REAL_CH%d_CROSS_SLOT_BATCH", channel_id);
-    snprintf(names[4], sizeof(names[4]), "SRC_REAL_NVME_CROSS_SLOT_MAX_ACTIVE");
-    snprintf(names[5], sizeof(names[5]), "SRC_REAL_NVME_CROSS_SLOT_BATCH");
-    if (getenv(names[0])) return storage_env_u32_limit(names[0], fallback, 64u);
-    if (getenv(names[1])) return storage_env_u32_limit(names[1], fallback, 64u);
-    if (getenv(names[2])) return storage_env_u32_limit(names[2], fallback, 64u);
-    if (getenv(names[3])) return storage_env_u32_limit(names[3], fallback, 64u);
-    if (getenv("SRC_REAL_CROSS_SLOT_MAX_ACTIVE"))
-        return storage_env_u32_limit("SRC_REAL_CROSS_SLOT_MAX_ACTIVE", fallback, 64u);
-    if (getenv(names[4])) return storage_env_u32_limit(names[4], fallback, 64u);
-    if (getenv(names[5])) return storage_env_u32_limit(names[5], fallback, 64u);
-    return fallback;
-}
-
-static const char *storage_cross_slot_active_source(int channel_id)
-{
-    char name[80];
-    snprintf(name, sizeof(name), "SRC_REAL_MAX_ACTIVE_CH%d", channel_id);
-    if (getenv(name)) return "channel_new";
-    snprintf(name, sizeof(name), "SRC_REAL_CROSS_SLOT_BATCH_CH%d", channel_id);
-    if (getenv(name)) return "channel_legacy";
-    if (getenv("SRC_REAL_MAX_ACTIVE")) return "global_new";
-    if (getenv("SRC_REAL_CROSS_SLOT_BATCH")) return "global_legacy";
-    return "default";
-}
-
 uint32_t storage_cross_slot_default_target_qd(int channel_id)
 {
     return channel_id == 2 ? 4u : 8u;
 }
 
-bool storage_cross_slot_enabled_for_channel(int channel_id)
+typedef struct {
+    const char *name;
+    StorageCrossSlotSourceKind kind;
+} StorageCrossSlotCandidate;
+
+static void storage_cross_slot_resolution_default(StorageCrossSlotResolution *out,
+                                                  uint32_t fallback)
 {
-    char channel_name[96];
+    memset(out, 0, sizeof(*out));
+    out->value = fallback;
+    out->source_kind = STORAGE_CROSS_SLOT_SOURCE_DEFAULT;
+    (void)snprintf(out->source_name, sizeof(out->source_name), "default");
+    (void)snprintf(out->fallback_source_name, sizeof(out->fallback_source_name), "default");
+}
+
+const char *storage_cross_slot_source_kind_name(StorageCrossSlotSourceKind kind)
+{
+    switch (kind) {
+    case STORAGE_CROSS_SLOT_SOURCE_CHANNEL_NEW: return "channel_new";
+    case STORAGE_CROSS_SLOT_SOURCE_CHANNEL_LEGACY: return "channel_legacy";
+    case STORAGE_CROSS_SLOT_SOURCE_GLOBAL_NEW: return "global_new";
+    case STORAGE_CROSS_SLOT_SOURCE_GLOBAL_LEGACY: return "global_legacy";
+    case STORAGE_CROSS_SLOT_SOURCE_DEFAULT: return "default";
+    default: return "default";
+    }
+}
+
+static bool storage_cross_slot_parse_u32(const char *value, uint32_t max_value,
+                                         uint32_t *out)
+{
+    char *end = NULL;
+    unsigned long parsed;
+
+    if (!value || value[0] == '\0' || !out) return false;
+    errno = 0;
+    parsed = strtoul(value, &end, 0);
+    if (errno != 0 || end == value || *end != '\0' || parsed > max_value) return false;
+    *out = (uint32_t)parsed;
+    return true;
+}
+
+static bool storage_cross_slot_parse_enabled(const char *value, uint32_t *out)
+{
+    uint32_t numeric;
+
+    if (!value || !out) return false;
+    if (strcmp(value, "true") == 0 || strcmp(value, "TRUE") == 0 ||
+        strcmp(value, "on") == 0 || strcmp(value, "ON") == 0 ||
+        strcmp(value, "yes") == 0 || strcmp(value, "YES") == 0) {
+        *out = 1u;
+        return true;
+    }
+    if (strcmp(value, "false") == 0 || strcmp(value, "FALSE") == 0 ||
+        strcmp(value, "off") == 0 || strcmp(value, "OFF") == 0 ||
+        strcmp(value, "no") == 0 || strcmp(value, "NO") == 0) {
+        *out = 0u;
+        return true;
+    }
+    if (!storage_cross_slot_parse_u32(value, UINT32_MAX, &numeric)) return false;
+    *out = numeric != 0u ? 1u : 0u;
+    return true;
+}
+
+static StorageCrossSlotResolution storage_cross_slot_resolve_candidates(
+    uint32_t fallback, uint32_t max_value, bool enabled,
+    const StorageCrossSlotCandidate *candidates, size_t count)
+{
+    StorageCrossSlotResolution out;
     size_t i;
 
-    if (channel_id < 0) return false;
-    for (i = 0u; i < 3u; ++i) {
-        if (i == 0u) {
-            (void)snprintf(channel_name, sizeof(channel_name),
-                           "SRC_REAL_CROSS_SLOT_CH%d", channel_id);
-        } else if (i == 1u) {
-            (void)snprintf(channel_name, sizeof(channel_name),
-                           "SRC_REAL_CROSS_SLOT_ENABLED_CH%d", channel_id);
-        } else {
-            (void)snprintf(channel_name, sizeof(channel_name),
-                           "SRC_REAL_NVME_CROSS_SLOT_QD_CH%d", channel_id);
+    storage_cross_slot_resolution_default(&out, fallback);
+    for (i = 0u; candidates && i < count; ++i) {
+        const char *value = getenv(candidates[i].name);
+        uint32_t parsed;
+
+        if (!value) continue;
+        if ((enabled ? storage_cross_slot_parse_enabled(value, &parsed) :
+                       storage_cross_slot_parse_u32(value, max_value, &parsed))) {
+            out.value = parsed;
+            out.source_kind = candidates[i].kind;
+            (void)snprintf(out.source_name, sizeof(out.source_name), "%s",
+                           candidates[i].name);
+            out.invalid_source_name[0] = '\0';
+            out.fallback_source_name[0] = '\0';
+            return out;
         }
-        if (getenv(channel_name)) return storage_env_flag_enabled(channel_name) != 0;
+        (void)snprintf(out.invalid_source_name, sizeof(out.invalid_source_name), "%s",
+                       candidates[i].name);
+        return out;
     }
-    if (getenv("SRC_REAL_CROSS_SLOT") != NULL)
-        return storage_env_flag_enabled("SRC_REAL_CROSS_SLOT") != 0;
-    if (getenv("SRC_REAL_CROSS_SLOT_ENABLED") != NULL)
-        return storage_env_flag_enabled("SRC_REAL_CROSS_SLOT_ENABLED") != 0;
-    if (getenv("SRC_REAL_NVME_CROSS_SLOT_QD") != NULL)
-        return storage_env_flag_enabled("SRC_REAL_NVME_CROSS_SLOT_QD") != 0;
-    return channel_id != 2;
+    return out;
 }
 
-static uint32_t storage_cross_slot_param(const ChannelConfig *cfg,
-                                         const char *short_name,
-                                         const char *old_suffix,
-                                         uint32_t fallback,
-                                         uint32_t max_value)
+StorageCrossSlotResolution storage_cross_slot_resolve_config(
+    int channel_id, StorageCrossSlotConfigParam param)
 {
-    char name[96];
+    char names[12][96];
+    StorageCrossSlotCandidate candidates[12];
+    const char *short_name = NULL;
+    uint32_t fallback = 0u;
+    uint32_t max_value = UINT32_MAX;
+    size_t count = 0u;
 
-    if (!cfg || !short_name) return fallback;
-    snprintf(name, sizeof(name), "SRC_REAL_%s_CH%d", short_name, cfg->id);
-    if (getenv(name)) return storage_env_u32_limit(name, fallback, max_value);
-    snprintf(name, sizeof(name), "SRC_REAL_%s", short_name);
-    if (getenv(name)) return storage_env_u32_limit(name, fallback, max_value);
-    if (old_suffix) {
-        snprintf(name, sizeof(name), "SRC_REAL_CH%d_%s", cfg->id, old_suffix);
-        if (getenv(name)) return storage_env_u32_limit(name, fallback, max_value);
-        snprintf(name, sizeof(name), "SRC_REAL_NVME_CROSS_SLOT_%s_CH%d", old_suffix,
-                 cfg->id);
-        if (getenv(name)) return storage_env_u32_limit(name, fallback, max_value);
-        snprintf(name, sizeof(name), "SRC_REAL_NVME_CROSS_SLOT_%s", old_suffix);
-        if (getenv(name)) return storage_env_u32_limit(name, fallback, max_value);
+#define CROSS_SLOT_ADD(kind_, format_, ...)                                    \
+    do {                                                                        \
+        (void)snprintf(names[count], sizeof(names[count]), format_, __VA_ARGS__); \
+        candidates[count].name = names[count];                                 \
+        candidates[count].kind = (kind_);                                      \
+        ++count;                                                                \
+    } while (0)
+
+    if (channel_id < 0) {
+        StorageCrossSlotResolution out;
+        storage_cross_slot_resolution_default(&out, 0u);
+        return out;
     }
-    return fallback;
+    switch (param) {
+    case STORAGE_CROSS_SLOT_CONFIG_ENABLED:
+        fallback = channel_id == 2 ? 0u : 1u;
+        CROSS_SLOT_ADD(STORAGE_CROSS_SLOT_SOURCE_CHANNEL_NEW,
+                       "SRC_REAL_CROSS_SLOT_CH%d", channel_id);
+        CROSS_SLOT_ADD(STORAGE_CROSS_SLOT_SOURCE_CHANNEL_LEGACY,
+                       "SRC_REAL_CROSS_SLOT_ENABLED_CH%d", channel_id);
+        CROSS_SLOT_ADD(STORAGE_CROSS_SLOT_SOURCE_CHANNEL_LEGACY,
+                       "SRC_REAL_NVME_CROSS_SLOT_QD_CH%d", channel_id);
+        CROSS_SLOT_ADD(STORAGE_CROSS_SLOT_SOURCE_GLOBAL_NEW, "%s", "SRC_REAL_CROSS_SLOT");
+        CROSS_SLOT_ADD(STORAGE_CROSS_SLOT_SOURCE_GLOBAL_LEGACY,
+                       "%s", "SRC_REAL_CROSS_SLOT_ENABLED");
+        CROSS_SLOT_ADD(STORAGE_CROSS_SLOT_SOURCE_GLOBAL_LEGACY,
+                       "%s", "SRC_REAL_NVME_CROSS_SLOT_QD");
+        return storage_cross_slot_resolve_candidates(fallback, 1u, true,
+                                                     candidates, count);
+    case STORAGE_CROSS_SLOT_CONFIG_MAX_ACTIVE:
+        fallback = channel_id == 2 ? 1u : 4u;
+        max_value = 64u;
+        CROSS_SLOT_ADD(STORAGE_CROSS_SLOT_SOURCE_CHANNEL_NEW,
+                       "SRC_REAL_MAX_ACTIVE_CH%d", channel_id);
+        CROSS_SLOT_ADD(STORAGE_CROSS_SLOT_SOURCE_CHANNEL_LEGACY,
+                       "SRC_REAL_CROSS_SLOT_BATCH_CH%d", channel_id);
+        CROSS_SLOT_ADD(STORAGE_CROSS_SLOT_SOURCE_CHANNEL_LEGACY,
+                       "SRC_REAL_NVME_CROSS_SLOT_MAX_ACTIVE_CH%d", channel_id);
+        CROSS_SLOT_ADD(STORAGE_CROSS_SLOT_SOURCE_CHANNEL_LEGACY,
+                       "SRC_REAL_NVME_CROSS_SLOT_BATCH_CH%d", channel_id);
+        CROSS_SLOT_ADD(STORAGE_CROSS_SLOT_SOURCE_CHANNEL_LEGACY,
+                       "SRC_REAL_CH%d_NVME_CROSS_SLOT_MAX_ACTIVE", channel_id);
+        CROSS_SLOT_ADD(STORAGE_CROSS_SLOT_SOURCE_CHANNEL_LEGACY,
+                       "SRC_REAL_CH%d_CROSS_SLOT_BATCH", channel_id);
+        CROSS_SLOT_ADD(STORAGE_CROSS_SLOT_SOURCE_GLOBAL_NEW, "%s", "SRC_REAL_MAX_ACTIVE");
+        CROSS_SLOT_ADD(STORAGE_CROSS_SLOT_SOURCE_GLOBAL_LEGACY,
+                       "%s", "SRC_REAL_CROSS_SLOT_BATCH");
+        CROSS_SLOT_ADD(STORAGE_CROSS_SLOT_SOURCE_GLOBAL_LEGACY,
+                       "%s", "SRC_REAL_CROSS_SLOT_MAX_ACTIVE");
+        CROSS_SLOT_ADD(STORAGE_CROSS_SLOT_SOURCE_GLOBAL_LEGACY,
+                       "%s", "SRC_REAL_NVME_CROSS_SLOT_MAX_ACTIVE");
+        CROSS_SLOT_ADD(STORAGE_CROSS_SLOT_SOURCE_GLOBAL_LEGACY,
+                       "%s", "SRC_REAL_NVME_CROSS_SLOT_BATCH");
+        return storage_cross_slot_resolve_candidates(fallback, max_value, false,
+                                                     candidates, count);
+    case STORAGE_CROSS_SLOT_CONFIG_TARGET_QD:
+        short_name = "TARGET_QD";
+        fallback = storage_cross_slot_default_target_qd(channel_id);
+        max_value = 64u;
+        break;
+    case STORAGE_CROSS_SLOT_CONFIG_CQ_BATCH:
+        short_name = "CQ_BATCH";
+        fallback = 32u;
+        max_value = 64u;
+        break;
+    case STORAGE_CROSS_SLOT_CONFIG_WRITER_BUDGET_US:
+        short_name = "WRITER_BUDGET_US";
+        fallback = 300u;
+        max_value = 1000000u;
+        break;
+    case STORAGE_CROSS_SLOT_CONFIG_BUSY_POLL_US:
+        short_name = "BUSY_POLL_US";
+        fallback = 20u;
+        max_value = 1000000u;
+        break;
+    case STORAGE_CROSS_SLOT_CONFIG_EMPTY_SLEEP_US:
+        short_name = "EMPTY_SLEEP_US";
+        fallback = 1u;
+        max_value = 1000000u;
+        break;
+    case STORAGE_CROSS_SLOT_CONFIG_NO_PROGRESS_TIMEOUT_US:
+        short_name = "NO_PROGRESS_TIMEOUT_US";
+        fallback = 5000000u;
+        break;
+    default: {
+        StorageCrossSlotResolution out;
+        storage_cross_slot_resolution_default(&out, 0u);
+        return out;
+    }
+    }
+
+    CROSS_SLOT_ADD(STORAGE_CROSS_SLOT_SOURCE_CHANNEL_NEW,
+                   "SRC_REAL_%s_CH%d", short_name, channel_id);
+    CROSS_SLOT_ADD(STORAGE_CROSS_SLOT_SOURCE_CHANNEL_LEGACY,
+                   "SRC_REAL_CH%d_%s", channel_id, short_name);
+    CROSS_SLOT_ADD(STORAGE_CROSS_SLOT_SOURCE_CHANNEL_LEGACY,
+                   "SRC_REAL_NVME_CROSS_SLOT_%s_CH%d", short_name, channel_id);
+    CROSS_SLOT_ADD(STORAGE_CROSS_SLOT_SOURCE_GLOBAL_NEW, "SRC_REAL_%s", short_name);
+    CROSS_SLOT_ADD(STORAGE_CROSS_SLOT_SOURCE_GLOBAL_LEGACY,
+                   "SRC_REAL_NVME_CROSS_SLOT_%s", short_name);
+    return storage_cross_slot_resolve_candidates(fallback, max_value, false,
+                                                 candidates, count);
+
+#undef CROSS_SLOT_ADD
 }
 
-static const char *storage_cross_slot_param_source(const ChannelConfig *cfg,
-                                                   const char *short_name,
-                                                   const char *old_suffix)
+uint32_t storage_cross_slot_active_slots_for_channel(int channel_id)
 {
-    char name[96];
-    if (!cfg || !short_name) return "default";
-    snprintf(name, sizeof(name), "SRC_REAL_%s_CH%d", short_name, cfg->id);
-    if (getenv(name)) return "channel_new";
-    snprintf(name, sizeof(name), "SRC_REAL_%s", short_name);
-    if (getenv(name)) return "global_new";
-    if (old_suffix) {
-        snprintf(name, sizeof(name), "SRC_REAL_CH%d_%s", cfg->id, old_suffix);
-        if (getenv(name)) return "channel_legacy";
-        snprintf(name, sizeof(name), "SRC_REAL_NVME_CROSS_SLOT_%s_CH%d", old_suffix, cfg->id);
-        if (getenv(name)) return "channel_legacy";
-        snprintf(name, sizeof(name), "SRC_REAL_NVME_CROSS_SLOT_%s", old_suffix);
-        if (getenv(name)) return "global_legacy";
-    }
-    return "default";
+    return storage_cross_slot_resolve_config(
+        channel_id, STORAGE_CROSS_SLOT_CONFIG_MAX_ACTIVE).value;
+}
+
+bool storage_cross_slot_enabled_for_channel(int channel_id)
+{
+    return storage_cross_slot_resolve_config(
+        channel_id, STORAGE_CROSS_SLOT_CONFIG_ENABLED).value != 0u;
 }
 
 static int storage_env_flag_enabled(const char *name)
@@ -3218,6 +3315,14 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
     uint32_t storage_critical_poll_sleep_us;
     uint32_t cross_slot_batch;
     NvmeCrossSlotConfig cross_slot_config;
+    StorageCrossSlotResolution cross_slot_enabled_resolution;
+    StorageCrossSlotResolution cross_slot_max_active_resolution;
+    StorageCrossSlotResolution cross_slot_target_qd_resolution;
+    StorageCrossSlotResolution cross_slot_cq_batch_resolution;
+    StorageCrossSlotResolution cross_slot_writer_budget_resolution;
+    StorageCrossSlotResolution cross_slot_busy_poll_resolution;
+    StorageCrossSlotResolution cross_slot_empty_sleep_resolution;
+    StorageCrossSlotResolution cross_slot_no_progress_resolution;
     uint32_t ready_queue_depth_cfg;
     uint32_t harvest_batch_max_cfg;
     uint32_t dma_idle_done_ms;
@@ -3306,22 +3411,31 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                                                     cfg->id == 2 ? 4u : 16u,
                                                     1024u);
     {
-        cross_slot_qd = storage_cross_slot_enabled_for_channel(cfg->id);
-        cross_slot_config.max_active_slots = storage_cross_slot_active_slots_for_channel(cfg->id);
+        cross_slot_enabled_resolution = storage_cross_slot_resolve_config(
+            cfg->id, STORAGE_CROSS_SLOT_CONFIG_ENABLED);
+        cross_slot_max_active_resolution = storage_cross_slot_resolve_config(
+            cfg->id, STORAGE_CROSS_SLOT_CONFIG_MAX_ACTIVE);
+        cross_slot_target_qd_resolution = storage_cross_slot_resolve_config(
+            cfg->id, STORAGE_CROSS_SLOT_CONFIG_TARGET_QD);
+        cross_slot_cq_batch_resolution = storage_cross_slot_resolve_config(
+            cfg->id, STORAGE_CROSS_SLOT_CONFIG_CQ_BATCH);
+        cross_slot_writer_budget_resolution = storage_cross_slot_resolve_config(
+            cfg->id, STORAGE_CROSS_SLOT_CONFIG_WRITER_BUDGET_US);
+        cross_slot_busy_poll_resolution = storage_cross_slot_resolve_config(
+            cfg->id, STORAGE_CROSS_SLOT_CONFIG_BUSY_POLL_US);
+        cross_slot_empty_sleep_resolution = storage_cross_slot_resolve_config(
+            cfg->id, STORAGE_CROSS_SLOT_CONFIG_EMPTY_SLEEP_US);
+        cross_slot_no_progress_resolution = storage_cross_slot_resolve_config(
+            cfg->id, STORAGE_CROSS_SLOT_CONFIG_NO_PROGRESS_TIMEOUT_US);
+        cross_slot_qd = cross_slot_enabled_resolution.value != 0u;
+        cross_slot_config.max_active_slots = cross_slot_max_active_resolution.value;
         cross_slot_batch = cross_slot_config.max_active_slots;
-        cross_slot_config.target_qd = storage_cross_slot_param(
-            cfg, "TARGET_QD", "TARGET_QD",
-            storage_cross_slot_default_target_qd(cfg->id), 64u);
-        cross_slot_config.cq_batch = storage_cross_slot_param(
-            cfg, "CQ_BATCH", "CQ_BATCH", 32u, 64u);
-        cross_slot_config.writer_budget_us = storage_cross_slot_param(
-            cfg, "WRITER_BUDGET_US", "WRITER_BUDGET_US", 300u, 1000000u);
-        cross_slot_config.busy_poll_us = storage_cross_slot_param(
-            cfg, "BUSY_POLL_US", "BUSY_POLL_US", 20u, 1000000u);
-        cross_slot_config.empty_sleep_us = storage_cross_slot_param(
-            cfg, "EMPTY_SLEEP_US", "EMPTY_SLEEP_US", 1u, 1000000u);
-        cross_slot_config.no_progress_timeout_us = storage_cross_slot_param(
-            cfg, "NO_PROGRESS_TIMEOUT_US", "NO_PROGRESS_TIMEOUT_US", 5000000u, UINT32_MAX);
+        cross_slot_config.target_qd = cross_slot_target_qd_resolution.value;
+        cross_slot_config.cq_batch = cross_slot_cq_batch_resolution.value;
+        cross_slot_config.writer_budget_us = cross_slot_writer_budget_resolution.value;
+        cross_slot_config.busy_poll_us = cross_slot_busy_poll_resolution.value;
+        cross_slot_config.empty_sleep_us = cross_slot_empty_sleep_resolution.value;
+        cross_slot_config.no_progress_timeout_us = cross_slot_no_progress_resolution.value;
     }
     dbg_printf("[DBG][WRITE] start ch=%d mode=%s size=%" PRIu64 " task=%s idx=%u lba_auto=%u dry=%u\n",
                cfg->id,
@@ -3546,8 +3660,14 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
     storage_emit_line("storage_cross_slot_effective_config channel=%d enabled=%u"
                       " max_active=%u target_qd=%u cq_batch=%u writer_budget_us=%u"
                       " busy_poll_us=%u empty_sleep_us=%u no_progress_timeout_us=%u"
-                      " max_active_source=%s target_qd_source=%s cq_batch_source=%s budget_source=%s"
-                      " busy_poll_source=%s empty_sleep_source=%s no_progress_source=%s",
+                      " enabled_source_kind=%s enabled_source_name=%s"
+                      " max_active_source_kind=%s max_active_source_name=%s"
+                      " target_qd_source_kind=%s target_qd_source_name=%s"
+                      " cq_batch_source_kind=%s cq_batch_source_name=%s"
+                      " budget_source_kind=%s budget_source_name=%s"
+                      " busy_poll_source_kind=%s busy_poll_source_name=%s"
+                      " empty_sleep_source_kind=%s empty_sleep_source_name=%s"
+                      " no_progress_source_kind=%s no_progress_source_name=%s",
                       cfg->id, cross_slot_qd ? 1u : 0u,
                       (unsigned)cross_slot_config.max_active_slots,
                       (unsigned)cross_slot_config.target_qd,
@@ -3556,13 +3676,45 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                       (unsigned)cross_slot_config.busy_poll_us,
                       (unsigned)cross_slot_config.empty_sleep_us,
                       (unsigned)cross_slot_config.no_progress_timeout_us,
-                      storage_cross_slot_active_source(cfg->id),
-                      storage_cross_slot_param_source(cfg, "TARGET_QD", "TARGET_QD"),
-                      storage_cross_slot_param_source(cfg, "CQ_BATCH", "CQ_BATCH"),
-                      storage_cross_slot_param_source(cfg, "WRITER_BUDGET_US", "WRITER_BUDGET_US"),
-                      storage_cross_slot_param_source(cfg, "BUSY_POLL_US", "BUSY_POLL_US"),
-                      storage_cross_slot_param_source(cfg, "EMPTY_SLEEP_US", "EMPTY_SLEEP_US"),
-                      storage_cross_slot_param_source(cfg, "NO_PROGRESS_TIMEOUT_US", "NO_PROGRESS_TIMEOUT_US"));
+                      storage_cross_slot_source_kind_name(cross_slot_enabled_resolution.source_kind),
+                      cross_slot_enabled_resolution.source_name,
+                      storage_cross_slot_source_kind_name(cross_slot_max_active_resolution.source_kind),
+                      cross_slot_max_active_resolution.source_name,
+                      storage_cross_slot_source_kind_name(cross_slot_target_qd_resolution.source_kind),
+                      cross_slot_target_qd_resolution.source_name,
+                      storage_cross_slot_source_kind_name(cross_slot_cq_batch_resolution.source_kind),
+                      cross_slot_cq_batch_resolution.source_name,
+                      storage_cross_slot_source_kind_name(cross_slot_writer_budget_resolution.source_kind),
+                      cross_slot_writer_budget_resolution.source_name,
+                      storage_cross_slot_source_kind_name(cross_slot_busy_poll_resolution.source_kind),
+                      cross_slot_busy_poll_resolution.source_name,
+                      storage_cross_slot_source_kind_name(cross_slot_empty_sleep_resolution.source_kind),
+                      cross_slot_empty_sleep_resolution.source_name,
+                      storage_cross_slot_source_kind_name(cross_slot_no_progress_resolution.source_kind),
+                      cross_slot_no_progress_resolution.source_name);
+    {
+        const StorageCrossSlotResolution *resolutions[] = {
+            &cross_slot_enabled_resolution, &cross_slot_max_active_resolution,
+            &cross_slot_target_qd_resolution, &cross_slot_cq_batch_resolution,
+            &cross_slot_writer_budget_resolution, &cross_slot_busy_poll_resolution,
+            &cross_slot_empty_sleep_resolution, &cross_slot_no_progress_resolution,
+        };
+        const char *labels[] = {
+            "enabled", "max_active", "target_qd", "cq_batch", "writer_budget_us",
+            "busy_poll_us", "empty_sleep_us", "no_progress_timeout_us",
+        };
+        size_t i;
+
+        for (i = 0u; i < sizeof(resolutions) / sizeof(resolutions[0]); ++i) {
+            if (resolutions[i]->invalid_source_name[0] != '\0') {
+                storage_emit_line("storage_cross_slot_invalid_config channel=%d parameter=%s"
+                                  " invalid_source=%s fallback_source=%s fallback_value=%u",
+                                  cfg->id, labels[i], resolutions[i]->invalid_source_name,
+                                  resolutions[i]->fallback_source_name,
+                                  (unsigned)resolutions[i]->value);
+            }
+        }
+    }
     storage_emit_line("storage_stop_config channel=%d compat_timeout_us=%" PRIu64
                       " dma_quiesce_timeout_us=%" PRIu64
                       " stop_harvest_timeout_us=%" PRIu64
