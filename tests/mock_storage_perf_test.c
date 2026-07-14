@@ -7,12 +7,12 @@
 int main(void)
 {
     StorageWorkerEvent e; FILE *f; char line[2048];
-    setenv("SRC_REAL_PERF_LOG_FILE", "/tmp/mock_storage_perf.log", 1);
-    setenv("SRC_REAL_PERF_LOG_ENABLE", "1", 1); unlink("/tmp/mock_storage_perf.log");
+    setenv("CCB_PERF_ENABLE", "1", 1);
+    unlink("/tmp/storage_perf.log");
     storage_ipc_make_event(&e, STORAGE_WORKER_PERF_SAMPLE, 1u,
                            STORAGE_ERR_NONE, 42u, "sample");
     assert(storage_perf_log_event(&e, "task") == 0);
-    storage_perf_log_close(); f = fopen("/tmp/mock_storage_perf.log", "r"); assert(f);
+    storage_perf_log_close(); f = fopen("/tmp/storage_perf.log", "r"); assert(f);
     e.payload.perf.window_start_us = 1u; e.payload.perf.window_end_us = 2u;
     e.payload.perf.dma_bytes_delta = 42u; e.payload.perf.nvme_bytes_delta = 41u;
     e.payload.perf.dma_writable = 1u; e.payload.perf.completed_unharvested = 2u;
@@ -35,7 +35,7 @@ int main(void)
     e.payload.perf.receive_integrity_ok = 1u;
     e.payload.perf.storage_integrity_ok = 1u;
     assert(storage_perf_log_event(&e, "task") == 0);
-    storage_perf_log_close(); f = fopen("/tmp/mock_storage_perf.log", "r"); assert(f);
+    storage_perf_log_close(); f = fopen("/tmp/storage_perf.log", "r"); assert(f);
     assert(fgets(line, sizeof(line), f) && strstr(line, "storage_perf task=task"));
     assert(fgets(line, sizeof(line), f) && strstr(line, "free_slots=6") &&
            strstr(line, "submit_mmio_count=18") && strstr(line, "queue_empty_wait_us=22") &&
@@ -67,7 +67,7 @@ int main(void)
     e.payload.diag.sequence = 3u;
     e.payload.diag.event_id = STORAGE_EVENT_WORKER_FATAL;
     assert(storage_perf_log_event(&e, "task") == 0);
-    storage_perf_log_close(); f = fopen("/tmp/mock_storage_perf.log", "r"); assert(f);
+    storage_perf_log_close(); f = fopen("/tmp/storage_perf.log", "r"); assert(f);
     while (fgets(line, sizeof(line), f)) { if (strstr(line, "storage_fatal")) break; }
     assert(strstr(line, "fatal_reason"));
     assert(fgets(line, sizeof(line), f) && strstr(line, "storage_final"));
@@ -77,11 +77,6 @@ int main(void)
            strstr(line, "primary_reason=primary_reason") &&
            strstr(line, "secondary_reason=secondary_reason"));
     assert(fgets(line, sizeof(line), f) && strstr(line, "storage_diag")); fclose(f);
-    storage_perf_log_close();
-    setenv("SRC_REAL_PERF_LOG_FILE", "/tmp/no_such_dir/mock.log", 1);
-    assert(storage_perf_log_event(&e, "task") != 0);
-    setenv("SRC_REAL_PERF_LOG_FILE", "/tmp/mock_storage_perf.log", 1);
-    assert(storage_perf_log_event(&e, "task") != 0);
     storage_perf_log_close();
     puts("mock_storage_perf_test: ok"); return 0;
 }

@@ -171,21 +171,16 @@ static uint64_t wall_time_us(void) {
 
 static int hw_storage_log_at_least_debug(void)
 {
-    const char *level = storage_config_compat_getenv("SRC_REAL_LOG_LEVEL");
-    const char *console_level = storage_config_compat_getenv("SRC_REAL_CONSOLE_LOG_LEVEL");
-    const char *legacy = storage_config_compat_getenv("SRC_REAL_LEGACY_STORAGE_TEXT");
+    const AppConfig *config = storage_config_get();
 
-    return (legacy && (strcmp(legacy, "1") == 0 || strcmp(legacy, "true") == 0 ||
-                       strcmp(legacy, "yes") == 0 || strcmp(legacy, "on") == 0)) ||
-           (level && (strcmp(level, "debug") == 0 || strcmp(level, "trace") == 0)) ||
-           (console_level && (strcmp(console_level, "debug") == 0 ||
-                              strcmp(console_level, "trace") == 0));
+    return config && config->log_level == CCB_LOG_DEBUG;
 }
 
 static int hw_storage_log_trace(void)
 {
-    const char *level = storage_config_compat_getenv("SRC_REAL_LOG_LEVEL");
-    return level && strcmp(level, "trace") == 0;
+    const AppConfig *config = storage_config_get();
+
+    return config && config->log_level == CCB_LOG_DEBUG;
 }
 
 static uint32_t elapsed_us_since(uint64_t start_us) {

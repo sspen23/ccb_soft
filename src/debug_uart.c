@@ -73,40 +73,6 @@ static const DebugCategory kDebugCategories[] = {
     {"CONT", DBG_CAT_CONT},
 };
 
-static int env_flag_enabled(const char *name)
-{
-    const char *value = storage_config_compat_getenv(name);
-
-    if (!value || value[0] == '\0') {
-        return 0;
-    }
-    if (strcmp(value, "0") == 0 ||
-        strcmp(value, "false") == 0 ||
-        strcmp(value, "FALSE") == 0 ||
-        strcmp(value, "off") == 0 ||
-        strcmp(value, "OFF") == 0 ||
-        strcmp(value, "no") == 0 ||
-        strcmp(value, "NO") == 0) {
-        return 0;
-    }
-    return 1;
-}
-
-static int token_is_all(const char *token, size_t len)
-{
-    return (len == 1u && token[0] == '1') ||
-           (len == 3u && strncasecmp(token, "all", len) == 0) ||
-           (len == 4u && strncasecmp(token, "true", len) == 0) ||
-           (len == 2u && strncasecmp(token, "on", len) == 0) ||
-           (len == 3u && strncasecmp(token, "yes", len) == 0);
-}
-
-static int token_is_separator(char c)
-{
-    return c == ',' || c == ':' || c == ';' || c == '|' || c == '+' ||
-           c == ' ' || c == '\t' || c == '\n' || c == '\r';
-}
-
 static uint32_t debug_category_mask(const char *name, size_t len)
 {
     size_t i;
@@ -120,55 +86,17 @@ static uint32_t debug_category_mask(const char *name, size_t len)
     return 0u;
 }
 
-static uint32_t parse_debug_mask(const char *value)
-{
-    uint32_t mask = 0u;
-    const char *p = value;
-
-    if (!value || value[0] == '\0') {
-        return 0u;
-    }
-    while (*p != '\0') {
-        const char *start;
-        size_t len;
-
-        while (*p != '\0' && token_is_separator(*p)) {
-            ++p;
-        }
-        start = p;
-        while (*p != '\0' && !token_is_separator(*p)) {
-            ++p;
-        }
-        len = (size_t)(p - start);
-        if (len == 0u) {
-            continue;
-        }
-        if (token_is_all(start, len)) {
-            return DBG_CAT_ALL;
-        }
-        mask |= debug_category_mask(start, len);
-    }
-    return mask;
-}
-
 static uint32_t debug_mask(void)
 {
-    const char *value;
+    const AppConfig *config;
 
     if (g_debug_mask_cached) {
         return g_debug_mask;
     }
     g_debug_mask_cached = 1;
-    if (env_flag_enabled("SRC_REAL_DEBUG_VERBOSE") ||
-        env_flag_enabled("CCB_DEBUG_VERBOSE")) {
-        g_debug_mask = DBG_CAT_ALL;
-        return g_debug_mask;
-    }
-    value = storage_config_compat_getenv("SRC_REAL_DEBUG");
-    if (!value || value[0] == '\0') {
-        value = storage_config_compat_getenv("CCB_DEBUG");
-    }
-    g_debug_mask = parse_debug_mask(value);
+    config = storage_config_get();
+    g_debug_mask = config && config->log_level == CCB_LOG_DEBUG
+                       ? DBG_CAT_ALL : 0u;
     return g_debug_mask;
 }
 
@@ -216,10 +144,6 @@ static int dbg_message_enabled(const char *fmt)
 
 static const char *debug_console_path(void)
 {
-    const char *env_path = storage_config_compat_getenv("DEBUG_CONSOLE_PATH");
-    if (env_path && env_path[0] != '\0') {
-        return env_path;
-    }
     return DEBUG_CONSOLE_PATH;
 }
 
@@ -286,8 +210,9 @@ void dbg_printf(const char *fmt, ...)
 int dbg_verbose_enabled(void)
 {
     if (g_verbose_cached < 0) {
-        g_verbose_cached = env_flag_enabled("SRC_REAL_DEBUG_VERBOSE") ||
-                           env_flag_enabled("CCB_DEBUG_VERBOSE");
+        const AppConfig *config = storage_config_get();
+
+        g_verbose_cached = config && config->log_level == CCB_LOG_DEBUG;
     }
     return g_verbose_cached != 0;
 }

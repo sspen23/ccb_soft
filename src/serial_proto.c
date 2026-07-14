@@ -17,36 +17,14 @@ static int expected_len = 0;
 static int (*send_cb)(uint8_t *, int) = NULL;
 static void (*handler_cb)(uint8_t *) = NULL;
 
-/* Internal helpers. */
-
-static int env_flag_enabled(const char *name)
-{
-    const char *value = storage_config_compat_getenv(name);
-
-    if (!value || value[0] == '\0') {
-        return 0;
-    }
-    if (strcmp(value, "0") == 0 ||
-        strcmp(value, "false") == 0 ||
-        strcmp(value, "FALSE") == 0 ||
-        strcmp(value, "off") == 0 ||
-        strcmp(value, "OFF") == 0 ||
-        strcmp(value, "no") == 0 ||
-        strcmp(value, "NO") == 0) {
-        return 0;
-    }
-    return 1;
-}
-
 static int proto_hex_enabled(void)
 {
     static int cached = -1;
 
     if (cached < 0) {
-        cached = env_flag_enabled("SRC_REAL_DEBUG_HEX") ||
-                 env_flag_enabled("CCB_DEBUG_HEX") ||
-                 env_flag_enabled("SRC_REAL_DEBUG_VERBOSE") ||
-                 env_flag_enabled("CCB_DEBUG_VERBOSE");
+        const AppConfig *config = storage_config_get();
+
+        cached = config && config->log_level == CCB_LOG_DEBUG;
     }
     return cached != 0;
 }

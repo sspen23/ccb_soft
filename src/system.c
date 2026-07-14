@@ -1648,25 +1648,6 @@ static void append_task_output(Task *task, const char *buf, size_t len)
     task->output[task->output_used] = '\0';
 }
 
-static int system_env_flag_enabled(const char *name)
-{
-    const char *value = storage_config_compat_getenv(name);
-
-    if (!value || value[0] == '\0') {
-        return 0;
-    }
-    if (strcmp(value, "0") == 0 ||
-        strcmp(value, "false") == 0 ||
-        strcmp(value, "FALSE") == 0 ||
-        strcmp(value, "off") == 0 ||
-        strcmp(value, "OFF") == 0 ||
-        strcmp(value, "no") == 0 ||
-        strcmp(value, "NO") == 0) {
-        return 0;
-    }
-    return 1;
-}
-
 static void system_emit_line(StorageLogSeverity severity, const char *fmt, ...)
 {
     char line[1024];
@@ -1720,17 +1701,12 @@ static void system_write_stdout_line(const char *line)
  * line directly. */
 static bool worker_output_is_quiet_critical(const char *text)
 {
-    const char *console = storage_config_compat_getenv("SRC_REAL_CONSOLE_LOG_LEVEL");
+    const AppConfig *config = storage_config_get();
 
     if (!text) {
         return false;
     }
-    if (console && strcmp(console, "none") == 0) return false;
-    if (console && (strcmp(console, "debug") == 0 || strcmp(console, "trace") == 0)) {
-        return true;
-    }
-    if ((!console || strcmp(console, "critical") != 0) &&
-        storage_log_severity_enabled(STORAGE_LOG_SUMMARY)) {
+    if (config && config->log_level != CCB_LOG_ERROR) {
         return true;
     }
     return strstr(text, "storage_ddr_full") != NULL ||
@@ -1748,25 +1724,6 @@ static void echo_worker_line(Task *task, const char *line)
     }
     if (worker_output_is_quiet_critical(line)) {
         system_write_stdout_line(line);
-        return;
-    }
-    if (storage_config_compat_getenv("SRC_REAL_ECHO_WORKER_OUTPUT") != NULL) {
-        if (system_env_flag_enabled("SRC_REAL_ECHO_WORKER_OUTPUT")) {
-            system_write_stdout_line(line);
-        }
-        return;
-    }
-    if (task == &transfer_task &&
-        (dbg_category_enabled("NET") || dbg_category_enabled("TCP"))) {
-        system_write_stdout_line(line);
-        return;
-    }
-    if (task != &transfer_task &&
-        (dbg_category_enabled("WRITE") ||
-         dbg_category_enabled("DMA") ||
-         dbg_category_enabled("STORAGE"))) {
-        system_write_stdout_line(line);
-        return;
     }
 }
 
@@ -2041,10 +1998,10 @@ static int start_storage_worker(const PlannedFile *planned, const char *task_id,
                                           keep_fds, 3u);
         setenv("CCB_PROCESS_META_DIR", meta_dir, 1);
         snprintf(start_fd, sizeof(start_fd), "%d", control_pipe[0]);
-        setenv("SRC_REAL_START_FD", start_fd, 1);
-        setenv("SRC_REAL_STORAGE_CONTROL_FD", start_fd, 1);
+        setenv(CCB_INTERNAL_START_FD, start_fd, 1);
+        setenv(CCB_INTERNAL_STORAGE_CONTROL_FD, start_fd, 1);
         snprintf(event_fd, sizeof(event_fd), "%d", event_pipe[1]);
-        setenv("SRC_REAL_STORAGE_EVENT_FD", event_fd, 1);
+        setenv(CCB_INTERNAL_STORAGE_EVENT_FD, event_fd, 1);
         {
             int flags = fcntl(event_pipe[1], F_GETFL, 0);
             if (flags >= 0) (void)fcntl(event_pipe[1], F_SETFL, flags | O_NONBLOCK);
@@ -2327,6 +2284,7 @@ static void finalize_storage_task(Task *task, int exit_code)
     task->state = success ? IDLE : ERROR;
     if (!success) (void)request_storage_stop_all();
 }
+#ifdef CCB_BUILD_DIAG
 static int ensure_task_for_standalone_storage(const char *task_id, time_t *out_overpass)
 {
     TaskInfo info;
@@ -2346,6 +2304,7 @@ static int ensure_task_for_standalone_storage(const char *task_id, time_t *out_o
     *out_overpass = now;
     return 0;
 }
+#endif
 
 static int start_network_worker(const FileRecord *rec)
 {
@@ -2458,6 +2417,7 @@ static int start_network_worker(const FileRecord *rec)
     return 0;
 }
 
+#ifdef CCB_BUILD_DIAG
 static int record_storage_result_to_db(const ParsedArgs *args, const WriteResult *result)
 {
     FileRecord existing;
@@ -2549,6 +2509,7 @@ static int advance_duplicate_file_index_from_db(ParsedArgs *args)
     fflush(stdout);
     return 0;
 }
+#endif
 
 typedef enum {
     NETWORK_SLOT_FREE = 0,
@@ -3627,7 +3588,7 @@ static uint8_t start_storage_for_last_task(uint8_t *failure_type)
       }
       storage_commit_state_reset(&g_storage_commit_state);
       (void)snprintf(count_text, sizeof(count_text), "%d", planned_count);
-      (void)setenv("SRC_REAL_SUPERVISED_CHANNEL_COUNT", count_text, 1);
+      (void)setenv(CCB_INTERNAL_SUPERVISED_CHANNEL_COUNT, count_text, 1);
     }
     for (i = 0; i < planned_count; ++i) {
         if (!find_channel(planned[i].channel_id)) {
@@ -4518,7 +4479,7 @@ static void install_storage_worker_signal_handlers(void)
 
 static int storage_worker_event_fd(void)
 {
-    const char *text = storage_config_compat_getenv("SRC_REAL_STORAGE_EVENT_FD");
+    const char *text = storage_config_compat_getenv(CCB_INTERNAL_STORAGE_EVENT_FD);
     char *end = NULL;
     long value;
 
@@ -4638,19 +4599,6 @@ static int run_storage_worker_main(int argc, char **argv, bool supervised)
         }
     }
     if (final_sent) storage_write_flush_deferred_diag();
-    if (system_env_flag_enabled("SRC_REAL_LEGACY_STORAGE_TEXT")) {
-        printf("storage_worker_result task=%s channel=%d file_index=%u rc=%d"
-               " data_persisted=%u integrity_ok=%u dma_stop_recovered=%u integrity_risk=%s\n",
-               args.task_no,
-               result.channel_id,
-               (unsigned)result.file_index,
-               rc,
-               result.data_persisted ? 1u : 0u,
-               result.integrity_ok ? 1u : 0u,
-               result.dma_stop_recovered ? 1u : 0u,
-               result.integrity_risk[0] != '\0' ? result.integrity_risk : "storage_error");
-        fflush(stdout);
-    }
     dbg_printf("[DBG][WORKER] execute_write done rc=%d task=%s idx=%u data_persisted=%u\n",
                rc,
                args.task_no,

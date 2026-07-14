@@ -10,11 +10,11 @@ static int g_fd = -2;
 static bool g_open_failure_reported;
 static int storage_perf_open(void)
 {
-    const char *enabled = storage_config_compat_getenv("SRC_REAL_PERF_LOG_ENABLE");
-    const char *path;
+    const AppConfig *config = storage_config_get();
+    const char *path = "/tmp/storage_perf.log";
+
     if (g_fd != -2) return g_fd;
-    if (enabled && strcmp(enabled, "0") == 0) { g_fd = -1; return -1; }
-    path = storage_config_compat_getenv("SRC_REAL_PERF_LOG_FILE"); if (!path || !path[0]) path = "/tmp/storage_perf.log";
+    if (!config || !config->perf_enabled) { g_fd = -1; return -1; }
     g_fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
     if (g_fd < 0 && !g_open_failure_reported) {
         /* A bad path must not turn every incoming event into another open(2)
@@ -145,9 +145,6 @@ int storage_perf_log_event(const StorageWorkerEvent *e, const char *task)
     }
     if (n <= 0 || (size_t)n >= sizeof(line)) return -1;
     if (write(fd, line, (size_t)n) != n) return -1;
-    if (storage_config_compat_getenv("SRC_REAL_PERF_LOG_FSYNC") &&
-        strcmp(storage_config_compat_getenv("SRC_REAL_PERF_LOG_FSYNC"), "1") == 0)
-        return fsync(fd);
     return 0;
 }
 void storage_perf_log_close(void) { if (g_fd >= 0) close(g_fd); g_fd = -2; g_open_failure_reported = false; }

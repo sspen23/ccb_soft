@@ -29,36 +29,14 @@ static int env_int_or_default(const char *name, int default_value, int min_value
     return (int)parsed;
 }
 
-static int logger_runtime_level(void)
-{
-    const char *value = storage_config_compat_getenv("SRC_REAL_LOG_LEVEL");
-
-    if (!value || value[0] == '\0' || strcmp(value, "quiet") == 0) {
-        return 0;
-    }
-    if (strcmp(value, "summary") == 0) {
-        return 1;
-    }
-    if (strcmp(value, "debug") == 0) {
-        return 2;
-    }
-    if (strcmp(value, "trace") == 0) {
-        return 3;
-    }
-    return 0;
-}
-
 static int logger_should_drop_message(LogLevel level, const char *message)
 {
-    int runtime_level = logger_runtime_level();
+    const AppConfig *config = storage_config_get();
 
-    if (runtime_level <= 1 && level < LOG_WARN) {
-        return 1;
-    }
-    if (level >= LOG_WARN) {
-        return 0;
-    }
-    if (runtime_level < 3 && message &&
+    if (!config) return level != LOG_ERROR;
+    if (config->log_level == CCB_LOG_ERROR) return level != LOG_ERROR;
+    if (level == LOG_DEBUG && config->log_level != CCB_LOG_DEBUG) return 1;
+    if (config->log_level != CCB_LOG_DEBUG && message &&
         (strstr(message, "storage_pipeline") != NULL ||
          strstr(message, "slot_write_perf") != NULL ||
          strstr(message, "nvme_perf_calc") != NULL ||
