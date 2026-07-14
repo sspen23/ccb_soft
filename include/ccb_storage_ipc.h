@@ -7,7 +7,7 @@
 #include <stdatomic.h>
 
 #define STORAGE_IPC_MAGIC 0x53544732u
-#define STORAGE_IPC_VERSION 2u
+#define STORAGE_IPC_VERSION 3u
 
 typedef enum {
     STORAGE_CTRL_ARM = 1,

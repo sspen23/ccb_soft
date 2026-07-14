@@ -156,6 +156,8 @@ typedef struct {
     bool run_enabled;
     bool error;
     char error_reason[64];
+    bool deferred_stop_error;
+    char deferred_stop_reason[64];
     bool nvme_engine_quiesced;
     /* Published while the cross-slot writer owns the engine.  Stop/error
      * paths may use it to request an abort without waiting for the writer's
@@ -279,7 +281,9 @@ static int storage_slot_addresses(const ChannelRuntime *rt,
 static int storage_zero_tail_padding(ChannelRuntime *rt,
                                      const PendingDdrSlot *item,
                                      uint64_t buffer_offset);
-static void storage_mark_writer_error(StorageWriteQueue *q);
+static void storage_fail_fatal(StorageWriteQueue *q);
+static void storage_record_deferred_stop_error(StorageWriteQueue *q,
+                                               const char *reason);
 static void storage_set_writer_error_reason(StorageWriteQueue *q, const char *reason);
 static void storage_copy_writer_error_reason(StorageWriteQueue *q, char *out, size_t out_size);
 static uint64_t storage_wall_time_us(void);
@@ -303,6 +307,16 @@ static bool storage_env_string_is(const char *name, const char *expected);
 static bool storage_text_output_enabled(void);
 static uint64_t storage_timeout_us(const char *us_name, const char *ms_name,
                                    uint64_t fallback_us);
+
+bool storage_stop_error_is_deferred(const char *reason)
+{
+    return reason &&
+           (strcmp(reason, "unaligned_payload_not_safely_paddable") == 0 ||
+            strcmp(reason, "partial_tail_unqueued") == 0 ||
+            strcmp(reason, "stop_packet_boundary_timeout") == 0 ||
+            strcmp(reason, "late_completed_descriptor") == 0 ||
+            strcmp(reason, "stop_harvest_timeout") == 0);
+}
 
 static uint64_t storage_wall_time_us(void) {
     struct timespec ts;
@@ -1536,6 +1550,22 @@ static void storage_mark_harvest_slot_failed(StorageWriteQueue *q, uint32_t slot
     pthread_mutex_unlock(&q->lock);
 }
 
+/* A completed STOP tail is software-owned after harvest.  When it cannot be
+ * padded safely it must not enter NVMe, but it also must not remain counted as
+ * hardware-writable or be requeued after the STOP latch. */
+static int storage_release_harvested_slot(StorageWriteQueue *q, uint32_t slot)
+{
+    int rc;
+
+    if (!q || slot >= q->capacity) return -1;
+    pthread_mutex_lock(&q->lock);
+    rc = storage_local_slot_transition_locked(q, slot,
+                                              STORAGE_SLOT_DMA_WRITABLE,
+                                              STORAGE_SLOT_FREE);
+    pthread_mutex_unlock(&q->lock);
+    return rc;
+}
+
 static int storage_queue_init(StorageWriteQueue *q,
                               ChannelRuntime *rt,
                               uint32_t file_index,
@@ -2422,7 +2452,7 @@ static int storage_complete_slot(StorageWriteQueue *q, const PendingDdrSlot *ite
             pthread_cond_broadcast(&q->not_full);
             pthread_cond_broadcast(&q->not_empty);
             pthread_mutex_unlock(&q->lock);
-            storage_mark_writer_error(q);
+            storage_fail_fatal(q);
             return -1;
         }
         if (storage_local_slot_transition_locked(q, item->slot, STORAGE_SLOT_REQUEUE_PENDING,
@@ -2434,7 +2464,7 @@ static int storage_complete_slot(StorageWriteQueue *q, const PendingDdrSlot *ite
     pthread_mutex_unlock(&q->lock);
     if (!should_requeue && q->rt && dma_requeue_after_stop_count(q->rt) != 0u) {
         storage_set_writer_error_reason(q, "requeue_after_stop_latched");
-        storage_mark_writer_error(q);
+        storage_fail_fatal(q);
         return -1;
     }
     return 0;
@@ -2460,7 +2490,7 @@ static void storage_copy_writer_error_reason(StorageWriteQueue *q,
     pthread_mutex_unlock(&q->lock);
 }
 
-static void storage_mark_writer_error(StorageWriteQueue *q) {
+static void storage_fail_fatal(StorageWriteQueue *q) {
     if (!q) {
         return;
     }
@@ -2479,6 +2509,19 @@ static void storage_mark_writer_error(StorageWriteQueue *q) {
     pthread_mutex_unlock(&q->lock);
     storage_ring_event(&q->writer_event_ring, STORAGE_EVENT_WORKER_FATAL, q->rt, 0u, 0u, true);
     storage_write_request_stop();
+}
+
+static void storage_record_deferred_stop_error(StorageWriteQueue *q,
+                                               const char *reason)
+{
+    if (!q || !storage_stop_error_is_deferred(reason)) return;
+    pthread_mutex_lock(&q->lock);
+    if (!q->deferred_stop_error) {
+        q->deferred_stop_error = true;
+        (void)snprintf(q->deferred_stop_reason,
+                       sizeof(q->deferred_stop_reason), "%s", reason);
+    }
+    pthread_mutex_unlock(&q->lock);
 }
 
 StorageCrossSlotWriterDecision storage_cross_slot_writer_decide(
@@ -2754,7 +2797,7 @@ static void *storage_nvme_writer_thread(void *arg) {
         pop_result = storage_queue_pop(q, &item, true);
         expected_run_us = 0u;
         if (pop_result == STORAGE_QUEUE_POP_ERROR) {
-            storage_mark_writer_error(q);
+            storage_fail_fatal(q);
             break;
         }
         if (pop_result == STORAGE_QUEUE_POP_PRODUCER_DRAINED) {
@@ -2773,7 +2816,7 @@ static void *storage_nvme_writer_thread(void *arg) {
                                q->file_index,
                                q->metadata_slot,
                                q->task_no) != 0) {
-            storage_mark_writer_error(q);
+            storage_fail_fatal(q);
             break;
         }
         write_us = storage_elapsed_us(write_start_us);
@@ -2791,7 +2834,7 @@ static void *storage_nvme_writer_thread(void *arg) {
             (void)__atomic_add_fetch(&q->ready_q_nonempty_us, write_us, __ATOMIC_RELEASE);
         }
         if (storage_complete_slot(q, &item) != 0) {
-            storage_mark_writer_error(q);
+            storage_fail_fatal(q);
             break;
         }
         if (storage_queue_ready_count(q) > 0u) expected_run_us = storage_wall_time_us();
@@ -2916,7 +2959,7 @@ static void *storage_nvme_cross_slot_writer_thread(void *arg) {
         (void)nvme_cross_slot_engine_drain_abort(engine, now_us + drain_us);
         q->nvme_engine_quiesced = nvme_cross_slot_engine_is_quiesced(engine);
         storage_cross_slot_update_stats(q, engine);
-        storage_mark_writer_error(q);
+        storage_fail_fatal(q);
     } else {
         q->nvme_engine_quiesced = nvme_cross_slot_engine_is_quiesced(engine);
     }
@@ -3292,6 +3335,11 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
     uint64_t start_lba = 0u;
     uint64_t total_sectors = 0u;
     uint64_t dma_received_bytes = 0u;
+    uint64_t dma_observed_bytes = 0u;
+    uint64_t dma_harvested_payload_bytes = 0u;
+    uint64_t queued_payload_bytes = 0u;
+    uint64_t tail_unqueued_bytes = 0u;
+    uint64_t completed_unharvested_bytes = 0u;
     uint64_t bytes_captured = 0u;
     uint64_t bytes_written = 0u;
     uint64_t next_queue_lba = 0u;
@@ -3321,6 +3369,7 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
     bool final_integrity_ok = false;
     bool auto_idle_done = false;
     bool stop_harvest_stable = false;
+    bool stop_tail_seen = false;
     bool bounded;
     bool cross_slot_qd;
     uint64_t requested_size;
@@ -3800,7 +3849,7 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
         storage_queue_set_producer_ready(&write_queue, true) != 0) {
         storage_record_failure(&producer_stats, "producer_schedule_failed");
         (void)storage_queue_set_producer_ready(&write_queue, false);
-        storage_mark_writer_error(&write_queue);
+        storage_fail_fatal(&write_queue);
         (void)storage_emit_event(STORAGE_WORKER_FATAL, &rt, -1, 0u,
                                  producer_stats.receive_integrity_risk);
         goto out;
@@ -3817,12 +3866,12 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
         storage_record_failure(&producer_stats, "invalid_running_sequence");
         (void)storage_emit_event(STORAGE_WORKER_FATAL, &rt, -1, 0u,
                                  "invalid_running_sequence");
-        storage_mark_writer_error(&write_queue);
+        storage_fail_fatal(&write_queue);
         goto out;
     }
     if (storage_emit_event(STORAGE_WORKER_RUNNING, &rt, 0, 0u, "running") != 0) {
         storage_record_failure(&producer_stats, "running_event_send_failed");
-        storage_mark_writer_error(&write_queue);
+        storage_fail_fatal(&write_queue);
         goto out;
     }
     storage_emit_line(STORAGE_LOG_DEBUG, "storage_started channel=%d task=%s file_index=%u"
@@ -4192,21 +4241,119 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                 bool batch_item_invalid = false;
 
                 for (i = 0u; i < harvest_count; ++i) {
-                    uint64_t queued_bytes = harvest_items[i].actual_bytes;
-                    uint64_t remaining = bounded
-                        ? requested_size - (batch_base_file_offset + batch_bytes)
-                        : queued_bytes;
-                    if (queued_bytes == 0u || queued_bytes > rt.dma_desc_bytes ||
-                        (bounded && remaining == 0u)) {
+                    uint64_t observed_bytes = harvest_items[i].actual_bytes;
+                    uint64_t queued_bytes = observed_bytes;
+                    uint64_t remaining = observed_bytes;
+                    uint64_t sectors;
+                    uint64_t media_bytes;
+                    bool stop_phase = stop_state.state != STORAGE_STOP_NONE;
+
+                    if (observed_bytes == 0u || observed_bytes > rt.dma_desc_bytes) {
                         storage_record_failure(&producer_stats, "invalid_dma_harvest_bytes");
                         storage_mark_harvest_slot_failed(&write_queue, harvest_items[i].slot);
                         storage_ring_event(&write_queue.producer_event_ring,
                                            STORAGE_EVENT_DESCRIPTOR_ERROR, &rt,
-                                           queued_bytes, rt.dma_desc_bytes, true);
+                                           observed_bytes, rt.dma_desc_bytes, true);
                         batch_item_invalid = true;
                         break;
                     }
+                    if (bounded) {
+                        if (batch_base_file_offset > requested_size ||
+                            batch_bytes > requested_size - batch_base_file_offset) {
+                            storage_record_failure(&producer_stats,
+                                                   "bounded_harvest_overflow");
+                            storage_mark_harvest_slot_failed(
+                                &write_queue, harvest_items[i].slot);
+                            batch_item_invalid = true;
+                            break;
+                        }
+                        remaining = requested_size - batch_base_file_offset - batch_bytes;
+                        if (remaining == 0u) {
+                            if (dma_observed_bytes > UINT64_MAX - observed_bytes ||
+                                dma_harvested_payload_bytes > UINT64_MAX - observed_bytes ||
+                                dma_received_bytes > UINT64_MAX - observed_bytes ||
+                                tail_unqueued_bytes > UINT64_MAX - observed_bytes) {
+                                storage_record_failure(&producer_stats,
+                                                       "dma_byte_counter_overflow");
+                                storage_mark_harvest_slot_failed(
+                                    &write_queue, harvest_items[i].slot);
+                                batch_item_invalid = true;
+                                break;
+                            }
+                            storage_record_failure(&producer_stats,
+                                                   "late_completed_descriptor");
+                            storage_record_deferred_stop_error(
+                                &write_queue, "late_completed_descriptor");
+                            if (storage_release_harvested_slot(
+                                    &write_queue, harvest_items[i].slot) != 0) {
+                                batch_item_invalid = true;
+                                break;
+                            }
+                            dma_observed_bytes += observed_bytes;
+                            dma_harvested_payload_bytes += observed_bytes;
+                            dma_received_bytes += observed_bytes;
+                            tail_unqueued_bytes += observed_bytes;
+                            storage_stats_record_dma_desc(&producer_stats,
+                                                          storage_wall_time_us());
+                            stop_tail_seen = true;
+                            continue;
+                        }
+                    }
                     if (bounded && queued_bytes > remaining) queued_bytes = remaining;
+                    sectors = bytes_to_sectors(queued_bytes);
+                    if (sectors == 0u ||
+                        sectors > UINT64_MAX / (uint64_t)SECTOR_SIZE) {
+                        storage_record_failure(&producer_stats, "media_byte_overflow");
+                        storage_mark_harvest_slot_failed(&write_queue,
+                                                         harvest_items[i].slot);
+                        batch_item_invalid = true;
+                        break;
+                    }
+                    media_bytes = sectors * (uint64_t)SECTOR_SIZE;
+                    if (dma_observed_bytes > UINT64_MAX - observed_bytes ||
+                        dma_harvested_payload_bytes > UINT64_MAX - queued_bytes ||
+                        dma_received_bytes > UINT64_MAX - queued_bytes) {
+                        storage_record_failure(&producer_stats, "dma_byte_counter_overflow");
+                        storage_mark_harvest_slot_failed(&write_queue,
+                                                         harvest_items[i].slot);
+                        batch_item_invalid = true;
+                        break;
+                    }
+                    dma_observed_bytes += observed_bytes;
+                    dma_harvested_payload_bytes += queued_bytes;
+                    dma_received_bytes += queued_bytes;
+                    storage_stats_record_dma_desc(&producer_stats,
+                                                  storage_wall_time_us());
+
+                    {
+                        StorageStopTailDisposition tail_disposition =
+                            storage_stop_tail_disposition(
+                                stop_phase, stop_tail_seen, queued_bytes, media_bytes,
+                                storage_env_flag_enabled(
+                                    "SRC_REAL_DDR_PADDING_DEVICE_COHERENT") != 0);
+
+                    if (tail_disposition != STORAGE_STOP_TAIL_QUEUE) {
+                        const char *deferred_reason =
+                            tail_disposition == STORAGE_STOP_TAIL_DEFER_LATE
+                                ? "late_completed_descriptor"
+                                : "unaligned_payload_not_safely_paddable";
+
+                        if (tail_unqueued_bytes > UINT64_MAX - queued_bytes ||
+                            storage_release_harvested_slot(
+                                &write_queue, harvest_items[i].slot) != 0) {
+                            storage_record_failure(&producer_stats,
+                                                   "slot_ownership_invariant_failed");
+                            batch_item_invalid = true;
+                            break;
+                        }
+                        tail_unqueued_bytes += queued_bytes;
+                        stop_tail_seen = true;
+                        storage_record_failure(&producer_stats, deferred_reason);
+                        storage_record_deferred_stop_error(&write_queue,
+                                                           deferred_reason);
+                        continue;
+                    }
+                    }
                     memset(&pending[valid_count], 0, sizeof(pending[valid_count]));
                     pending[valid_count].slot = harvest_items[i].slot;
                     pending[valid_count].bytes = queued_bytes;
@@ -4219,16 +4366,8 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                         break;
                     }
                     pending[valid_count].start_lba = batch_base_lba + batch_sectors;
-                    pending[valid_count].sectors = bytes_to_sectors(queued_bytes);
-                    if (pending[valid_count].sectors == 0u ||
-                        pending[valid_count].sectors > UINT64_MAX / (uint64_t)SECTOR_SIZE) {
-                        storage_record_failure(&producer_stats, "media_byte_overflow");
-                        storage_mark_harvest_slot_failed(&write_queue, harvest_items[i].slot);
-                        batch_item_invalid = true;
-                        break;
-                    }
-                    pending[valid_count].media_bytes = pending[valid_count].sectors *
-                                                       (uint64_t)SECTOR_SIZE;
+                    pending[valid_count].sectors = sectors;
+                    pending[valid_count].media_bytes = media_bytes;
                     if ((uint64_t)pending[valid_count].slot >
                         (UINT64_MAX - rt.cfg->ddr_hw_base) / rt.dma_desc_bytes) {
                         storage_record_failure(&producer_stats, "ddr_address_overflow");
@@ -4254,16 +4393,18 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                     goto out;
                 }
                 bytes_captured = batch_base_file_offset + batch_bytes;
-                dma_received_bytes += batch_bytes;
+                if (queued_payload_bytes > UINT64_MAX - batch_bytes) {
+                    storage_record_failure(&producer_stats, "queued_byte_counter_overflow");
+                    goto out;
+                }
+                queued_payload_bytes += batch_bytes;
                 if (batch_sectors > UINT64_MAX - batch_base_lba) {
                     storage_record_failure(&producer_stats, "lba_range_overflow");
                     goto out;
                 }
                 next_queue_lba = batch_base_lba + batch_sectors;
-                for (i = 0u; i < valid_count; ++i)
-                    storage_stats_record_dma_desc(&producer_stats, storage_wall_time_us());
                 ring_full_logged = false;
-                saw_dma_data = true;
+                saw_dma_data = saw_dma_data || harvest_count != 0u;
                 idle_notice_logged = false;
                 last_dma_us = storage_wall_time_us();
                 if (harvest_fatal || batch_item_invalid) {
@@ -4344,6 +4485,14 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
     storage_maybe_dump_event_rings(&write_queue, &rt, false, manual_stop_seen);
     storage_stats_finish_harvest_batch(&producer_stats);
     storage_queue_snapshot(&write_queue, &final_queue_snapshot);
+    if (final_queue_snapshot.completed_unharvested_slots >
+        UINT64_MAX / (uint64_t)rt.dma_desc_bytes) {
+        completed_unharvested_bytes = UINT64_MAX;
+    } else {
+        completed_unharvested_bytes =
+            (uint64_t)final_queue_snapshot.completed_unharvested_slots *
+            (uint64_t)rt.dma_desc_bytes;
+    }
     bytes_written = write_queue.bytes_written;
     chunks = write_queue.chunks;
     nvme_write_us = write_queue.nvme_write_us;
@@ -4363,7 +4512,12 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
         goto out;
     }
 
-    if (storage_write_mode_commits_locally(mode)) {
+    if (storage_write_mode_commits_locally(mode) &&
+        producer_stats.receive_integrity_ok && !tail_incomplete &&
+        tail_unqueued_bytes == 0u && completed_unharvested_bytes == 0u &&
+        queued_payload_bytes == write_queue.bytes_written &&
+        queued_payload_bytes ==
+            __atomic_load_n(&rt.nvme_payload_bytes_done, __ATOMIC_ACQUIRE)) {
         FileEntry e;
         memset(&e, 0, sizeof(e));
         memcpy(e.task_no, args->task_no, strlen(args->task_no));
@@ -4432,7 +4586,13 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                                   expected_bytes == nvme_payload_bytes_done
                             : !strict_end_to_end;
         bool storage_integrity_ok = !tail_incomplete && !dma_stop_failed &&
-                                    dma_received_bytes == bytes_written;
+                                    tail_unqueued_bytes == 0u &&
+                                    completed_unharvested_bytes == 0u &&
+                                    final_queue_snapshot.ready_depth_current == 0u &&
+                                    final_queue_snapshot.nvme_busy_slots == 0u &&
+                                    queued_payload_bytes == bytes_written &&
+                                    queued_payload_bytes == nvme_payload_bytes_done &&
+                                    dma_harvested_payload_bytes == queued_payload_bytes;
         if (require_nonempty_payload && dma_received_bytes == 0u) {
             storage_record_failure(&producer_stats, "zero_payload_not_allowed");
             storage_integrity_ok = false;
@@ -4665,10 +4825,15 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
             result->integrity_ok = integrity_ok;
             result->dma_stop_recovered = dma_stop_result == DMA_STOP_RESET_RECOVERED;
             result->dma_received_bytes = dma_received_bytes;
+            result->dma_observed_bytes = dma_observed_bytes;
+            result->dma_harvested_payload_bytes = dma_harvested_payload_bytes;
+            result->queued_payload_bytes = queued_payload_bytes;
             result->nvme_completed_bytes = nvme_payload_bytes_done;
             result->nvme_media_bytes = nvme_write_bytes_done;
             result->nvme_padding_bytes = nvme_write_bytes_done >= nvme_payload_bytes_done
                                              ? nvme_write_bytes_done - nvme_payload_bytes_done : 0u;
+            result->tail_unqueued_bytes = tail_unqueued_bytes;
+            result->completed_unharvested_bytes = completed_unharvested_bytes;
             result->file_bytes = bytes_written;
             result->expected_bytes = expected_bytes;
             result->expected_available = expected_available;
@@ -4818,7 +4983,8 @@ out:
 
                     memset(stopped_pending, 0, sizeof(stopped_pending));
                     for (i = 0u; i < stopped_count; ++i) {
-                        uint64_t bytes = stopped_items[i].actual_bytes;
+                        uint64_t observed_bytes = stopped_items[i].actual_bytes;
+                        uint64_t bytes = observed_bytes;
                         uint64_t remaining = bounded && base_offset + batch_bytes < requested_size
                                                  ? requested_size - (base_offset + batch_bytes)
                                                  : (bounded ? 0u : bytes);
@@ -4830,6 +4996,58 @@ out:
                             continue;
                         }
                         if (bounded && bytes > remaining) bytes = remaining;
+                        {
+                            uint64_t sectors = bytes_to_sectors(bytes);
+                            uint64_t media_bytes = sectors <= UINT64_MAX / SECTOR_SIZE
+                                                       ? sectors * (uint64_t)SECTOR_SIZE : 0u;
+                            bool unsafe_tail = stop_tail_seen ||
+                                (media_bytes != bytes &&
+                                 !storage_env_flag_enabled(
+                                     "SRC_REAL_DDR_PADDING_DEVICE_COHERENT"));
+
+                            if (sectors == 0u || media_bytes == 0u) {
+                                storage_mark_harvest_slot_failed(
+                                    &write_queue, stopped_items[i].slot);
+                                storage_record_failure(&producer_stats,
+                                                       "media_byte_overflow");
+                                continue;
+                            }
+                            if (dma_observed_bytes > UINT64_MAX - observed_bytes ||
+                                dma_harvested_payload_bytes > UINT64_MAX - bytes ||
+                                dma_received_bytes > UINT64_MAX - bytes) {
+                                storage_mark_harvest_slot_failed(
+                                    &write_queue, stopped_items[i].slot);
+                                storage_record_failure(&producer_stats,
+                                                       "dma_byte_counter_overflow");
+                                continue;
+                            }
+                            dma_observed_bytes += observed_bytes;
+                            dma_harvested_payload_bytes += bytes;
+                            dma_received_bytes += bytes;
+                            storage_stats_record_dma_desc(&producer_stats,
+                                                          storage_wall_time_us());
+                            if (unsafe_tail) {
+                                const char *reason = stop_tail_seen
+                                    ? "late_completed_descriptor"
+                                    : "unaligned_payload_not_safely_paddable";
+                                if (tail_unqueued_bytes > UINT64_MAX - bytes ||
+                                    storage_release_harvested_slot(
+                                        &write_queue, stopped_items[i].slot) != 0) {
+                                    storage_record_failure(
+                                        &producer_stats,
+                                        "slot_ownership_invariant_failed");
+                                    continue;
+                                }
+                                tail_unqueued_bytes += bytes;
+                                stop_tail_seen = true;
+                                storage_record_failure(&producer_stats, reason);
+                                storage_record_deferred_stop_error(&write_queue,
+                                                                   reason);
+                                continue;
+                            }
+                            stopped_pending[valid_count].sectors = sectors;
+                            stopped_pending[valid_count].media_bytes = media_bytes;
+                        }
                         stopped_pending[valid_count].slot = stopped_items[i].slot;
                         stopped_pending[valid_count].bytes = bytes;
                         stopped_pending[valid_count].chunk_index = base_chunk + valid_count;
@@ -4840,9 +5058,6 @@ out:
                             continue;
                         }
                         stopped_pending[valid_count].start_lba = base_lba + batch_sectors;
-                        stopped_pending[valid_count].sectors = bytes_to_sectors(bytes);
-                        stopped_pending[valid_count].media_bytes =
-                            stopped_pending[valid_count].sectors * (uint64_t)SECTOR_SIZE;
                         if ((uint64_t)stopped_pending[valid_count].slot >
                             (UINT64_MAX - rt.cfg->ddr_hw_base) / rt.dma_desc_bytes) {
                             storage_record_failure(&producer_stats, "ddr_address_overflow");
@@ -4863,13 +5078,15 @@ out:
                         break;
                     }
                     bytes_captured += batch_bytes;
-                    dma_received_bytes += batch_bytes;
+                    if (queued_payload_bytes <= UINT64_MAX - batch_bytes)
+                        queued_payload_bytes += batch_bytes;
+                    else
+                        storage_record_failure(&producer_stats,
+                                               "queued_byte_counter_overflow");
                     if (batch_sectors <= UINT64_MAX - next_queue_lba)
                         next_queue_lba += batch_sectors;
                     else
                         storage_record_failure(&producer_stats, "lba_range_overflow");
-                    for (i = 0u; i < valid_count; ++i)
-                        storage_stats_record_dma_desc(&producer_stats, storage_wall_time_us());
                 }
             }
         }
@@ -4947,10 +5164,15 @@ out:
             result->storage_integrity_ok = false;
             result->integrity_ok = false;
             result->dma_received_bytes = dma_received_bytes;
+            result->dma_observed_bytes = dma_observed_bytes;
+            result->dma_harvested_payload_bytes = dma_harvested_payload_bytes;
+            result->queued_payload_bytes = queued_payload_bytes;
             result->nvme_completed_bytes = __atomic_load_n(&rt.nvme_payload_bytes_done, __ATOMIC_ACQUIRE);
             result->nvme_media_bytes = __atomic_load_n(&rt.nvme_write_bytes_done, __ATOMIC_ACQUIRE);
             result->nvme_padding_bytes = result->nvme_media_bytes >= result->nvme_completed_bytes
                                              ? result->nvme_media_bytes - result->nvme_completed_bytes : 0u;
+            result->tail_unqueued_bytes = tail_unqueued_bytes;
+            result->completed_unharvested_bytes = completed_unharvested_bytes;
             result->file_bytes = bytes_written;
             result->dma_bd_exhaustion_count = producer_stats.dma_no_free_slot_count;
             result->dma_error_count = producer_stats.dma_error_count;

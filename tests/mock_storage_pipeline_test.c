@@ -42,6 +42,20 @@ int main(void)
                                          1300u, 3u, 100u));
     assert(!storage_stop_harvest_observe(&harvest_stop, true, 0u, 0u, true,
                                          1400u, 3u, 100u));
+    {
+        bool queue_error = false;
+        bool producer_done = false;
+
+        assert(storage_stop_tail_disposition(true, false, 8u * 1024u * 1024u,
+                                             8u * 1024u * 1024u, false) ==
+               STORAGE_STOP_TAIL_QUEUE);
+        assert(storage_stop_tail_disposition(true, false, 419692512u,
+                                             419692544u, false) ==
+               STORAGE_STOP_TAIL_DEFER_UNALIGNED);
+        assert(storage_stop_tail_disposition(true, true, 4096u, 4096u, false) ==
+               STORAGE_STOP_TAIL_DEFER_LATE);
+        assert(!queue_error && !producer_done);
+    }
 
     storage_run_state_init(&run);
     assert(!storage_run_state_can_emit_running(&run));

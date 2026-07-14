@@ -28,6 +28,12 @@ typedef struct {
     uint64_t empty_since_us;
 } StorageStopHarvestState;
 
+typedef enum {
+    STORAGE_STOP_TAIL_QUEUE = 0,
+    STORAGE_STOP_TAIL_DEFER_UNALIGNED,
+    STORAGE_STOP_TAIL_DEFER_LATE
+} StorageStopTailDisposition;
+
 typedef struct {
     bool writer_enabled;
     bool writer_run_ready;
@@ -107,6 +113,11 @@ bool storage_stop_harvest_observe(StorageStopHarvestState *state,
                                   uint64_t now_us,
                                   uint32_t required_empty_scans,
                                   uint64_t stable_window_us);
+StorageStopTailDisposition storage_stop_tail_disposition(bool stop_active,
+                                                         bool tail_already_seen,
+                                                         uint64_t payload_bytes,
+                                                         uint64_t media_bytes,
+                                                         bool padding_coherent);
 void storage_run_state_init(StorageRunState *state);
 int storage_run_state_enable_writer(StorageRunState *state);
 int storage_run_state_set_writer_ready(StorageRunState *state, bool success);

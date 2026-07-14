@@ -59,6 +59,9 @@ storage-host-tests:
 	$(CC) $(CFLAGS) -Wformat=2 -Iinclude tests/mock_storage_pipeline_test.c \
 		src/ccb_storage_pipeline.c -lpthread -o /tmp/mock_storage_pipeline_test
 	/tmp/mock_storage_pipeline_test
+	$(CC) $(CFLAGS) -Wformat=2 -Iinclude tests/mock_storage_stop_lifecycle_test.c \
+		src/ccb_storage_pipeline.c -lpthread -o /tmp/mock_storage_stop_lifecycle_test
+	/tmp/mock_storage_stop_lifecycle_test
 	$(CC) $(CFLAGS) -Wformat=2 -Iinclude tests/mock_storage_diag_test.c \
 		src/ccb_storage_diag.c -latomic -o /tmp/mock_storage_diag_test
 	/tmp/mock_storage_diag_test

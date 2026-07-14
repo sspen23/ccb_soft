@@ -70,6 +70,19 @@ bool storage_stop_harvest_observe(StorageStopHarvestState *state,
            now_us - state->empty_since_us >= stable_window_us;
 }
 
+StorageStopTailDisposition storage_stop_tail_disposition(bool stop_active,
+                                                         bool tail_already_seen,
+                                                         uint64_t payload_bytes,
+                                                         uint64_t media_bytes,
+                                                         bool padding_coherent)
+{
+    if (!stop_active) return STORAGE_STOP_TAIL_QUEUE;
+    if (tail_already_seen) return STORAGE_STOP_TAIL_DEFER_LATE;
+    if (payload_bytes != 0u && media_bytes > payload_bytes && !padding_coherent)
+        return STORAGE_STOP_TAIL_DEFER_UNALIGNED;
+    return STORAGE_STOP_TAIL_QUEUE;
+}
+
 void storage_run_state_init(StorageRunState *state)
 {
     if (state) memset(state, 0, sizeof(*state));

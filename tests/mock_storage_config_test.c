@@ -227,12 +227,25 @@ static void test_enabled_and_invalid_fallback(void)
     assert(strcmp(resolution.fallback_source_name, "default") == 0);
 }
 
+static void test_stop_error_classification(void)
+{
+    assert(storage_stop_error_is_deferred(
+        "unaligned_payload_not_safely_paddable"));
+    assert(storage_stop_error_is_deferred("partial_tail_unqueued"));
+    assert(storage_stop_error_is_deferred("stop_packet_boundary_timeout"));
+    assert(storage_stop_error_is_deferred("late_completed_descriptor"));
+    assert(storage_stop_error_is_deferred("stop_harvest_timeout"));
+    assert(!storage_stop_error_is_deferred("unknown_completion_cid"));
+    assert(!storage_stop_error_is_deferred("duplicate_completion_cid"));
+}
+
 int main(void)
 {
     test_defaults();
     test_max_active_priority_and_aliases();
     test_generic_priority_and_all_parameters();
     test_enabled_and_invalid_fallback();
+    test_stop_error_classification();
     clear_cross_slot_env();
     puts("mock_storage_config_test: ok");
     return 0;

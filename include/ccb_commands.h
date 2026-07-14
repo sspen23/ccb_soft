@@ -16,12 +16,17 @@ typedef struct {
     bool integrity_ok;
     bool dma_stop_recovered;
     uint64_t dma_received_bytes;
+    uint64_t dma_observed_bytes;
+    uint64_t dma_harvested_payload_bytes;
+    uint64_t queued_payload_bytes;
     /* Payload bytes are the valid data bytes.  Media bytes include sector
      * padding and are kept separate so integrity checks never compare a
      * padded write with the received payload. */
     uint64_t nvme_completed_bytes;
     uint64_t nvme_media_bytes;
     uint64_t nvme_padding_bytes;
+    uint64_t tail_unqueued_bytes;
+    uint64_t completed_unharvested_bytes;
     uint64_t file_bytes;
     uint64_t expected_bytes;
     bool expected_available;
@@ -61,6 +66,8 @@ void storage_write_reset_stop(void);
 void storage_write_request_stop(void);
 void storage_write_flush_deferred_diag(void);
 bool storage_write_fatal_event_sent(void);
+
+bool storage_stop_error_is_deferred(const char *reason);
 
 typedef enum {
     STORAGE_CROSS_SLOT_CONFIG_ENABLED = 0,
