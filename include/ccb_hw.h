@@ -28,6 +28,11 @@ int nvme_stop_requested(void);
 
 /* Submit segmented NVMe read/write covering the requested sector range. */
 int nvme_rw(ChannelRuntime *rt, bool is_write, uint64_t lba, uint64_t sectors, uint64_t hw_addr);
+/* The return value follows NvmeSubmitResult.  Once the doorbell is written,
+ * STOP and timeout are acceptance-unknown, never ordinary cancellation. */
+int nvme_submit_command_async(ChannelRuntime *rt, uint8_t opcode,
+                              uint16_t cid, uint64_t lba,
+                              uint32_t sectors, uint64_t ddr_addr);
 int nvme_submit_write_async(ChannelRuntime *rt,
                             uint16_t cid,
                             uint64_t lba,
@@ -106,7 +111,7 @@ typedef enum {
     NVME_SUBMIT_ACCEPTED = 0,
     NVME_SUBMIT_RETRY_SQ_FULL = 1,
     NVME_SUBMIT_NOT_ACCEPTED = -1,
-    NVME_SUBMIT_STOPPED = -2,
+    NVME_SUBMIT_STOPPED_BEFORE_DOORBELL = -2,
     NVME_SUBMIT_ACCEPTANCE_UNKNOWN = -3
 } NvmeSubmitResult;
 typedef struct {

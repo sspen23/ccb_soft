@@ -7,6 +7,7 @@
 - Default cross-slot policy is ch0/ch1 enabled with `target_qd=8`, `max_active_slots=4`, `cq_batch=32`; ch2 is legacy single-slot with QD 4. Do not set compatibility variables unless the step asks for them.
 - Capture serial output, parent stdout, `/tmp/storage_perf.log`, task status, metadata and file hashes. The serial binary ACK protocol is unchanged and is authoritative for command acknowledgement; worker stdout is not.
 - A normal terminal record is exactly one `storage_capture_complete`. Per-channel detail is taken from structured FINAL/PERF/DIAG records in the performance log.
+- Pending hardware assumptions: a legacy submit that reports `submit_accept_timeout_after_stop` or `submit_accept_timeout` must drain its matching CQ before its CID/DDR slot is reused. The current Host Core integration has no documented queue/controller reset or CQ-clear sequence that proves PRP ownership ended; `nvme_queue_reset_unavailable` is therefore a safe failure. Board validation must confirm reset/disable ownership and CQ FIFO semantics before enabling any recovery that releases unresolved DDR.
 
 ## 1. ch2 single-channel baseline
 

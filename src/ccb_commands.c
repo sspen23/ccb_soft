@@ -2397,6 +2397,12 @@ static void storage_mark_writer_error(StorageWriteQueue *q) {
     }
     storage_set_writer_error_reason(q, "storage_writer_error");
     pthread_mutex_lock(&q->lock);
+    if (q->rt && q->rt->nvme_ownership_unresolved) {
+        /* The legacy pending array is intentionally retained only until this
+         * worker exits.  Do not destroy the queue or unmap DDR while an
+         * unconfirmed Host Core command may still hold its PRP. */
+        q->nvme_engine_quiesced = false;
+    }
     q->error = true;
     q->producer_done = true;
     pthread_cond_broadcast(&q->not_full);

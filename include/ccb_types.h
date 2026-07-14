@@ -283,6 +283,10 @@ typedef struct {
     uint64_t nvme_refill_count;
     uint64_t nvme_completion_count;
     char nvme_last_error[64];
+    /* Set only after a posted NVMe doorbell cannot be drained and no
+     * confirmed controller/queue reset exists.  Such a runtime must retain
+     * its mappings until process teardown; DDR/CID ownership is unresolved. */
+    bool nvme_ownership_unresolved;
     uint32_t dma_desc_bytes;
     uint64_t dma_ring_bytes;
     uint32_t dma_desc_count;

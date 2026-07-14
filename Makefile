@@ -77,5 +77,8 @@ storage-host-tests:
 		tests/mock_nvme_cross_slot_test.c src/ccb_hw.c src/debug_uart.c -Wl,--gc-sections -o /tmp/mock_nvme_cross_slot_test
 	/tmp/mock_nvme_cross_slot_test
 	$(CC) $(CFLAGS) -Wformat=2 -ffunction-sections -fdata-sections -Iinclude \
+		tests/mock_nvme_legacy_submit_test.c src/ccb_hw.c src/debug_uart.c -lpthread -Wl,--gc-sections -o /tmp/mock_nvme_legacy_submit_test
+	/tmp/mock_nvme_legacy_submit_test
+	$(CC) $(CFLAGS) -Wformat=2 -ffunction-sections -fdata-sections -Iinclude \
 		tests/mock_dma_harvest_batch_test.c src/ccb_hw.c -Wl,--gc-sections -o /tmp/mock_dma_harvest_batch_test
 	/tmp/mock_dma_harvest_batch_test

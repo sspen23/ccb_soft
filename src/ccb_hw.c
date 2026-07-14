@@ -974,6 +974,8 @@ typedef struct {
     uint32_t inflight_cmds;
 } NvmeSlotWriteContext;
 
+static int cross_slot_real_reset(void *opaque);
+
 static void nvme_dump_write_timeout_context(ChannelRuntime *rt,
                                             const NvmePendingCmd *pending,
                                             uint32_t capacity,
@@ -1111,27 +1113,27 @@ static void nvme_print_active_qd_stats(const ChannelRuntime *rt,
            rt->nvme_completion_count);
 }
 
-static int nvme_submit_command_async(ChannelRuntime *rt,
-                                     uint8_t opcode,
-                                     uint16_t cid,
-                                     uint64_t lba,
-                                     uint32_t sectors,
-                                     uint64_t hw_addr) {
+int nvme_submit_command_async(ChannelRuntime *rt,
+                              uint8_t opcode,
+                              uint16_t cid,
+                              uint64_t lba,
+                              uint32_t sectors,
+                              uint64_t hw_addr) {
     uint64_t submit_start_us;
     uint64_t pending_start_us;
 
-    if (sectors == 0u || sectors > UINT16_MAX) {
-        return -1;
+    if (!rt || sectors == 0u || sectors > UINT16_MAX) {
+        return NVME_SUBMIT_NOT_ACCEPTED;
     }
     if (rt->gopt.dry_run) {
-        return 0;
+        return NVME_SUBMIT_ACCEPTED;
     }
     if (nvme_stop_requested()) {
-        return -2;
+        return NVME_SUBMIT_STOPPED_BEFORE_DOORBELL;
     }
     if ((reg_read32(&rt->nvme, QUEUE_REG_OFFSET + QUEUE_TX_STATUS) & QUEUE_SQ_FIFO_FULL) != 0u) {
         rt->nvme_submit_sq_full_count++;
-        return 1;
+        return NVME_SUBMIT_RETRY_SQ_FULL;
     }
 
     submit_start_us = wall_time_us();
@@ -1153,6 +1155,11 @@ static int nvme_submit_command_async(ChannelRuntime *rt,
     reg_write32(&rt->nvme, QUEUE_REG_OFFSET + QUEUE_LBA_L, (uint32_t)(lba & 0xFFFFFFFFull));
     reg_write32(&rt->nvme, QUEUE_REG_OFFSET + QUEUE_LBA_H, (uint32_t)(lba >> 32u));
     __sync_synchronize();
+    /* This is the last software-observable point before ownership crosses
+     * the doorbell boundary.  A STOP after this check is ambiguous. */
+    if (nvme_stop_requested()) {
+        return NVME_SUBMIT_STOPPED_BEFORE_DOORBELL;
+    }
     reg_write32(&rt->nvme, QUEUE_REG_OFFSET + QUEUE_TX_CTRL, QUEUE_TX_CTRL_CMD_PENDING);
 
     pending_start_us = wall_time_us();
@@ -1163,21 +1170,22 @@ static int nvme_submit_command_async(ChannelRuntime *rt,
             rt->nvme_submit_pending_wait_us += elapsed_us_since(pending_start_us);
             rt->nvme_submit_total_us += submit_us;
             nvme_record_submit_stall(rt, submit_us);
-            return -2;
+            nvme_set_last_error(rt, "submit_accept_timeout_after_stop");
+            return NVME_SUBMIT_ACCEPTANCE_UNKNOWN;
         }
         if (elapsed_us_since(pending_start_us) >= rt->gopt.timeout_us) {
             uint64_t submit_us = elapsed_us_since(submit_start_us);
             rt->nvme_submit_pending_wait_us += elapsed_us_since(pending_start_us);
             rt->nvme_submit_total_us += submit_us;
             nvme_record_submit_stall(rt, submit_us);
-            nvme_set_last_error(rt, "tx_pending_timeout");
+            nvme_set_last_error(rt, "submit_accept_timeout");
             fprintf(stderr,
                     "NVMe TX pending timeout channel=%d cid=%u ctrl=0x%08x status=0x%08x\n",
                     rt->cfg->id,
                     (unsigned)cid,
                     reg_read32(&rt->nvme, QUEUE_REG_OFFSET + QUEUE_TX_CTRL),
                     reg_read32(&rt->nvme, QUEUE_REG_OFFSET + QUEUE_TX_STATUS));
-            return -1;
+            return NVME_SUBMIT_ACCEPTANCE_UNKNOWN;
         }
         nvme_poll_pause(rt, pending_start_us);
     }
@@ -1197,7 +1205,7 @@ static int nvme_submit_command_async(ChannelRuntime *rt,
                                           __ATOMIC_RELEASE,
                                           __ATOMIC_RELAXED);
     }
-    return 0;
+    return NVME_SUBMIT_ACCEPTED;
 }
 
 int nvme_submit_write_async(ChannelRuntime *rt,
@@ -1256,7 +1264,7 @@ static int nvme_submit_write_fast(ChannelRuntime *rt,
         return NVME_SUBMIT_ACCEPTED;
     }
     if (nvme_stop_requested()) {
-        return NVME_SUBMIT_STOPPED;
+        return NVME_SUBMIT_STOPPED_BEFORE_DOORBELL;
     }
     tx_status = reg_read32(&rt->nvme, QUEUE_REG_OFFSET + QUEUE_TX_STATUS);
     if ((tx_status & QUEUE_SQ_FIFO_FULL) != 0u) {
@@ -1535,6 +1543,102 @@ static int nvme_handle_write_completion(ChannelRuntime *rt,
     return 0;
 }
 
+/* No documented Host Core register sequence proves that reset/disable has
+ * stopped accesses to submitted PRPs.  Keep this explicit instead of
+ * fabricating a successful reset. */
+static int nvme_legacy_reset_unavailable(ChannelRuntime *rt)
+{
+    return cross_slot_real_reset(rt);
+}
+
+static void nvme_mark_ownership_unresolved(ChannelRuntime *rt,
+                                           const char *primary_reason)
+{
+    if (!rt) return;
+    rt->nvme_ownership_unresolved = true;
+    if (rt->nvme_last_error[0] == '\0' && primary_reason) {
+        nvme_set_last_error(rt, primary_reason);
+    }
+    fprintf(stderr,
+            "NVMe ownership unresolved channel=%d primary_reason=%s"
+            " secondary_reason=nvme_queue_reset_unavailable\n",
+            rt->cfg ? rt->cfg->id : -1,
+            rt->nvme_last_error[0] ? rt->nvme_last_error : "submit_accept_timeout");
+}
+
+/* Drain only already-posted commands.  nvme_try_poll_cq_fast deliberately
+ * ignores the global STOP latch: STOP after a doorbell must not prevent CQ
+ * retirement.  On an unknown/duplicate CQ or deadline, reset is attempted
+ * only through the real conservative callback and ownership stays frozen. */
+static int nvme_drain_ambiguous_legacy_pending(ChannelRuntime *rt,
+                                               NvmePendingCmd *pending,
+                                               uint32_t capacity,
+                                               NvmeSlotWriteContext *slot_ctx,
+                                               uint64_t deadline_us)
+{
+    while (slot_ctx && slot_ctx->inflight_cmds > 0u) {
+        NvmeCompletion completion;
+        int poll_rc = nvme_try_poll_cq_fast(rt, &completion);
+        if (poll_rc > 0) {
+            if (nvme_handle_write_completion(rt, pending, capacity, slot_ctx,
+                                             &completion) != 0) {
+                (void)nvme_legacy_reset_unavailable(rt);
+                nvme_mark_ownership_unresolved(rt, "submit_accept_timeout");
+                return -1;
+            }
+            continue;
+        }
+        if (poll_rc < 0 || wall_time_us() >= deadline_us) {
+            (void)nvme_legacy_reset_unavailable(rt);
+            nvme_mark_ownership_unresolved(rt, "submit_accept_timeout");
+            return -1;
+        }
+        if (rt->nvme_poll_sleep_us != 0u) usleep(rt->nvme_poll_sleep_us);
+        else sched_yield();
+    }
+    return 0;
+}
+
+static int nvme_drain_ambiguous_tight_pending(ChannelRuntime *rt,
+                                              NvmePendingCmd *pending,
+                                              uint32_t *active_qd,
+                                              uint64_t *completed,
+                                              uint64_t deadline_us)
+{
+    while (active_qd && *active_qd > 0u) {
+        NvmeCompletion completion;
+        NvmePendingCmd *entry;
+        int poll_rc = nvme_try_poll_cq_fast(rt, &completion);
+        if (poll_rc > 0) {
+            entry = nvme_find_pending_by_cid(pending, NVME_PENDING_CAPACITY,
+                                             completion.cid);
+            if (!entry) {
+                nvme_set_last_error(rt, "completion_without_pending_cid");
+                (void)nvme_legacy_reset_unavailable(rt);
+                nvme_mark_ownership_unresolved(rt, "submit_accept_timeout");
+                return -1;
+            }
+            entry->valid = false;
+            if (*active_qd > 0u) --(*active_qd);
+            if (completion.error) {
+                nvme_set_last_error(rt, "completion_status_error");
+                return -1;
+            }
+            nvme_record_write_completion(rt, entry, wall_time_us());
+            if (completed) ++(*completed);
+            continue;
+        }
+        if (poll_rc < 0 || wall_time_us() >= deadline_us) {
+            (void)nvme_legacy_reset_unavailable(rt);
+            nvme_mark_ownership_unresolved(rt, "submit_accept_timeout");
+            return -1;
+        }
+        if (rt->nvme_poll_sleep_us != 0u) usleep(rt->nvme_poll_sleep_us);
+        else sched_yield();
+    }
+    return 0;
+}
+
 static int nvme_simulate_write_qd_payload(ChannelRuntime *rt, uint64_t sectors,
                                            uint64_t payload_bytes,
                                            uint64_t command_sectors) {
@@ -1714,15 +1818,32 @@ int nvme_write_contiguous_tight_qd_payload(ChannelRuntime *rt,
                                                next_ddr,
                                                &last_ctx0,
                                                &last_ctx0_valid);
-            if (submit_rc == 1) {
+            if (submit_rc == NVME_SUBMIT_RETRY_SQ_FULL) {
                 entry->valid = false;
                 rt->nvme_submit_sq_full_count++;
                 break;
             }
-            if (submit_rc != 0) {
+            if (submit_rc == NVME_SUBMIT_ACCEPTANCE_UNKNOWN) {
+                uint64_t deadline_us;
+                ++submitted;
+                ++active_qd;
+                rt->nvme_refill_count++;
+                nvme_record_active_qd_event(rt, active_qd);
+                deadline_us = wall_time_us() + (uint64_t)rt->gopt.timeout_us;
+                if (deadline_us < rt->gopt.timeout_us ||
+                    nvme_drain_ambiguous_tight_pending(rt, pending, &active_qd,
+                                                       &completed, deadline_us) != 0) {
+                    return -1;
+                }
+                nvme_tight_error(rt, "submit_accept_timeout", cid, submitted,
+                                 completed, active_qd, next_lba, next_ddr);
+                return NVME_SUBMIT_ACCEPTANCE_UNKNOWN;
+            }
+            if (submit_rc != NVME_SUBMIT_ACCEPTED) {
                 entry->valid = false;
                 nvme_tight_error(rt,
-                                 submit_rc == -2 ? "submit_timeout" : "submit_timeout",
+                                 submit_rc == NVME_SUBMIT_STOPPED_BEFORE_DOORBELL
+                                     ? "submit_stopped_before_doorbell" : "submit_failed",
                                  cid,
                                  submitted,
                                  completed,
@@ -1938,13 +2059,40 @@ static int nvme_write_slot_qd_legacy_payload(ChannelRuntime *rt,
                                                 entry->lba,
                                                 entry->sectors,
                                                 entry->ddr_addr);
-            if (submit_rc == 1) {
+            if (submit_rc == NVME_SUBMIT_RETRY_SQ_FULL) {
                 entry->valid = false;
                 sq_full = true;
                 break;
-            } else if (submit_rc != 0) {
+            } else if (submit_rc == NVME_SUBMIT_ACCEPTANCE_UNKNOWN) {
+                uint64_t deadline_us;
+                /* The doorbell may own this CID/DDR range.  Account it
+                 * before doing anything else, then stop submitting and drain
+                 * only the already posted commands. */
+                slot_ctx.next_submit_sector += command_sectors;
+                ++slot_ctx.submitted_cmds;
+                ++slot_ctx.inflight_cmds;
+                nvme_update_active_qd(rt, slot_ctx.inflight_cmds, wall_time_us());
+                nvme_record_active_qd_event(rt, slot_ctx.inflight_cmds);
+                deadline_us = wall_time_us() + (uint64_t)rt->gopt.timeout_us;
+                if (deadline_us < rt->gopt.timeout_us ||
+                    nvme_drain_ambiguous_legacy_pending(rt, pending,
+                                                        NVME_PENDING_CAPACITY,
+                                                        &slot_ctx, deadline_us) != 0) {
+                    return -1;
+                }
+                /* CQ proved all submitted commands completed.  Continue only
+                 * if this slot itself is now complete; otherwise fail safely
+                 * rather than issuing more commands after ambiguity. */
+                if (slot_ctx.next_submit_sector == slot_ctx.total_sectors &&
+                    slot_ctx.completed_cmds == slot_ctx.submitted_cmds &&
+                    slot_ctx.inflight_cmds == 0u && slot_ctx.failed_cmds == 0u) {
+                    return 0;
+                }
+                return NVME_SUBMIT_ACCEPTANCE_UNKNOWN;
+            } else if (submit_rc != NVME_SUBMIT_ACCEPTED) {
                 entry->valid = false;
-                if (submit_rc != -2 && rt->nvme_last_error[0] == '\0') {
+                if (submit_rc != NVME_SUBMIT_STOPPED_BEFORE_DOORBELL &&
+                    rt->nvme_last_error[0] == '\0') {
                     nvme_set_last_error(rt, "async_submit_failed");
                 }
                 return submit_rc;
@@ -2166,6 +2314,38 @@ static int nvme_handle_multi_write_completion(ChannelRuntime *rt,
     return 0;
 }
 
+static int nvme_drain_ambiguous_multi_pending(ChannelRuntime *rt,
+                                              NvmePendingCmd *pending,
+                                              NvmeSlotWriteContext *contexts,
+                                              uint32_t context_count,
+                                              uint32_t *global_inflight,
+                                              uint64_t deadline_us)
+{
+    while (global_inflight && *global_inflight > 0u) {
+        NvmeCompletion completion;
+        int poll_rc = nvme_try_poll_cq_fast(rt, &completion);
+        if (poll_rc > 0) {
+            if (nvme_handle_multi_write_completion(rt, pending,
+                                                   NVME_PENDING_CAPACITY,
+                                                   contexts, context_count,
+                                                   global_inflight, &completion) != 0) {
+                (void)nvme_legacy_reset_unavailable(rt);
+                nvme_mark_ownership_unresolved(rt, "submit_accept_timeout");
+                return -1;
+            }
+            continue;
+        }
+        if (poll_rc < 0 || wall_time_us() >= deadline_us) {
+            (void)nvme_legacy_reset_unavailable(rt);
+            nvme_mark_ownership_unresolved(rt, "submit_accept_timeout");
+            return -1;
+        }
+        if (rt->nvme_poll_sleep_us != 0u) usleep(rt->nvme_poll_sleep_us);
+        else sched_yield();
+    }
+    return 0;
+}
+
 static int nvme_finish_completed_slots(ChannelRuntime *rt,
                                        NvmeSlotWriteContext *contexts,
                                        const NvmeWriteSlotReq *reqs,
@@ -2383,7 +2563,10 @@ static void cross_slot_real_yield(void *opaque) { (void)opaque; sched_yield(); }
 static int cross_slot_real_reset(void *opaque)
 {
     ChannelRuntime *rt = opaque;
-    if (rt) nvme_set_last_error(rt, "nvme_queue_reset_unavailable");
+    if (rt && rt->nvme_last_error[0] == '\0')
+        nvme_set_last_error(rt, "nvme_queue_reset_unavailable");
+    if (rt) fprintf(stderr, "NVMe queue reset unavailable channel=%d\n",
+                    rt->cfg ? rt->cfg->id : -1);
     return -1;
 }
 
@@ -2717,7 +2900,7 @@ int nvme_cross_slot_engine_step(NvmeCrossSlotEngine *e, uint32_t budget_us,
             }
             if (src != NVME_SUBMIT_ACCEPTED) {
                 p->valid = false;
-                return cross_slot_fail(e, src == NVME_SUBMIT_STOPPED ?
+                return cross_slot_fail(e, src == NVME_SUBMIT_STOPPED_BEFORE_DOORBELL ?
                                        "submit_stopped" : "submit_not_accepted");
             }
             e->completed_cid_seen[cid] = false;
@@ -2949,14 +3132,33 @@ int nvme_write_slots_qd(ChannelRuntime *rt,
                                                 entry->lba,
                                                 entry->sectors,
                                                 entry->ddr_addr);
-            if (submit_rc == 1) {
+            if (submit_rc == NVME_SUBMIT_RETRY_SQ_FULL) {
                 entry->valid = false;
                 sq_full = true;
                 break;
             }
-            if (submit_rc != 0) {
+            if (submit_rc == NVME_SUBMIT_ACCEPTANCE_UNKNOWN) {
+                uint64_t deadline_us;
+                ctx->next_submit_sector += command_sectors;
+                ++ctx->submitted_cmds;
+                ++ctx->inflight_cmds;
+                ++global_inflight;
+                nvme_update_active_qd(rt, global_inflight, wall_time_us());
+                deadline_us = wall_time_us() + (uint64_t)rt->gopt.timeout_us;
+                if (deadline_us < rt->gopt.timeout_us ||
+                    nvme_drain_ambiguous_multi_pending(rt, pending, contexts,
+                                                       req_count, &global_inflight,
+                                                       deadline_us) != 0) {
+                    return -1;
+                }
+                /* Callers must decide task outcome explicitly; never submit
+                 * another command after a formerly ambiguous doorbell. */
+                return NVME_SUBMIT_ACCEPTANCE_UNKNOWN;
+            }
+            if (submit_rc != NVME_SUBMIT_ACCEPTED) {
                 entry->valid = false;
-                if (submit_rc != -2 && rt->nvme_last_error[0] == '\0') {
+                if (submit_rc != NVME_SUBMIT_STOPPED_BEFORE_DOORBELL &&
+                    rt->nvme_last_error[0] == '\0') {
                     nvme_set_last_error(rt, "async_submit_failed");
                 }
                 return submit_rc;
@@ -3203,6 +3405,14 @@ int channel_runtime_open(ChannelRuntime *rt, const ChannelConfig *cfg, GlobalOpt
 
 void channel_runtime_close(ChannelRuntime *rt) {
     int fd = -1;
+    if (!rt) return;
+    if (rt->nvme_ownership_unresolved) {
+        fprintf(stderr,
+                "Refusing runtime close with unresolved NVMe ownership channel=%d reason=%s\n",
+                rt->cfg ? rt->cfg->id : -1,
+                rt->nvme_last_error[0] ? rt->nvme_last_error : "submit_accept_timeout");
+        return;
+    }
     if (!rt->gopt.dry_run && rt->dma.valid) {
         fd = rt->dma.fd;
     }
@@ -3341,6 +3551,7 @@ static int nvme_issue_one_sync(ChannelRuntime *rt,
                                uint32_t sectors,
                                uint64_t hw_addr) {
     NvmePendingCmd pending[1];
+    NvmeSlotWriteContext slot_ctx;
     NvmeCompletion completion;
     uint16_t cid;
     uint64_t start_us;
@@ -3351,13 +3562,14 @@ static int nvme_issue_one_sync(ChannelRuntime *rt,
         return 0;
     }
     memset(pending, 0, sizeof(pending));
+    memset(&slot_ctx, 0, sizeof(slot_ctx));
     if (nvme_alloc_cid(rt, pending, 1u, &cid) != 0) {
         return -1;
     }
     start_us = wall_time_us();
     do {
         submit_rc = nvme_submit_command_async(rt, opcode, cid, lba, sectors, hw_addr);
-        if (submit_rc == 1) {
+        if (submit_rc == NVME_SUBMIT_RETRY_SQ_FULL) {
             if (elapsed_us_since(start_us) >= rt->gopt.timeout_us) {
                 fprintf(stderr, "NVMe SQ full timeout channel=%d op=%s\n",
                         rt->cfg->id, nvme_opcode_name(opcode));
@@ -3365,8 +3577,30 @@ static int nvme_issue_one_sync(ChannelRuntime *rt,
             }
             nvme_poll_pause(rt, start_us);
         }
-    } while (submit_rc == 1);
-    if (submit_rc != 0) {
+    } while (submit_rc == NVME_SUBMIT_RETRY_SQ_FULL);
+    if (submit_rc == NVME_SUBMIT_ACCEPTANCE_UNKNOWN) {
+        uint64_t deadline_us = wall_time_us() + (uint64_t)rt->gopt.timeout_us;
+        pending[0].valid = true;
+        pending[0].cid = cid;
+        pending[0].slot = UINT32_MAX;
+        pending[0].lba = lba;
+        pending[0].ddr_addr = hw_addr;
+        pending[0].sectors = sectors;
+        pending[0].bytes = sectors * NVME_SECTOR_BYTES;
+        slot_ctx.slot = UINT32_MAX;
+        slot_ctx.submitted_cmds = 1u;
+        slot_ctx.inflight_cmds = 1u;
+        if (deadline_us < rt->gopt.timeout_us ||
+            nvme_drain_ambiguous_legacy_pending(rt, pending, 1u, &slot_ctx,
+                                                deadline_us) != 0) {
+            return -1;
+        }
+        /* This one command is now known complete, but do not turn an
+         * ambiguous submit into the old generic -1/STOP path. */
+        nvme_set_last_error(rt, "submit_accept_timeout");
+        return NVME_SUBMIT_ACCEPTANCE_UNKNOWN;
+    }
+    if (submit_rc != NVME_SUBMIT_ACCEPTED) {
         return submit_rc;
     }
 
@@ -3438,13 +3672,17 @@ int nvme_rw(ChannelRuntime *rt, bool is_write, uint64_t lba, uint64_t sectors, u
 
         issue_rc = nvme_issue_one_sync(rt, NVM_READ, cur_lba, this_sectors, cur_hw);
         if (issue_rc != 0) {
-            if (issue_rc == -2) {
+            if (issue_rc == NVME_SUBMIT_STOPPED_BEFORE_DOORBELL) {
                 dbg_printf("[DBG][NVME] rw stopped ch=%d op=%s submitted=%" PRIu64 "/%" PRIu64 "\n",
                            rt->cfg->id,
                            is_write ? "write" : "read",
                            submitted,
                            sectors);
                 return -2;
+            }
+            if (issue_rc == NVME_SUBMIT_ACCEPTANCE_UNKNOWN) {
+                nvme_set_last_error(rt, "submit_accept_timeout");
+                return NVME_SUBMIT_ACCEPTANCE_UNKNOWN;
             }
             return -1;
         }
