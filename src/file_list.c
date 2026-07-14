@@ -5,6 +5,7 @@
 #include "file_list.h"
 #include "log_config.h"
 #include "logger.h"
+#include "storage_config.h"
 
 /* Global state. */
 static sqlite3 *file_db = NULL;
@@ -26,7 +27,7 @@ static uint64_t file_size_from_db(sqlite3_int64 file_size, uint64_t sector_count
 
 static int env_int_or_default(const char *name, int default_value, int min_value, int max_value)
 {
-    const char *value = getenv(name);
+    const char *value = storage_config_compat_getenv(name);
     char *end = NULL;
     long parsed;
 

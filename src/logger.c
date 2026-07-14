@@ -7,6 +7,7 @@
 #include <time.h>
 #include "logger.h"
 #include "log_config.h"
+#include "storage_config.h"
 
 /* Global state. */
 static sqlite3 *db = NULL;
@@ -14,7 +15,7 @@ static pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static int env_int_or_default(const char *name, int default_value, int min_value, int max_value)
 {
-    const char *value = getenv(name);
+    const char *value = storage_config_compat_getenv(name);
     char *end = NULL;
     long parsed;
 
@@ -30,7 +31,7 @@ static int env_int_or_default(const char *name, int default_value, int min_value
 
 static int logger_runtime_level(void)
 {
-    const char *value = getenv("SRC_REAL_LOG_LEVEL");
+    const char *value = storage_config_compat_getenv("SRC_REAL_LOG_LEVEL");
 
     if (!value || value[0] == '\0' || strcmp(value, "quiet") == 0) {
         return 0;

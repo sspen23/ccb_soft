@@ -1,4 +1,5 @@
 #include "debug_uart.h"
+#include "storage_config.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -74,7 +75,7 @@ static const DebugCategory kDebugCategories[] = {
 
 static int env_flag_enabled(const char *name)
 {
-    const char *value = getenv(name);
+    const char *value = storage_config_compat_getenv(name);
 
     if (!value || value[0] == '\0') {
         return 0;
@@ -163,9 +164,9 @@ static uint32_t debug_mask(void)
         g_debug_mask = DBG_CAT_ALL;
         return g_debug_mask;
     }
-    value = getenv("SRC_REAL_DEBUG");
+    value = storage_config_compat_getenv("SRC_REAL_DEBUG");
     if (!value || value[0] == '\0') {
-        value = getenv("CCB_DEBUG");
+        value = storage_config_compat_getenv("CCB_DEBUG");
     }
     g_debug_mask = parse_debug_mask(value);
     return g_debug_mask;
@@ -215,7 +216,7 @@ static int dbg_message_enabled(const char *fmt)
 
 static const char *debug_console_path(void)
 {
-    const char *env_path = getenv("DEBUG_CONSOLE_PATH");
+    const char *env_path = storage_config_compat_getenv("DEBUG_CONSOLE_PATH");
     if (env_path && env_path[0] != '\0') {
         return env_path;
     }

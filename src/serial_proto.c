@@ -1,5 +1,6 @@
 #include "serial_proto.h"
 #include "debug_uart.h"
+#include "storage_config.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -20,7 +21,7 @@ static void (*handler_cb)(uint8_t *) = NULL;
 
 static int env_flag_enabled(const char *name)
 {
-    const char *value = getenv(name);
+    const char *value = storage_config_compat_getenv(name);
 
     if (!value || value[0] == '\0') {
         return 0;

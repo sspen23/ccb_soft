@@ -42,6 +42,7 @@
 #include "ccb_storage_sync_outbox.h"
 #include "ccb_tcp_transfer.h"
 #include "debug_uart.h"
+#include "storage_config.h"
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
@@ -243,16 +244,14 @@ static int configure_tcp_for_channel(const ChannelConfig *cfg, TcpTransferConfig
 
 static const char *get_serial_device_path(void)
 {
-    const char *env_path = getenv("UART_DEV_PATH");
-    if (env_path && env_path[0] != '\0') {
-        return env_path;
-    }
-    return UART_DEV_PATH;
+    const AppConfig *config = storage_config_get();
+
+    return config ? config->uart_device : UART_DEV_PATH;
 }
 
 static const char *get_storage_meta_dir(void)
 {
-    const char *env_path = getenv("CCB_PROCESS_META_DIR");
+    const char *env_path = storage_config_compat_getenv("CCB_PROCESS_META_DIR");
     if (env_path && env_path[0] != '\0') {
         return env_path;
     }
@@ -273,11 +272,11 @@ static const char *get_current_working_dir(char *buf, size_t len)
 
 static const char *get_flash_filelist_db_path(void)
 {
-    const char *env_path = getenv("SRC_REAL_FLASH_FILELIST_DB_PATH");
+    const char *env_path = storage_config_compat_getenv("SRC_REAL_FLASH_FILELIST_DB_PATH");
     if (env_path && env_path[0] != '\0') {
         return env_path;
     }
-    env_path = getenv("CCB_FLASH_FILELIST_DB_PATH");
+    env_path = storage_config_compat_getenv("CCB_FLASH_FILELIST_DB_PATH");
     if (env_path && env_path[0] != '\0') {
         return env_path;
     }
@@ -490,7 +489,7 @@ static uint8_t sync_filelist_db_to_flash(void)
 
 static const char *storage_sync_outbox_dir(void)
 {
-    const char *value = getenv("SRC_REAL_STORAGE_SYNC_OUTBOX_DIR");
+    const char *value = storage_config_compat_getenv("SRC_REAL_STORAGE_SYNC_OUTBOX_DIR");
     return value && value[0] != '\0' ? value : STORAGE_SYNC_OUTBOX_DIR_DEFAULT;
 }
 
@@ -1189,7 +1188,7 @@ static uint8_t failure_type_from_acq_type(uint8_t acq_type)
 
 static int env_flag_enabled(const char *name)
 {
-    const char *value = getenv(name);
+    const char *value = storage_config_compat_getenv(name);
 
     if (!value || value[0] == '\0') {
         return 0;
@@ -1208,7 +1207,7 @@ static int env_flag_enabled(const char *name)
 
 static uint32_t env_u32_or_default(const char *name, uint32_t default_value)
 {
-    const char *value = getenv(name);
+    const char *value = storage_config_compat_getenv(name);
     char *end = NULL;
     unsigned long parsed;
 
@@ -1225,7 +1224,7 @@ static uint32_t env_u32_or_default(const char *name, uint32_t default_value)
 
 static int env_u32_allow_zero(const char *name, uint32_t max_value, uint32_t *out)
 {
-    const char *value = getenv(name);
+    const char *value = storage_config_compat_getenv(name);
     char *end = NULL;
     unsigned long parsed;
 
@@ -1640,7 +1639,7 @@ static void append_task_output(Task *task, const char *buf, size_t len)
 
 static int system_env_flag_enabled(const char *name)
 {
-    const char *value = getenv(name);
+    const char *value = storage_config_compat_getenv(name);
 
     if (!value || value[0] == '\0') {
         return 0;
@@ -1710,7 +1709,7 @@ static void system_write_stdout_line(const char *line)
  * line directly. */
 static bool worker_output_is_quiet_critical(const char *text)
 {
-    const char *console = getenv("SRC_REAL_CONSOLE_LOG_LEVEL");
+    const char *console = storage_config_compat_getenv("SRC_REAL_CONSOLE_LOG_LEVEL");
 
     if (!text) {
         return false;
@@ -1740,7 +1739,7 @@ static void echo_worker_line(Task *task, const char *line)
         system_write_stdout_line(line);
         return;
     }
-    if (getenv("SRC_REAL_ECHO_WORKER_OUTPUT") != NULL) {
+    if (storage_config_compat_getenv("SRC_REAL_ECHO_WORKER_OUTPUT") != NULL) {
         if (system_env_flag_enabled("SRC_REAL_ECHO_WORKER_OUTPUT")) {
             system_write_stdout_line(line);
         }
@@ -1937,9 +1936,9 @@ static int start_storage_worker(const PlannedFile *planned, const char *task_id,
         const char *dma_desc_env;
 
         snprintf(env_name, sizeof(env_name), "SRC_REAL_STORAGE_DMA_DESC_BYTES_CH%d", planned->channel_id);
-        dma_desc_env = getenv(env_name);
+        dma_desc_env = storage_config_compat_getenv(env_name);
         if (!dma_desc_env || dma_desc_env[0] == '\0') {
-            dma_desc_env = getenv("SRC_REAL_STORAGE_DMA_DESC_BYTES");
+            dma_desc_env = storage_config_compat_getenv("SRC_REAL_STORAGE_DMA_DESC_BYTES");
         }
         if (dma_desc_env && dma_desc_env[0] != '\0') {
             snprintf(dma_desc_str, sizeof(dma_desc_str), "%s", dma_desc_env);
@@ -1957,7 +1956,7 @@ static int start_storage_worker(const PlannedFile *planned, const char *task_id,
         argv[argc++] = "--skip-link-check";
     }
     {
-        const char *timeout_env = getenv("SRC_REAL_STORAGE_TIMEOUT_US");
+        const char *timeout_env = storage_config_compat_getenv("SRC_REAL_STORAGE_TIMEOUT_US");
         if (timeout_env && timeout_env[0] != '\0') {
             snprintf(timeout_str, sizeof(timeout_str), "%s", timeout_env);
             argv[argc++] = "--timeout-us";
@@ -2355,7 +2354,7 @@ static int start_network_worker(const FileRecord *rec)
         argv[argc++] = "--skip-link-check";
     }
     {
-        const char *timeout_env = getenv("SRC_REAL_NETWORK_TIMEOUT_US");
+        const char *timeout_env = storage_config_compat_getenv("SRC_REAL_NETWORK_TIMEOUT_US");
         if (timeout_env && timeout_env[0] != '\0') {
             snprintf(timeout_str, sizeof(timeout_str), "%s", timeout_env);
             argv[argc++] = "--timeout-us";
@@ -4415,7 +4414,7 @@ static void install_storage_worker_signal_handlers(void)
 
 static int storage_worker_event_fd(void)
 {
-    const char *text = getenv("SRC_REAL_STORAGE_EVENT_FD");
+    const char *text = storage_config_compat_getenv("SRC_REAL_STORAGE_EVENT_FD");
     char *end = NULL;
     long value;
 
@@ -4784,7 +4783,10 @@ static int run_dma_rx_benchmark_main(int argc, char **argv)
 int main(int argc, char **argv)
 {
     uint8_t byte;
-    const char *serial_dev = get_serial_device_path();
+    const char *serial_dev;
+
+    if (storage_config_load_global() != 0) return 2;
+    serial_dev = get_serial_device_path();
     g_program_path = (argc > 0 && argv[0]) ? argv[0] : "./src_real_app";
     (void)debug_uart_init();
     if (argc > 1) {
@@ -4862,6 +4864,34 @@ int main(int argc, char **argv)
     LOG_INFO("SYSTEM", "Log database: %s", LOG_DB_PATH);
     LOG_INFO("SYSTEM", "File list database: %s", FILELIST_DB_PATH);
     LOG_INFO("SYSTEM", "Storage metadata dir: %s", get_storage_meta_dir());
+    {
+        const AppConfig *config = storage_config_get();
+        size_t channel;
+
+        LOG_INFO("SYSTEM",
+                 "Storage config: profile=%s log=%s status_timeout_ms=%u first_data_timeout_ms=%u perf=%u perf_interval_ms=%u diag_on_error=%u",
+                 storage_config_profile_name(config->storage_profile),
+                 storage_config_log_level_name(config->log_level),
+                 config->status_timeout_ms,
+                 config->first_data_timeout_ms,
+                 config->perf_enabled ? 1u : 0u,
+                 config->perf_interval_ms,
+                 config->dump_diag_on_error ? 1u : 0u);
+        for (channel = 0u; channel < NUM_CHANNELS; ++channel) {
+            const ChannelStorageConfig *storage = &config->channels[channel];
+            LOG_INFO("SYSTEM",
+                     "Storage channel config: ch=%u writer=%s ring=%" PRIu64 " descriptor=%u command=%u qd=%u active=%u cq_batch=%u",
+                     storage->channel,
+                     storage->writer_mode == STORAGE_WRITER_CROSS_SLOT
+                         ? "cross-slot" : "legacy",
+                     storage->ring_bytes,
+                     storage->descriptor_bytes,
+                     storage->command_bytes,
+                     storage->nvme_qd,
+                     storage->max_active_slots,
+                     storage->cq_batch);
+        }
+    }
     dbg_printf("[DBG][MAIN] uart1=%s log_db=%s file_db=%s meta_dir=%s\n",
                serial_dev, LOG_DB_PATH, FILELIST_DB_PATH, get_storage_meta_dir());
 

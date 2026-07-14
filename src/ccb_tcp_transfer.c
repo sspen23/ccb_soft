@@ -2,6 +2,7 @@
 
 #include "ccb_config.h"
 #include "debug_uart.h"
+#include "storage_config.h"
 
 #include <errno.h>
 #include <inttypes.h>
@@ -70,7 +71,7 @@ static volatile sig_atomic_t g_tcp_stop_requested = 0;
 
 static int tcp_env_flag_enabled(const char *name)
 {
-    const char *value = getenv(name);
+    const char *value = storage_config_compat_getenv(name);
 
     if (!value || value[0] == '\0') {
         return 0;

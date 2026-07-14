@@ -1,5 +1,6 @@
 #include "ccb_cli.h"
 #include "ccb_config.h"
+#include "storage_config.h"
 
 #include <errno.h>
 #include <getopt.h>
@@ -511,7 +512,7 @@ int validate_network_send_args(const ParsedArgs *a) {
 int validate_ddr_pattern_store_args(const ParsedArgs *a) {
     uint64_t size = a->has_size ? a->size_bytes : (32ull * 1024ull * 1024ull);
     const ChannelConfig *cfg = a->has_channel ? find_channel(a->channel_id) : find_channel(LOW_SPEED_CHANNEL_ID);
-    const char *raw_env = getenv("SRC_REAL_DDR_RAW_STORE");
+    const char *raw_env = storage_config_compat_getenv("SRC_REAL_DDR_RAW_STORE");
     bool raw_store = raw_env && raw_env[0] != '\0' && strcmp(raw_env, "0") != 0;
     uint64_t size_limit = raw_store && cfg ? cfg->dma_ring_bytes : CHANNEL_CPU_DDR_BYTES;
 

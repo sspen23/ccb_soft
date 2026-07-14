@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
+#include "storage_config.h"
 
 /*
  * Storage text has a small, explicit severity vocabulary.  A legacy text
@@ -19,7 +20,7 @@ typedef enum {
 
 static inline bool storage_log_env_flag_enabled(const char *name)
 {
-    const char *value = getenv(name);
+    const char *value = storage_config_compat_getenv(name);
 
     return value && value[0] != '\0' && strcmp(value, "0") != 0 &&
            strcmp(value, "false") != 0 && strcmp(value, "FALSE") != 0 &&
@@ -29,7 +30,7 @@ static inline bool storage_log_env_flag_enabled(const char *name)
 
 static inline StorageLogSeverity storage_log_effective_level(void)
 {
-    const char *value = getenv("SRC_REAL_LOG_LEVEL");
+    const char *value = storage_config_compat_getenv("SRC_REAL_LOG_LEVEL");
 
     if (!value || value[0] == '\0') {
         return storage_log_env_flag_enabled("SRC_REAL_LEGACY_STORAGE_TEXT")

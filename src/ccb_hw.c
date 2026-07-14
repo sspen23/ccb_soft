@@ -2,6 +2,7 @@
 
 #include "debug_uart.h"
 #include "ccb_storage_log.h"
+#include "storage_config.h"
 
 #include <errno.h>
 #include <stdio.h>
@@ -170,9 +171,9 @@ static uint64_t wall_time_us(void) {
 
 static int hw_storage_log_at_least_debug(void)
 {
-    const char *level = getenv("SRC_REAL_LOG_LEVEL");
-    const char *console_level = getenv("SRC_REAL_CONSOLE_LOG_LEVEL");
-    const char *legacy = getenv("SRC_REAL_LEGACY_STORAGE_TEXT");
+    const char *level = storage_config_compat_getenv("SRC_REAL_LOG_LEVEL");
+    const char *console_level = storage_config_compat_getenv("SRC_REAL_CONSOLE_LOG_LEVEL");
+    const char *legacy = storage_config_compat_getenv("SRC_REAL_LEGACY_STORAGE_TEXT");
 
     return (legacy && (strcmp(legacy, "1") == 0 || strcmp(legacy, "true") == 0 ||
                        strcmp(legacy, "yes") == 0 || strcmp(legacy, "on") == 0)) ||
@@ -183,7 +184,7 @@ static int hw_storage_log_at_least_debug(void)
 
 static int hw_storage_log_trace(void)
 {
-    const char *level = getenv("SRC_REAL_LOG_LEVEL");
+    const char *level = storage_config_compat_getenv("SRC_REAL_LOG_LEVEL");
     return level && strcmp(level, "trace") == 0;
 }
 
@@ -202,7 +203,7 @@ static uint32_t elapsed_us_since(uint64_t start_us) {
 }
 
 static uint64_t env_u64_limit(const char *name, uint64_t fallback, uint64_t max_value) {
-    const char *v = getenv(name);
+    const char *v = storage_config_compat_getenv(name);
     char *end = NULL;
     unsigned long long parsed;
 
@@ -221,7 +222,7 @@ static uint64_t env_u64_limit(const char *name, uint64_t fallback, uint64_t max_
 }
 
 static int hw_env_flag_enabled(const char *name) {
-    const char *v = getenv(name);
+    const char *v = storage_config_compat_getenv(name);
 
     if (!v || v[0] == '\0' || strcmp(v, "0") == 0 ||
         strcmp(v, "false") == 0 || strcmp(v, "FALSE") == 0 ||
@@ -232,7 +233,7 @@ static int hw_env_flag_enabled(const char *name) {
 }
 
 static int env_u64_exact(const char *name, uint64_t *out) {
-    const char *v = getenv(name);
+    const char *v = storage_config_compat_getenv(name);
     char *end = NULL;
     unsigned long long parsed;
 
@@ -379,7 +380,7 @@ static const char *channel_env(const ChannelRuntime *rt, const char *prefix, cha
         return NULL;
     }
     snprintf(buf, buf_size, "%s_CH%d", prefix, rt->cfg->id);
-    return getenv(buf);
+    return storage_config_compat_getenv(buf);
 }
 
 static uint32_t parse_channel_u32_env(ChannelRuntime *rt,
@@ -395,7 +396,7 @@ static uint32_t parse_channel_u32_env(ChannelRuntime *rt,
     if (env && env[0] != '\0') {
         env_name = channel_name;
     } else {
-        env = getenv(prefix);
+        env = storage_config_compat_getenv(prefix);
         env_name = prefix;
     }
     if (!env || env[0] == '\0') {
@@ -429,7 +430,7 @@ static uint64_t parse_storage_ring_bytes(ChannelRuntime *rt) {
     if (env && env[0] != '\0') {
         env_name = channel_name;
     } else {
-        env = getenv("SRC_REAL_STORAGE_RING_BYTES");
+        env = storage_config_compat_getenv("SRC_REAL_STORAGE_RING_BYTES");
         env_name = "SRC_REAL_STORAGE_RING_BYTES";
     }
     if (rt->cfg->id == HIGH_I_CHANNEL_ID || rt->cfg->id == HIGH_Q_CHANNEL_ID) {
@@ -486,7 +487,7 @@ static uint32_t parse_nvme_cmd_kib(ChannelRuntime *rt) {
     if (env && env[0] != '\0') {
         env_name = channel_name;
     } else {
-        env = getenv("SRC_REAL_NVME_CMD_KIB");
+        env = storage_config_compat_getenv("SRC_REAL_NVME_CMD_KIB");
         env_name = "SRC_REAL_NVME_CMD_KIB";
     }
     if (!env || env[0] == '\0') {
@@ -517,7 +518,7 @@ static uint32_t parse_nvme_qd(ChannelRuntime *rt) {
     if (env && env[0] != '\0') {
         env_name = channel_name;
     } else {
-        env = getenv("SRC_REAL_NVME_QD");
+        env = storage_config_compat_getenv("SRC_REAL_NVME_QD");
         env_name = "SRC_REAL_NVME_QD";
     }
     if (!env || env[0] == '\0') {
@@ -551,7 +552,7 @@ static uint32_t parse_nvme_feed_mode(ChannelRuntime *rt) {
     if (env && env[0] != '\0') {
         env_name = channel_name;
     } else {
-        env = getenv("SRC_REAL_NVME_FEED_MODE");
+        env = storage_config_compat_getenv("SRC_REAL_NVME_FEED_MODE");
         env_name = "SRC_REAL_NVME_FEED_MODE";
     }
     if (!env || env[0] == '\0' || strcmp(env, "legacy") == 0) {

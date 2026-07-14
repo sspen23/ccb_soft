@@ -1,4 +1,5 @@
 #include "ccb_storage_ipc.h"
+#include "storage_config.h"
 
 #include <errno.h>
 #include <limits.h>
@@ -54,7 +55,7 @@ static bool storage_ipc_parse_u64_env(const char *name, uint64_t *out)
     char *end = NULL;
     unsigned long long parsed;
 
-    if (!name || !out || !(value = getenv(name)) || value[0] == '\0') return false;
+    if (!name || !out || !(value = storage_config_compat_getenv(name)) || value[0] == '\0') return false;
     errno = 0;
     parsed = strtoull(value, &end, 0);
     if (errno != 0 || end == value || *end != '\0' || parsed == 0u) return false;

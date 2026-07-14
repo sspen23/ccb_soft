@@ -9,6 +9,7 @@
 #include "ccb_storage_diag.h"
 #include "ccb_storage_log.h"
 #include "debug_uart.h"
+#include "storage_config.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -355,7 +356,7 @@ static uint64_t storage_elapsed_us(uint64_t start_us) {
 
 static int storage_env_fd(const char *name)
 {
-    const char *value = getenv(name);
+    const char *value = storage_config_compat_getenv(name);
     char *end = NULL;
     long fd;
     if (!value || value[0] == '\0') return -1;
@@ -543,7 +544,7 @@ static void storage_maybe_dump_event_rings(const StorageWriteQueue *q,
 static int storage_wait_start_gate(ChannelRuntime *rt, uint64_t *start_skew_us,
                                    const char **gate_mode, const char **failure_reason)
 {
-    const char *value = getenv("SRC_REAL_START_FD");
+    const char *value = storage_config_compat_getenv("SRC_REAL_START_FD");
     char *end = NULL;
     long fd;
     uint64_t parent_start_us = 0u;
@@ -688,7 +689,7 @@ static void storage_emit_line_impl(const char *fmt, ...)
     } while (0)
 
 static uint32_t storage_idle_notice_ms(void) {
-    const char *env = getenv("SRC_REAL_STORAGE_IDLE_NOTICE_MS");
+    const char *env = storage_config_compat_getenv("SRC_REAL_STORAGE_IDLE_NOTICE_MS");
     char *end = NULL;
     unsigned long parsed;
 
@@ -719,7 +720,7 @@ static int storage_env_flag_enabled(const char *name);
 
 static uint32_t storage_pipeline_stats_ms(void)
 {
-    const char *env = getenv("SRC_REAL_PIPELINE_STATS_SEC");
+    const char *env = storage_config_compat_getenv("SRC_REAL_PIPELINE_STATS_SEC");
     char *end = NULL;
     unsigned long parsed;
 
@@ -749,7 +750,7 @@ static uint32_t storage_perf_log_interval_ms(void)
 
 static uint32_t storage_env_u32_limit(const char *name, uint32_t fallback, uint32_t max_value)
 {
-    const char *value = getenv(name);
+    const char *value = storage_config_compat_getenv(name);
     char *end = NULL;
     unsigned long parsed;
 
@@ -780,8 +781,9 @@ static uint32_t storage_channel_env_u32(const ChannelConfig *cfg,
 
     if (!cfg || !suffix) return fallback;
     snprintf(name, sizeof(name), "SRC_REAL_CH%d_%s", cfg->id, suffix);
-    if (getenv(name)) return storage_env_u32_limit(name, fallback, max_value);
-    if (global_fallback && getenv(global_fallback)) {
+    if (storage_config_compat_getenv(name))
+        return storage_env_u32_limit(name, fallback, max_value);
+    if (global_fallback && storage_config_compat_getenv(global_fallback)) {
         return storage_env_u32_limit(global_fallback, fallback, max_value);
     }
     return fallback;
@@ -801,12 +803,12 @@ static uint64_t storage_timeout_us(const char *us_name, const char *ms_name,
     const char *value;
     char *end = NULL;
     unsigned long long parsed;
-    if (us_name && (value = getenv(us_name)) && value[0] != '\0') {
+    if (us_name && (value = storage_config_compat_getenv(us_name)) && value[0] != '\0') {
         errno = 0; parsed = strtoull(value, &end, 0);
         if (errno == 0 && end != value && *end == '\0' && parsed > 0u)
             return (uint64_t)parsed;
     }
-    if (ms_name && (value = getenv(ms_name)) && value[0] != '\0') {
+    if (ms_name && (value = storage_config_compat_getenv(ms_name)) && value[0] != '\0') {
         errno = 0; parsed = strtoull(value, &end, 0);
         if (errno == 0 && end != value && *end == '\0' && parsed > 0u &&
             parsed <= UINT64_MAX / 1000ull)
@@ -917,7 +919,7 @@ static StorageCrossSlotResolution storage_cross_slot_resolve_candidates(
 
     storage_cross_slot_resolution_default(&out, fallback);
     for (i = 0u; candidates && i < count; ++i) {
-        const char *value = getenv(candidates[i].name);
+        const char *value = storage_config_compat_getenv(candidates[i].name);
         uint32_t parsed;
 
         if (!value) continue;
@@ -1068,7 +1070,7 @@ bool storage_cross_slot_enabled_for_channel(int channel_id)
 
 static int storage_env_flag_enabled(const char *name)
 {
-    const char *value = getenv(name);
+    const char *value = storage_config_compat_getenv(name);
 
     if (!value || value[0] == '\0') {
         return 0;
@@ -1087,7 +1089,7 @@ static int storage_env_flag_enabled(const char *name)
 
 static bool storage_env_string_is(const char *name, const char *expected)
 {
-    const char *value = getenv(name);
+    const char *value = storage_config_compat_getenv(name);
 
     return value && expected && strcmp(value, expected) == 0;
 }
@@ -1102,7 +1104,7 @@ static FILE *storage_slot_perf_log_open(void)
         return log;
     }
     initialized = true;
-    path = getenv("SRC_REAL_SLOT_WRITE_PERF_LOG");
+    path = storage_config_compat_getenv("SRC_REAL_SLOT_WRITE_PERF_LOG");
     if ((!path || path[0] == '\0') &&
         storage_env_flag_enabled("SRC_REAL_SLOT_WRITE_PERF")) {
         path = "/tmp/storage_slot_perf.log";
@@ -1161,7 +1163,7 @@ static uint32_t storage_writer_rt_prio(const ChannelRuntime *rt)
         return 0u;
     }
     snprintf(name, sizeof(name), "SRC_REAL_CH%d_WRITER_RT_PRIO", rt->cfg->id);
-    if (getenv(name)) {
+    if (storage_config_compat_getenv(name)) {
         return storage_env_u32_limit(name, 0u, 99u);
     }
     return 61u;
@@ -1175,7 +1177,7 @@ static uint32_t storage_producer_rt_prio(const ChannelRuntime *rt)
         return 0u;
     }
     snprintf(name, sizeof(name), "SRC_REAL_CH%d_PRODUCER_RT_PRIO", rt->cfg->id);
-    if (getenv(name)) {
+    if (storage_config_compat_getenv(name)) {
         return storage_env_u32_limit(name, 0u, 99u);
     }
     return 60u;
@@ -1183,7 +1185,7 @@ static uint32_t storage_producer_rt_prio(const ChannelRuntime *rt)
 
 static int storage_rt_policy(const char *name, int fallback)
 {
-    const char *value = getenv(name);
+    const char *value = storage_config_compat_getenv(name);
 
     if (!value || value[0] == '\0') {
         return fallback;
@@ -1219,9 +1221,9 @@ static uint64_t storage_requested_ring_bytes(const ChannelRuntime *rt)
         return 0u;
     }
     snprintf(name, sizeof(name), "SRC_REAL_STORAGE_RING_BYTES_CH%d", rt->cfg->id);
-    env = getenv(name);
+    env = storage_config_compat_getenv(name);
     if (!env || env[0] == '\0') {
-        env = getenv("SRC_REAL_STORAGE_RING_BYTES");
+        env = storage_config_compat_getenv("SRC_REAL_STORAGE_RING_BYTES");
     }
     if (!env || env[0] == '\0') {
         return rt->cfg->dma_ring_bytes;
@@ -1521,7 +1523,7 @@ static int storage_event_logs_enabled(void)
 
 static int storage_env_u64(const char *name, uint64_t *out)
 {
-    const char *value = getenv(name);
+    const char *value = storage_config_compat_getenv(name);
     char *end = NULL;
     unsigned long long parsed;
 
@@ -2293,7 +2295,7 @@ static void storage_stats_print_periodic(StorageProducerStats *stats,
     StorageQueueSnapshot snapshot;
     DmaBdSnapshot bd_snapshot;
 
-    perf_enabled = getenv("SRC_REAL_PERF_LOG_ENABLE") == NULL ||
+    perf_enabled = storage_config_compat_getenv("SRC_REAL_PERF_LOG_ENABLE") == NULL ||
                    storage_env_flag_enabled("SRC_REAL_PERF_LOG_ENABLE") != 0;
     if (!stats) {
         return;
@@ -3937,7 +3939,8 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
     producer_stats.interval_ms = storage_pipeline_stats_ms();
     storage_emit_line(STORAGE_LOG_DEBUG, "storage_ready channel=%d task=%s file_index=%u start_gate_mode=%s",
                       cfg->id, args->task_no, (unsigned)effective_file_index,
-                      getenv("SRC_REAL_START_FD") ? "software_barrier" : "standalone_immediate");
+                      storage_config_compat_getenv("SRC_REAL_START_FD")
+                          ? "software_barrier" : "standalone_immediate");
     dma_started = true;
     {
         const char *gate_failure_reason = "start_gate_failed";

@@ -1,6 +1,7 @@
 #include "ccb_metadata.h"
 
 #include "ccb_hw.h"
+#include "storage_config.h"
 
 #include <errno.h>
 #include <stdio.h>
@@ -16,7 +17,7 @@
 
 /* File-list backend: same 32-byte entries and meta_chN.bin files as process_test. */
 static const char *metadata_dir(void) {
-    const char *env = getenv("CCB_PROCESS_META_DIR");
+    const char *env = storage_config_compat_getenv("CCB_PROCESS_META_DIR");
     if (env && env[0] != '\0') {
         return env;
     }
