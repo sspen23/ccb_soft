@@ -83,6 +83,10 @@ storage-host-tests:
 	$(CC) $(CFLAGS) -Wformat=2 -ffunction-sections -fdata-sections -Iinclude \
 		tests/mock_nvme_cross_slot_test.c src/ccb_hw.c src/debug_uart.c -Wl,--gc-sections -o /tmp/mock_nvme_cross_slot_test
 	/tmp/mock_nvme_cross_slot_test
+	$(CC) $(CFLAGS) -Wformat=2 -Wno-unused-function -Wno-stringop-truncation \
+		-ffunction-sections -fdata-sections -Iinclude tests/mock_cross_slot_writer_lifecycle_test.c \
+		src/ccb_commands.c src/ccb_hw.c src/debug_uart.c -Wl,--gc-sections -o /tmp/mock_cross_slot_writer_lifecycle_test
+	/tmp/mock_cross_slot_writer_lifecycle_test
 	$(CC) $(CFLAGS) -Wformat=2 -ffunction-sections -fdata-sections -Iinclude \
 		tests/mock_nvme_legacy_submit_test.c src/ccb_hw.c src/debug_uart.c -lpthread -Wl,--gc-sections -o /tmp/mock_nvme_legacy_submit_test
 	/tmp/mock_nvme_legacy_submit_test

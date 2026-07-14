@@ -61,6 +61,14 @@ typedef struct {
     uint64_t hw_addr;
 } PendingDdrSlot;
 
+typedef enum {
+    STORAGE_QUEUE_POP_ERROR = -1,
+    STORAGE_QUEUE_POP_TEMP_EMPTY = 0,
+    STORAGE_QUEUE_POP_ITEM = 1,
+    STORAGE_QUEUE_POP_PRODUCER_DRAINED = 2,
+    STORAGE_QUEUE_POP_NOT_ATTEMPTED = 3
+} StorageQueuePopResult;
+
 typedef struct {
     uint32_t ready_depth_current;
     uint32_t ready_depth_avg;
@@ -2471,10 +2479,22 @@ static void storage_mark_writer_error(StorageWriteQueue *q) {
     storage_write_request_stop();
 }
 
-static int storage_queue_pop(StorageWriteQueue *q, PendingDdrSlot *out, bool wait_for_item) {
+StorageCrossSlotWriterDecision storage_cross_slot_writer_decide(
+    bool producer_done, uint32_t queue_count, bool queue_error,
+    uint32_t engine_active, uint32_t engine_inflight)
+{
+    if (queue_error) return STORAGE_CROSS_SLOT_WRITER_QUEUE_ERROR;
+    if (queue_count != 0u || engine_active != 0u || engine_inflight != 0u)
+        return STORAGE_CROSS_SLOT_WRITER_CONTINUE;
+    if (producer_done) return STORAGE_CROSS_SLOT_WRITER_DRAINED;
+    return STORAGE_CROSS_SLOT_WRITER_WAIT_FOR_QUEUE;
+}
+
+static StorageQueuePopResult storage_queue_pop(StorageWriteQueue *q, PendingDdrSlot *out,
+                                               bool wait_for_item) {
     uint64_t empty_wait_start_us = 0u;
     if (!q || !out) {
-        return -1;
+        return STORAGE_QUEUE_POP_ERROR;
     }
     pthread_mutex_lock(&q->lock);
     if (wait_for_item && q->count == 0u && !q->producer_done && !q->error) {
@@ -2488,21 +2508,42 @@ static int storage_queue_pop(StorageWriteQueue *q, PendingDdrSlot *out, bool wai
         q->queue_empty_wait_us += wait_us;
         q->writer_idle_us += wait_us; /* legacy alias */
     }
-    if ((q->producer_done || q->error || !wait_for_item) && q->count == 0u) {
+    if (q->error) {
         pthread_mutex_unlock(&q->lock);
-        return 0;
+        return STORAGE_QUEUE_POP_ERROR;
+    }
+    if (q->count == 0u) {
+        StorageQueuePopResult result = q->producer_done
+                                           ? STORAGE_QUEUE_POP_PRODUCER_DRAINED
+                                           : STORAGE_QUEUE_POP_TEMP_EMPTY;
+        pthread_mutex_unlock(&q->lock);
+        return result;
     }
     *out = q->items[q->head];
     q->head = (q->head + 1u) % q->capacity;
     --q->count;
     if (storage_local_slot_transition_locked(q, out->slot, STORAGE_SLOT_READY_FOR_NVME,
                                              STORAGE_SLOT_NVME_BUSY) != 0) {
-        pthread_mutex_unlock(&q->lock); return -1;
+        pthread_mutex_unlock(&q->lock); return STORAGE_QUEUE_POP_ERROR;
     }
     storage_queue_record_depth_locked(q);
     pthread_cond_signal(&q->not_full);
     pthread_mutex_unlock(&q->lock);
-    return 1;
+    return STORAGE_QUEUE_POP_ITEM;
+}
+
+static StorageCrossSlotWriterDecision storage_cross_slot_writer_decision_locked(
+    StorageWriteQueue *q, const NvmeCrossSlotEngine *engine)
+{
+    StorageCrossSlotWriterDecision decision;
+
+    if (!q || !engine) return STORAGE_CROSS_SLOT_WRITER_QUEUE_ERROR;
+    pthread_mutex_lock(&q->lock);
+    decision = storage_cross_slot_writer_decide(
+        q->producer_done, q->count, q->error,
+        nvme_cross_slot_engine_active(engine), nvme_cross_slot_engine_inflight(engine));
+    pthread_mutex_unlock(&q->lock);
+    return decision;
 }
 
 static int storage_queue_wait_run(StorageWriteQueue *q)
@@ -2703,22 +2744,23 @@ static void *storage_nvme_writer_thread(void *arg) {
         uint64_t submit_stalls_before;
         uint64_t cq_empty_before;
         bool backlog_after_pop = false;
-        int pop_rc;
+        StorageQueuePopResult pop_result;
 
         if (storage_queue_abort_requested(q)) break;
         if (expected_run_us != 0u)
             storage_record_writer_schedule_gap(q, expected_run_us, storage_wall_time_us());
-        pop_rc = storage_queue_pop(q, &item, true);
+        pop_result = storage_queue_pop(q, &item, true);
         expected_run_us = 0u;
-        if (pop_rc < 0) {
+        if (pop_result == STORAGE_QUEUE_POP_ERROR) {
             storage_mark_writer_error(q);
             break;
         }
-        if (pop_rc == 0) {
+        if (pop_result == STORAGE_QUEUE_POP_PRODUCER_DRAINED) {
             storage_ring_event(&q->writer_event_ring, STORAGE_EVENT_STOP_DRAINED,
                                q->rt, 0u, 0u, false);
             break;
         }
+        if (pop_result != STORAGE_QUEUE_POP_ITEM) continue;
         backlog_after_pop = storage_queue_ready_count(q) > 0u;
 
         submit_stalls_before = __atomic_load_n(&q->rt->nvme_submit_stall_count, __ATOMIC_ACQUIRE);
@@ -2787,7 +2829,8 @@ static void *storage_nvme_cross_slot_writer_thread(void *arg) {
     while (1) {
         PendingDdrSlot item;
         NvmeWriteSlotReq req;
-        int pop_rc;
+        StorageQueuePopResult pop_result = STORAGE_QUEUE_POP_NOT_ATTEMPTED;
+        StorageCrossSlotWriterDecision writer_decision;
         bool wait_for_item = nvme_cross_slot_engine_active(engine) == 0u;
 
         if (storage_queue_abort_requested(q)) {
@@ -2802,16 +2845,14 @@ static void *storage_nvme_cross_slot_writer_thread(void *arg) {
         }
 
         if (nvme_cross_slot_engine_can_accept(engine)) {
-            pop_rc = storage_queue_pop(q, &item, wait_for_item);
-        } else {
-            pop_rc = 0;
+            pop_result = storage_queue_pop(q, &item, wait_for_item);
         }
-        if (pop_rc < 0) {
+        if (pop_result == STORAGE_QUEUE_POP_ERROR) {
             storage_set_writer_error_reason(q, "storage_queue_pop_failed");
             writer_failed = true;
             break;
         }
-        if (pop_rc > 0) {
+        if (pop_result == STORAGE_QUEUE_POP_ITEM) {
             uint64_t buffer_offset = 0u;
             memset(&req, 0, sizeof(req));
             req.slot = item.slot; req.start_lba = item.start_lba; req.sectors = item.sectors;
@@ -2846,11 +2887,20 @@ static void *storage_nvme_cross_slot_writer_thread(void *arg) {
         }
         storage_cross_slot_update_stats(q, engine);
         expected_run_us = storage_wall_time_us();
-        if (pop_rc == 0 && nvme_cross_slot_engine_active(engine) == 0u) {
+        writer_decision = storage_cross_slot_writer_decision_locked(q, engine);
+        if (writer_decision == STORAGE_CROSS_SLOT_WRITER_QUEUE_ERROR) {
+            storage_set_writer_error_reason(q, "storage_queue_error");
+            writer_failed = true;
+            break;
+        }
+        if (writer_decision == STORAGE_CROSS_SLOT_WRITER_DRAINED) {
             storage_ring_event(&q->writer_event_ring, STORAGE_EVENT_STOP_DRAINED,
                                q->rt, 0u, 0u, false);
             break;
         }
+        /* CONTINUE covers queued work or live engine ownership.  WAIT_FOR_QUEUE
+         * returns to the top where active==0 makes storage_queue_pop block on
+         * not_empty until the producer supplies work or marks itself done. */
     }
     if (writer_failed) {
         uint64_t now_us = storage_wall_time_us();
