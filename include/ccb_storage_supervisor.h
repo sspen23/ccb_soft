@@ -9,6 +9,8 @@ typedef struct {
     uint32_t fatal_seen_mask;
     uint32_t unavailable_mask, worker_exited_mask;
     uint32_t stop_requested_mask, stop_sent_mask, stop_failed_mask;
+    uint64_t stop_epoch;
+    uint32_t stop_phase[NUM_CHANNELS];
     bool first_fatal, result_known_failed, aggregate_ready;
     uint32_t fatal_channel; char fatal_reason[64]; char secondary_reason[64];
     WriteResult final_result[NUM_CHANNELS];

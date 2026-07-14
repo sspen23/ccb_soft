@@ -125,6 +125,7 @@ Task transfer_task = {
 LastTaskContext g_last_task = {0};
 static StorageTaskSupervisor g_storage_supervisor;
 static StorageCommitState g_storage_commit_state;
+static uint64_t g_storage_stop_epoch;
 
 typedef struct {
     bool active;
@@ -133,6 +134,7 @@ typedef struct {
     uint8_t acq_type;
     uint8_t failure_type;
     uint64_t deadline_us;
+    uint64_t stop_epoch;
     int requested_workers;
 } StoragePendingStop;
 
@@ -422,6 +424,10 @@ static int request_storage_stop_all(void)
     int requested = 0;
     uint32_t stop_mask = 0u;
 
+    if (g_storage_stop_epoch == 0u) {
+        g_storage_stop_epoch = storage_ipc_monotonic_us();
+        if (g_storage_stop_epoch == 0u) g_storage_stop_epoch = 1u;
+    }
     for (i = 0; i < STORAGE_TASK_COUNT; ++i) {
         if (storage_tasks[i].pid > 0) {
             stop_mask |= 1u << i;
@@ -429,6 +435,7 @@ static int request_storage_stop_all(void)
         }
     }
     storage_supervisor_request_stop(&g_storage_supervisor, stop_mask);
+    g_storage_supervisor.stop_epoch = g_storage_stop_epoch;
     storage_try_send_pending_stops();
     return requested;
 }
@@ -819,6 +826,7 @@ static int storage_send_control(Task *task, StorageControlType type, uint64_t ti
 
     if (!task || task->control_fd < 0) return -1;
     storage_ipc_make_control(&msg, type, timestamp_us);
+    if (type == STORAGE_CTRL_STOP) msg.stop_epoch = g_storage_stop_epoch;
     return storage_ipc_write_control_deadline(task->control_fd, &msg,
                                               storage_ipc_monotonic_us() + send_slice_us);
 }
@@ -855,6 +863,12 @@ static void storage_try_send_pending_stops(void)
     uint32_t pending = storage_supervisor_peek_stop_mask(&g_storage_supervisor);
     size_t i;
 
+    if (pending != 0u && g_storage_stop_epoch == 0u) {
+        g_storage_stop_epoch = storage_ipc_monotonic_us();
+        if (g_storage_stop_epoch == 0u) g_storage_stop_epoch = 1u;
+    }
+    if (pending != 0u && g_storage_supervisor.stop_epoch == 0u)
+        g_storage_supervisor.stop_epoch = g_storage_stop_epoch;
     for (i = 0u; i < STORAGE_TASK_COUNT; ++i) {
         Task *task = &storage_tasks[i];
         int send_errno;
@@ -1821,6 +1835,16 @@ static void drain_storage_events(Task *task, bool report_eof)
         if (event.type == STORAGE_WORKER_PERF_SAMPLE || event.type == STORAGE_WORKER_FATAL ||
             event.type == STORAGE_WORKER_FINAL_RESULT || event.type == STORAGE_WORKER_DIAG_EVENT) {
             (void)storage_perf_log_event(&event, task->task_id);
+        }
+        if (event.type == STORAGE_WORKER_STOP_PHASE) {
+            system_emit_line(STORAGE_LOG_SUMMARY,
+                             "storage_worker_stop_phase task=%s channel=%u stop_epoch=%" PRIu64
+                             " phase=%s bytes=%" PRIu64 " reason=%s",
+                             task->task_id, event.channel, event.stop_epoch,
+                             storage_ipc_stop_phase_name(
+                                 (StorageWorkerStopPhase)event.stop_phase),
+                             event.received_bytes,
+                             event.reason[0] != '\0' ? event.reason : "none");
         }
         task->worker_event = event;
         task->worker_phase = event.type;
@@ -3555,6 +3579,7 @@ static uint8_t start_storage_for_last_task(uint8_t *failure_type)
     { uint32_t mask = 0u; char count_text[16];
       for (i = 0; i < planned_count; ++i) mask |= 1u << planned[i].channel_id;
       storage_supervisor_init(&g_storage_supervisor, mask);
+      g_storage_stop_epoch = 0u;
       storage_commit_state_reset(&g_storage_commit_state);
       (void)snprintf(count_text, sizeof(count_text), "%d", planned_count);
       (void)setenv("SRC_REAL_SUPERVISED_CHANNEL_COUNT", count_text, 1);
@@ -4190,18 +4215,21 @@ void handle_frame(uint8_t *f)
                 g_pending_storage_stop.acq_type = acq_type;
                 g_pending_storage_stop.failure_type = failure_type;
                 g_pending_storage_stop.requested_workers = stopped;
+                g_pending_storage_stop.stop_epoch = g_storage_stop_epoch;
                 storage_ipc_parent_stop_timeout_config(&parent_stop_config,
                                                        DEFAULT_TIMEOUT_US);
                 stop_started_us = storage_ipc_monotonic_us();
                 g_pending_storage_stop.deadline_us = storage_ipc_saturating_add_u64(
                     stop_started_us, parent_stop_config.parent_timeout_us);
-                system_emit_line(STORAGE_LOG_SUMMARY, "storage_parent_stop_config task=%s parent_timeout_us=%" PRIu64
+                system_emit_line(STORAGE_LOG_SUMMARY, "storage_parent_stop_config task=%s stop_epoch=%" PRIu64
+                                 " parent_timeout_us=%" PRIu64
                                  " source=%s dma_quiesce_us=%" PRIu64
                                  " stop_harvest_us=%" PRIu64
                                  " writer_drain_us=%" PRIu64
                                  " nvme_abort_us=%" PRIu64
                                  " margin_us=%" PRIu64,
                                  g_pending_storage_stop.task_id,
+                                 g_pending_storage_stop.stop_epoch,
                                  parent_stop_config.parent_timeout_us,
                                  storage_ipc_parent_stop_timeout_source(
                                      parent_stop_config.source),

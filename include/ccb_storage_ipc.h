@@ -7,7 +7,7 @@
 #include <stdatomic.h>
 
 #define STORAGE_IPC_MAGIC 0x53544732u
-#define STORAGE_IPC_VERSION 3u
+#define STORAGE_IPC_VERSION 4u
 
 typedef enum {
     STORAGE_CTRL_ARM = 1,
@@ -22,6 +22,7 @@ typedef struct {
     uint32_t type;
     uint32_t flags;
     uint64_t timestamp_us;
+    uint64_t stop_epoch;
 } StorageControlMessage;
 
 /* A control pipe is a byte stream.  Keep incomplete frames here so a
@@ -56,8 +57,19 @@ typedef enum {
     STORAGE_WORKER_DRAINED = 5,
     STORAGE_WORKER_FINAL_RESULT = 6,
     STORAGE_WORKER_PERF_SAMPLE = 7,
-    STORAGE_WORKER_DIAG_EVENT = 8
+    STORAGE_WORKER_DIAG_EVENT = 8,
+    STORAGE_WORKER_STOP_PHASE = 9
 } StorageWorkerEventType;
+
+typedef enum {
+    STORAGE_WORKER_STOP_REQUESTED = 1,
+    STORAGE_WORKER_PACKET_BOUNDARY_REACHED,
+    STORAGE_WORKER_DMA_QUIESCED,
+    STORAGE_WORKER_HARVEST_STABLE_EMPTY,
+    STORAGE_WORKER_WRITER_DRAINED,
+    STORAGE_WORKER_FINALIZED,
+    STORAGE_WORKER_FAILED_FATAL
+} StorageWorkerStopPhase;
 
 typedef struct {
     uint64_t window_start_us, window_end_us, dma_bytes_delta, nvme_bytes_delta;
@@ -87,6 +99,9 @@ typedef struct {
     int32_t error_code;
     uint32_t reserved;
     uint64_t received_bytes;
+    uint64_t stop_epoch;
+    uint32_t stop_phase;
+    uint32_t stop_reserved;
     char reason[64];
     StoragePerfSample perf;
     StorageEventRecord diag;
@@ -132,6 +147,7 @@ int storage_ipc_try_write_diag(int fd, const StorageWorkerEvent *event,
 int storage_ipc_write_event_deadline(int fd, const StorageWorkerEvent *event,
                                      uint64_t deadline_us);
 int storage_ipc_validate_event(const StorageWorkerEvent *event);
+const char *storage_ipc_stop_phase_name(StorageWorkerStopPhase phase);
 int storage_ipc_read_event_raw(int fd, StorageWorkerEvent *event);
 int storage_ipc_read_event(int fd, StorageWorkerEvent *event);
 

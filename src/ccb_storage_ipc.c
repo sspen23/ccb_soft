@@ -201,7 +201,21 @@ int storage_ipc_validate_event(const StorageWorkerEvent *event)
 {
     return event && event->magic == STORAGE_IPC_MAGIC &&
            event->version == STORAGE_IPC_VERSION && event->size == sizeof(*event) &&
-           event->type >= STORAGE_WORKER_READY && event->type <= STORAGE_WORKER_DIAG_EVENT;
+           event->type >= STORAGE_WORKER_READY && event->type <= STORAGE_WORKER_STOP_PHASE;
+}
+
+const char *storage_ipc_stop_phase_name(StorageWorkerStopPhase phase)
+{
+    switch (phase) {
+    case STORAGE_WORKER_STOP_REQUESTED: return "stop_requested";
+    case STORAGE_WORKER_PACKET_BOUNDARY_REACHED: return "packet_boundary_reached";
+    case STORAGE_WORKER_DMA_QUIESCED: return "dma_quiesced";
+    case STORAGE_WORKER_HARVEST_STABLE_EMPTY: return "harvest_stable_empty";
+    case STORAGE_WORKER_WRITER_DRAINED: return "writer_drained";
+    case STORAGE_WORKER_FINALIZED: return "finalized";
+    case STORAGE_WORKER_FAILED_FATAL: return "failed_fatal";
+    default: return "invalid";
+    }
 }
 
 int storage_ipc_write_control(int fd, const StorageControlMessage *msg)

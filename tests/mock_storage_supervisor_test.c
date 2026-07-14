@@ -305,6 +305,53 @@ static void test_payload_media_accounting(void)
     assert(storage_supervisor_result_status(&s) == STORAGE_TASK_SUCCESS);
 }
 
+static StorageWorkerEvent stop_phase(uint32_t channel, uint64_t epoch,
+                                     StorageWorkerStopPhase phase,
+                                     const char *reason)
+{
+    StorageWorkerEvent value = event(STORAGE_WORKER_STOP_PHASE, channel);
+
+    value.stop_epoch = epoch;
+    value.stop_phase = (uint32_t)phase;
+    snprintf(value.reason, sizeof(value.reason), "%s", reason ? reason : "phase");
+    return value;
+}
+
+static void test_multichannel_stop_epoch_and_deferred_isolation(void)
+{
+    StorageTaskSupervisor s;
+    StorageWorkerEvent value;
+    uint32_t channel;
+    uint32_t phase;
+
+    storage_supervisor_init(&s, 3u);
+    advance_to_running(&s, 0u);
+    advance_to_running(&s, 1u);
+    for (channel = 0u; channel < 2u; ++channel) {
+        for (phase = STORAGE_WORKER_STOP_REQUESTED;
+             phase <= STORAGE_WORKER_FINALIZED; ++phase) {
+            value = stop_phase(channel, 77u, (StorageWorkerStopPhase)phase,
+                               "graceful_stop");
+            assert(storage_supervisor_handle_event(&s, &value) == 0);
+        }
+    }
+    assert(s.stop_epoch == 77u);
+    assert(!s.first_fatal && s.stop_requested_mask == 0u);
+
+    storage_supervisor_init(&s, 3u);
+    advance_to_running(&s, 0u);
+    advance_to_running(&s, 1u);
+    value = stop_phase(0u, 88u, STORAGE_WORKER_STOP_REQUESTED, "stop_requested");
+    assert(storage_supervisor_handle_event(&s, &value) == 0);
+    value = stop_phase(0u, 88u, STORAGE_WORKER_DMA_QUIESCED,
+                       "boundary_timeout_quiesced");
+    assert(storage_supervisor_handle_event(&s, &value) == 0);
+    assert(!s.first_fatal && s.stop_requested_mask == 0u);
+    value = stop_phase(1u, 89u, STORAGE_WORKER_STOP_REQUESTED, "stop_requested");
+    assert(storage_supervisor_handle_event(&s, &value) != 0);
+    assert_reason(&s, "stop_epoch_mismatch");
+}
+
 int main(void)
 {
     test_worker_exit_without_final();
@@ -317,6 +364,7 @@ int main(void)
     test_result_failure_reasons();
     test_one_channel_failure_rejects_aggregate();
     test_payload_media_accounting();
+    test_multichannel_stop_epoch_and_deferred_isolation();
     puts("mock_storage_supervisor_test: ok");
     return 0;
 }

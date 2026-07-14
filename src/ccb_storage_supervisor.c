@@ -137,6 +137,33 @@ int storage_supervisor_handle_event(StorageTaskSupervisor *s, const StorageWorke
             return -1;
         }
         break;
+    case STORAGE_WORKER_STOP_PHASE:
+        if ((s->running_mask & b) == 0u || (s->final_seen_mask & b) != 0u ||
+            e->stop_epoch == 0u ||
+            e->stop_phase < STORAGE_WORKER_STOP_REQUESTED ||
+            e->stop_phase > STORAGE_WORKER_FAILED_FATAL) {
+            fail(s, e->channel, "invalid_stop_phase_event");
+            return -1;
+        }
+        if (s->stop_epoch == 0u) s->stop_epoch = e->stop_epoch;
+        if (s->stop_epoch != e->stop_epoch) {
+            fail(s, e->channel, "stop_epoch_mismatch");
+            return -1;
+        }
+        if (e->stop_phase == STORAGE_WORKER_FAILED_FATAL) {
+            if (s->stop_phase[e->channel] == STORAGE_WORKER_FAILED_FATAL) {
+                fail(s, e->channel, "duplicate_stop_phase");
+                return -1;
+            }
+        } else if (e->stop_phase != s->stop_phase[e->channel] + 1u &&
+                   !(s->stop_phase[e->channel] == STORAGE_WORKER_STOP_REQUESTED &&
+                     e->stop_phase == STORAGE_WORKER_DMA_QUIESCED &&
+                     strcmp(e->reason, "boundary_timeout_quiesced") == 0)) {
+            fail(s, e->channel, "invalid_stop_phase_sequence");
+            return -1;
+        }
+        s->stop_phase[e->channel] = e->stop_phase;
+        break;
     default:
         fail(s, e->channel, "event_type_invalid");
         return -1;

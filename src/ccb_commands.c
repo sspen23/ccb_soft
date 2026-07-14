@@ -43,6 +43,7 @@
 #define STORAGE_STOP_STABLE_EMPTY_US 100ull
 static volatile sig_atomic_t g_storage_stop_requested = 0;
 static bool g_storage_control_stop_latched = false;
+static uint64_t g_storage_stop_epoch;
 static _Atomic uint64_t g_storage_dropped_perf_samples;
 static _Atomic uint64_t g_storage_dropped_diag_events;
 /* A worker has one primary FATAL.  Cleanup failures are retained separately
@@ -368,6 +369,25 @@ static int storage_emit_event(StorageWorkerEventType type, const ChannelRuntime 
     }
 }
 
+static int storage_emit_stop_phase(const ChannelRuntime *rt,
+                                   StorageWorkerStopPhase phase,
+                                   uint64_t bytes,
+                                   const char *reason)
+{
+    StorageWorkerEvent event;
+    int fd = storage_env_fd("SRC_REAL_STORAGE_EVENT_FD");
+
+    if (fd < 0) return 0;
+    storage_ipc_make_event(&event, STORAGE_WORKER_STOP_PHASE,
+                           rt && rt->cfg ? (uint32_t)rt->cfg->id : UINT32_MAX,
+                           phase == STORAGE_WORKER_FAILED_FATAL ? -1 : 0,
+                           bytes, reason);
+    event.stop_epoch = g_storage_stop_epoch;
+    event.stop_phase = (uint32_t)phase;
+    return storage_ipc_write_event_deadline(
+        fd, &event, storage_ipc_monotonic_us() + STORAGE_EVENT_DEADLINE_US);
+}
+
 static void storage_emit_perf_event(const ChannelRuntime *rt, const StorageProducerStats *stats,
                                     const StorageWriteQueue *q,
                                     const DmaBdSnapshot *bd, uint64_t start_us, uint64_t end_us,
@@ -517,6 +537,7 @@ static int storage_wait_start_gate(ChannelRuntime *rt, uint64_t *start_skew_us,
         }
         if (msg.type == STORAGE_CTRL_STOP) {
             g_storage_control_stop_latched = true;
+            g_storage_stop_epoch = msg.stop_epoch;
             if (failure_reason) *failure_reason = "stop_before_arm";
             return -1;
         }
@@ -541,6 +562,7 @@ static int storage_wait_start_gate(ChannelRuntime *rt, uint64_t *start_skew_us,
         }
         if (msg.type == STORAGE_CTRL_STOP) {
             g_storage_control_stop_latched = true;
+            g_storage_stop_epoch = msg.stop_epoch;
             if (failure_reason) *failure_reason = "stop_before_run";
             return -1;
         }
@@ -582,6 +604,7 @@ static bool storage_control_stop_requested(void)
     if (g_storage_control_stop_latched) return true;
     if (fd >= 0 && storage_ipc_read_control(fd, &msg) == 0 && msg.type == STORAGE_CTRL_STOP) {
         g_storage_control_stop_latched = true;
+        g_storage_stop_epoch = msg.stop_epoch;
     }
     return g_storage_control_stop_latched;
 }
@@ -2973,6 +2996,7 @@ void storage_write_reset_stop(void) {
     g_storage_stop_requested = 0;
     g_storage_control_stop_latched = false;
     g_storage_fatal_event_sent = false;
+    g_storage_stop_epoch = 0u;
 }
 
 void storage_write_request_stop(void) {
@@ -3370,6 +3394,7 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
     bool auto_idle_done = false;
     bool stop_harvest_stable = false;
     bool stop_tail_seen = false;
+    bool stop_failed_phase_sent = false;
     bool bounded;
     bool cross_slot_qd;
     uint64_t requested_size;
@@ -3936,10 +3961,21 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
             }
             if (stop_requested && stop_state.state == STORAGE_STOP_NONE) {
                 manual_stop_seen = external_stop_requested;
+                if (g_storage_stop_epoch == 0u) {
+                    g_storage_stop_epoch = storage_wall_time_us();
+                    if (g_storage_stop_epoch == 0u) g_storage_stop_epoch = 1u;
+                }
                 (void)storage_stop_state_latch(
                     &stop_state, storage_wall_time_us() + stop_timeouts.stop_harvest_us);
                 (void)storage_stop_state_advance(&stop_state,
                                                  STORAGE_STOP_WAIT_BOUNDARY);
+                if (storage_emit_stop_phase(&rt, STORAGE_WORKER_STOP_REQUESTED,
+                                            dma_received_bytes,
+                                            auto_idle_done ? "auto_idle" : "stop_requested") != 0) {
+                    storage_record_failure(&producer_stats,
+                                           "stop_requested_event_send_failed");
+                    goto out;
+                }
             }
             if (stop_state.state == STORAGE_STOP_WAIT_BOUNDARY && rt.gopt.dry_run) {
                 (void)storage_queue_latch_stop(&write_queue);
@@ -4046,6 +4082,15 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                             storage_record_failure(&producer_stats,
                                                    "stop_packet_boundary_timeout");
                         }
+                        if (!boundary_timed_out &&
+                            storage_emit_stop_phase(
+                                &rt, STORAGE_WORKER_PACKET_BOUNDARY_REACHED,
+                                dma_received_bytes, "packet_boundary_reached") != 0) {
+                            storage_record_failure(
+                                &producer_stats,
+                                "packet_boundary_event_send_failed");
+                            goto out;
+                        }
                         (void)storage_queue_latch_stop(&write_queue);
                         (void)storage_stop_state_advance(
                             &stop_state, STORAGE_STOP_DMA_QUIESCING);
@@ -4069,6 +4114,15 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                             dma_stop_result = quiesce_result;
                         }
                         dma_quiesced = true;
+                        if (storage_emit_stop_phase(
+                                &rt, STORAGE_WORKER_DMA_QUIESCED,
+                                dma_received_bytes,
+                                boundary_timed_out ? "boundary_timeout_quiesced"
+                                                   : "dma_quiesced") != 0) {
+                            storage_record_failure(&producer_stats,
+                                                   "dma_quiesced_event_send_failed");
+                            goto out;
+                        }
                         stop_state.deadline_us = storage_wall_time_us() +
                                                  stop_timeouts.stop_harvest_us;
                         (void)storage_stop_state_advance(
@@ -4102,6 +4156,14 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                                    " ch=%d captured=%" PRIu64 "\n",
                                    cfg->id, bytes_captured);
                         stop_harvest_stable = true;
+                        if (storage_emit_stop_phase(
+                                &rt, STORAGE_WORKER_HARVEST_STABLE_EMPTY,
+                                dma_received_bytes, "harvest_stable_empty") != 0) {
+                            storage_record_failure(
+                                &producer_stats,
+                                "harvest_stable_event_send_failed");
+                            goto out;
+                        }
                         break;
                     }
                     if (storage_stop_state_expired(&stop_state, now_us)) {
@@ -4460,6 +4522,12 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
         goto out;
     }
     writer_started = false;
+    if (storage_emit_stop_phase(&rt, STORAGE_WORKER_WRITER_DRAINED,
+                                dma_received_bytes, "writer_drained") != 0) {
+        storage_record_failure(&producer_stats,
+                               "writer_drained_event_send_failed");
+        goto out;
+    }
     /* The final DMA reset is deliberately last: all queued slots and all
      * NVMe completions have drained before hardware state is destroyed. */
     {
@@ -4500,6 +4568,11 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
     (void)storage_queue_buffered_bytes(&write_queue, &max_buffered_bytes);
     storage_queue_destroy(&write_queue);
     write_queue_ready = false;
+    if (storage_emit_stop_phase(&rt, STORAGE_WORKER_FINALIZED,
+                                dma_received_bytes, "finalized") != 0) {
+        storage_record_failure(&producer_stats, "finalized_event_send_failed");
+        goto out;
+    }
     (void)storage_stop_state_advance(&stop_state, STORAGE_STOP_FINISHED);
 
     total_sectors = next_queue_lba - start_lba;
@@ -5138,6 +5211,18 @@ out:
             dma_stop_failed = true;
             storage_record_failure(&producer_stats, "dma_stop_recovery_failed");
         }
+    }
+    if (!stop_failed_phase_sent && capture_start_us != 0u &&
+        (write_queue.error || dma_stop_failed || !write_queue.nvme_engine_quiesced)) {
+        if (g_storage_stop_epoch == 0u) {
+            g_storage_stop_epoch = storage_wall_time_us();
+            if (g_storage_stop_epoch == 0u) g_storage_stop_epoch = 1u;
+        }
+        (void)storage_emit_stop_phase(
+            &rt, STORAGE_WORKER_FAILED_FATAL, dma_received_bytes,
+            producer_stats.receive_integrity_risk[0] != '\0'
+                ? producer_stats.receive_integrity_risk : "storage_fatal");
+        stop_failed_phase_sent = true;
     }
     if (stop_state.state == STORAGE_STOP_WRITER_DRAINING) {
         (void)storage_stop_state_advance(&stop_state, STORAGE_STOP_FINALIZING);
