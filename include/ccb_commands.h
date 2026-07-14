@@ -3,6 +3,7 @@
 
 #include "ccb_types.h"
 #include "storage_error.h"
+#include "storage_writer.h"
 
 typedef struct {
     int channel_id;
@@ -124,19 +125,6 @@ const char *storage_cross_slot_source_kind_name(StorageCrossSlotSourceKind kind)
 bool storage_cross_slot_enabled_for_channel(int channel_id);
 uint32_t storage_cross_slot_active_slots_for_channel(int channel_id);
 uint32_t storage_cross_slot_default_target_qd(int channel_id);
-
-typedef enum {
-    STORAGE_CROSS_SLOT_WRITER_CONTINUE = 0,
-    STORAGE_CROSS_SLOT_WRITER_WAIT_FOR_QUEUE,
-    STORAGE_CROSS_SLOT_WRITER_DRAINED,
-    STORAGE_CROSS_SLOT_WRITER_QUEUE_ERROR
-} StorageCrossSlotWriterDecision;
-
-/* Pure decision helper used by the locked writer termination check and host
- * lifecycle tests.  Only DRAINED permits STOP_DRAINED and thread exit. */
-StorageCrossSlotWriterDecision storage_cross_slot_writer_decide(
-    bool producer_done, uint32_t queue_count, bool queue_error,
-    uint32_t engine_active, uint32_t engine_inflight);
 
 /* Read one file (by metadata key or explicit LBA) back to DDR. */
 int execute_read(const ParsedArgs *args, GlobalOptions gopt);

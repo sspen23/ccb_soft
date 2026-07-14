@@ -2657,17 +2657,6 @@ static void storage_record_deferred_stop_error(StorageWriteQueue *q,
     pthread_mutex_unlock(&q->lock);
 }
 
-StorageCrossSlotWriterDecision storage_cross_slot_writer_decide(
-    bool producer_done, uint32_t queue_count, bool queue_error,
-    uint32_t engine_active, uint32_t engine_inflight)
-{
-    if (queue_error) return STORAGE_CROSS_SLOT_WRITER_QUEUE_ERROR;
-    if (queue_count != 0u || engine_active != 0u || engine_inflight != 0u)
-        return STORAGE_CROSS_SLOT_WRITER_CONTINUE;
-    if (producer_done) return STORAGE_CROSS_SLOT_WRITER_DRAINED;
-    return STORAGE_CROSS_SLOT_WRITER_WAIT_FOR_QUEUE;
-}
-
 static StorageQueuePopResult storage_queue_pop(StorageWriteQueue *q, PendingDdrSlot *out,
                                                bool wait_for_item) {
     uint64_t empty_wait_start_us = 0u;
