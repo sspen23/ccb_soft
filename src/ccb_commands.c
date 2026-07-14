@@ -143,6 +143,7 @@ typedef struct {
     uint64_t cross_completion_process_max_us;
     uint64_t cross_no_progress_sleep_count;
     uint64_t writer_no_progress_sleep_count;
+    uint32_t writer_budget_override_us;
     bool writer_rt_enabled;
     int writer_rt_policy;
     uint32_t writer_rt_prio;
@@ -215,6 +216,12 @@ typedef struct {
     bool ring_full_active;
     bool integrity_risk_ring_full;
     uint32_t watermark_level;
+    uint32_t ring_warning_percent;
+    uint32_t ring_critical_percent;
+    uint64_t ring_critical_duration_us;
+    uint64_t ring_critical_since_us;
+    bool ring_critical_stop_enabled;
+    bool ring_critical_stop_triggered;
     uint64_t dma_no_free_slot_count;
     uint64_t dma_harvest_batches;
     uint64_t dma_harvest_batch_total;
@@ -2167,79 +2174,77 @@ static void storage_stats_update_ring_full(StorageProducerStats *stats,
     }
 }
 
-static uint32_t storage_watermark_level(uint32_t busy_slots, uint32_t total_slots)
-{
-    if (total_slots == 0u) {
-        return 0u;
-    }
-    if (busy_slots >= total_slots) {
-        return 4u;
-    }
-    if (total_slots == 32u) {
-        if (busy_slots >= 28u) {
-            return 3u;
-        }
-        if (busy_slots >= 24u) {
-            return 2u;
-        }
-        if (busy_slots >= 16u) {
-            return 1u;
-        }
-    } else {
-        if (busy_slots * 100u >= total_slots * 88u) {
-            return 3u;
-        }
-        if (busy_slots * 100u >= total_slots * 75u) {
-            return 2u;
-        }
-        if (busy_slots * 100u >= total_slots * 50u) {
-            return 1u;
-        }
-    }
-    return 0u;
-}
-
 static const char *storage_watermark_name(uint32_t level)
 {
     switch (level) {
     case 1u:
-        return "half";
+        return "warning";
     case 2u:
-        return "high";
-    case 3u:
         return "critical";
-    case 4u:
+    case 3u:
         return "full";
     default:
         return "normal";
     }
 }
 
-static void storage_maybe_log_watermark(StorageProducerStats *stats,
-                                        StorageWriteQueue *q,
-                                        const ChannelRuntime *rt,
-                                        const char *task_no,
-                                        uint32_t file_index,
-                                        uint64_t dma_received_bytes)
+static bool storage_update_ring_pressure(StorageProducerStats *stats,
+                                         StorageWriteQueue *q,
+                                         const ChannelRuntime *rt,
+                                         const char *task_no,
+                                         uint32_t file_index,
+                                         uint64_t dma_received_bytes)
 {
     uint32_t busy_slots;
     uint32_t level;
+    uint32_t previous_level;
     uint64_t buffered_bytes;
+    uint64_t now_us;
+    bool should_stop;
 
     if (!stats || !q || !rt) {
-        return;
+        return false;
     }
     busy_slots = storage_queue_busy_count(q, NULL);
     buffered_bytes = storage_queue_buffered_bytes(q, NULL);
-    level = storage_watermark_level(busy_slots, rt->dma_desc_count);
-    if (level < stats->watermark_level) {
-        stats->watermark_level = level;
-        return;
-    }
-    if (level == 0u || level == 4u || level <= stats->watermark_level) {
-        return;
-    }
+    level = storage_ring_pressure_level(busy_slots, rt->dma_desc_count,
+                                        stats->ring_warning_percent,
+                                        stats->ring_critical_percent);
+    now_us = storage_wall_time_us();
+    previous_level = stats->watermark_level;
     stats->watermark_level = level;
+    __atomic_store_n(&q->writer_budget_override_us,
+                     level == 0u
+                         ? 0u
+                         : storage_writer_budget_for_pressure(
+                               q->cross_slot_config.writer_budget_us, level),
+                     __ATOMIC_RELEASE);
+    if (level >= 2u) {
+        if (stats->ring_critical_since_us == 0u)
+            stats->ring_critical_since_us = now_us;
+    } else {
+        stats->ring_critical_since_us = 0u;
+    }
+    should_stop = !stats->ring_critical_stop_triggered &&
+                  storage_ring_pressure_should_stop(
+                      level, stats->ring_critical_since_us, now_us,
+                      stats->ring_critical_duration_us,
+                      stats->ring_critical_stop_enabled);
+    if (should_stop) {
+        stats->ring_critical_stop_triggered = true;
+        storage_emit_line(
+            STORAGE_LOG_SUMMARY,
+            "storage_ring_pressure_stop channel=%d task=%s file_index=%u"
+            " level=%s busy_slots=%u total_slots=%u"
+            " critical_duration_us=%" PRIu64,
+            rt->cfg->id, task_no, (unsigned)file_index,
+            storage_watermark_name(level), (unsigned)busy_slots,
+            (unsigned)rt->dma_desc_count, stats->ring_critical_duration_us);
+    }
+
+    if (level == 0u || level == 3u || level <= previous_level) {
+        return should_stop;
+    }
     if (storage_event_logs_enabled()) {
         printf("storage_ddr_watermark channel=%d task=%s file_index=%u level=%s"
                " busy_slots=%u total_slots=%u buffered_bytes=%" PRIu64
@@ -2257,6 +2262,7 @@ static void storage_maybe_log_watermark(StorageProducerStats *stats,
                stats->ring_full_count);
         fflush(stdout);
     }
+    return should_stop;
 }
 
 static void storage_stats_print_periodic(StorageProducerStats *stats,
@@ -2997,7 +3003,10 @@ static void *storage_nvme_cross_slot_writer_thread(void *arg) {
         }
         {
             uint64_t step_start_us = storage_wall_time_us();
-            if (nvme_cross_slot_engine_step(engine, 0u, storage_cross_slot_done_cb, q) != 0) {
+            uint32_t step_budget_us = __atomic_load_n(
+                &q->writer_budget_override_us, __ATOMIC_ACQUIRE);
+            if (nvme_cross_slot_engine_step(engine, step_budget_us,
+                                            storage_cross_slot_done_cb, q) != 0) {
                 (void)__atomic_add_fetch(&q->writer_active_us,
                                          storage_elapsed_us(step_start_us), __ATOMIC_RELEASE);
                 storage_cross_slot_update_stats(q, engine);
@@ -3562,6 +3571,24 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                                                     "SRC_REAL_HARVEST_BATCH_MAX",
                                                     cfg->id == 2 ? 4u : 16u,
                                                     1024u);
+    producer_stats.ring_warning_percent = storage_env_u32_limit(
+        "SRC_REAL_RING_WARNING_PERCENT", 75u, 100u);
+    producer_stats.ring_critical_percent = storage_env_u32_limit(
+        "SRC_REAL_RING_CRITICAL_PERCENT", 90u, 100u);
+    if (producer_stats.ring_warning_percent == 0u ||
+        producer_stats.ring_warning_percent >= producer_stats.ring_critical_percent) {
+        fprintf(stderr,
+                "warning: invalid storage ring pressure thresholds warning=%u"
+                " critical=%u; fallback=75/90\n",
+                (unsigned)producer_stats.ring_warning_percent,
+                (unsigned)producer_stats.ring_critical_percent);
+        producer_stats.ring_warning_percent = 75u;
+        producer_stats.ring_critical_percent = 90u;
+    }
+    producer_stats.ring_critical_duration_us = storage_timeout_us(
+        "SRC_REAL_RING_CRITICAL_DURATION_US", NULL, 100000u);
+    producer_stats.ring_critical_stop_enabled =
+        storage_env_flag_enabled("SRC_REAL_RING_CRITICAL_GRACEFUL_STOP") != 0;
     {
         cross_slot_enabled_resolution = storage_cross_slot_resolve_config(
             cfg->id, STORAGE_CROSS_SLOT_CONFIG_ENABLED);
@@ -3844,6 +3871,15 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                       cross_slot_empty_sleep_resolution.source_name,
                       storage_cross_slot_source_kind_name(cross_slot_no_progress_resolution.source_kind),
                       cross_slot_no_progress_resolution.source_name);
+    storage_emit_line(STORAGE_LOG_SUMMARY,
+                      "storage_ring_pressure_config channel=%d warning_percent=%u"
+                      " critical_percent=%u critical_duration_us=%" PRIu64
+                      " graceful_stop=%u",
+                      cfg->id,
+                      (unsigned)producer_stats.ring_warning_percent,
+                      (unsigned)producer_stats.ring_critical_percent,
+                      producer_stats.ring_critical_duration_us,
+                      producer_stats.ring_critical_stop_enabled ? 1u : 0u);
     {
         const StorageCrossSlotResolution *resolutions[] = {
             &cross_slot_enabled_resolution, &cross_slot_max_active_resolution,
@@ -3991,6 +4027,9 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
             first_dma_deadline_due = first_dma_deadline_us != 0u &&
                                      !saw_dma_data && !stop_requested &&
                                      storage_wall_time_us() >= first_dma_deadline_us;
+
+            if (producer_stats.watermark_level >= 1u && harvest_limit < 16u)
+                harvest_limit = 16u;
 
             if (bounded && stop_state.state == STORAGE_STOP_NONE) {
                 harvest_limit = storage_harvest_limit_for_remaining(
@@ -4252,12 +4291,16 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                                                 &bd_snapshot) != 0) {
                     goto out;
                 }
-                storage_maybe_log_watermark(&producer_stats,
-                                            &write_queue,
-                                            &rt,
-                                            args->task_no,
-                                            effective_file_index,
-                                            dma_received_bytes);
+                {
+                    bool ring_pressure_stop = storage_update_ring_pressure(
+                        &producer_stats, &write_queue, &rt, args->task_no,
+                        effective_file_index, dma_received_bytes);
+
+                    if (bd_snapshot.dma_writable != 0u && ring_pressure_stop) {
+                        storage_write_request_stop();
+                        continue;
+                    }
+                }
                 if (bd_snapshot.dma_writable == 0u) {
                     ++producer_stats.dma_no_free_slot_count;
                     storage_ring_event(&write_queue.producer_event_ring,
@@ -4546,6 +4589,11 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                         STORAGE_STOP_STABLE_EMPTY_US);
                 }
                 storage_stats_finish_harvest_batch(&producer_stats);
+                if (storage_update_ring_pressure(
+                        &producer_stats, &write_queue, &rt, args->task_no,
+                        effective_file_index, dma_received_bytes)) {
+                    storage_write_request_stop();
+                }
                 if (harvest_count >= harvest_batch_max_cfg) sched_yield();
                 continue;
             }

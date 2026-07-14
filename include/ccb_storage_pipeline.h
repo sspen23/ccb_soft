@@ -133,6 +133,17 @@ StorageStopTailDisposition storage_stop_tail_disposition(bool stop_active,
                                                          uint64_t media_bytes,
                                                          bool padding_coherent);
 bool storage_drain_invariant_ok(const StorageDrainInvariant *invariant);
+uint32_t storage_ring_pressure_level(uint32_t occupied_slots,
+                                     uint32_t total_slots,
+                                     uint32_t warning_percent,
+                                     uint32_t critical_percent);
+uint32_t storage_writer_budget_for_pressure(uint32_t base_budget_us,
+                                            uint32_t pressure_level);
+bool storage_ring_pressure_should_stop(uint32_t pressure_level,
+                                       uint64_t critical_since_us,
+                                       uint64_t now_us,
+                                       uint64_t critical_duration_us,
+                                       bool stop_enabled);
 void storage_run_state_init(StorageRunState *state);
 int storage_run_state_enable_writer(StorageRunState *state);
 int storage_run_state_set_writer_ready(StorageRunState *state, bool success);

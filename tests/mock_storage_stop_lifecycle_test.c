@@ -87,11 +87,30 @@ static void test_stop_is_idempotent_and_inflight_blocks_finish(void)
     assert(!storage_drain_invariant_ok(&invariant));
 }
 
+static void test_ring_pressure_policy_is_bounded(void)
+{
+    assert(storage_ring_pressure_level(74u, 100u, 75u, 90u) == 0u);
+    assert(storage_ring_pressure_level(75u, 100u, 75u, 90u) == 1u);
+    assert(storage_ring_pressure_level(90u, 100u, 75u, 90u) == 2u);
+    assert(storage_ring_pressure_level(100u, 100u, 75u, 90u) == 3u);
+    assert(storage_writer_budget_for_pressure(300u, 0u) == 300u);
+    assert(storage_writer_budget_for_pressure(300u, 1u) == 450u);
+    assert(storage_writer_budget_for_pressure(300u, 2u) == 600u);
+    assert(storage_writer_budget_for_pressure(UINT32_MAX, 2u) == UINT32_MAX);
+    assert(!storage_ring_pressure_should_stop(2u, 1000u, 100999u,
+                                              100000u, true));
+    assert(storage_ring_pressure_should_stop(2u, 1000u, 101000u,
+                                             100000u, true));
+    assert(!storage_ring_pressure_should_stop(2u, 1000u, 101000u,
+                                              100000u, false));
+}
+
 int main(void)
 {
     test_stable_empty_requires_repeated_observation();
     test_unaligned_tail_does_not_abort_full_prefix();
     test_stop_is_idempotent_and_inflight_blocks_finish();
+    test_ring_pressure_policy_is_bounded();
     puts("mock_storage_stop_lifecycle_test: ok");
     return 0;
 }

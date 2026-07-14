@@ -100,6 +100,44 @@ bool storage_drain_invariant_ok(const StorageDrainInvariant *invariant)
                invariant->global_inflight;
 }
 
+uint32_t storage_ring_pressure_level(uint32_t occupied_slots,
+                                     uint32_t total_slots,
+                                     uint32_t warning_percent,
+                                     uint32_t critical_percent)
+{
+    uint64_t occupied_percent;
+
+    if (total_slots == 0u || warning_percent == 0u ||
+        warning_percent >= critical_percent || critical_percent > 100u)
+        return 0u;
+    if (occupied_slots >= total_slots) return 3u;
+    occupied_percent = (uint64_t)occupied_slots * 100u / total_slots;
+    if (occupied_percent >= critical_percent) return 2u;
+    if (occupied_percent >= warning_percent) return 1u;
+    return 0u;
+}
+
+uint32_t storage_writer_budget_for_pressure(uint32_t base_budget_us,
+                                            uint32_t pressure_level)
+{
+    uint64_t scaled = base_budget_us;
+
+    if (pressure_level >= 2u) scaled *= 2u;
+    else if (pressure_level == 1u) scaled += (scaled + 1u) / 2u;
+    return scaled > UINT32_MAX ? UINT32_MAX : (uint32_t)scaled;
+}
+
+bool storage_ring_pressure_should_stop(uint32_t pressure_level,
+                                       uint64_t critical_since_us,
+                                       uint64_t now_us,
+                                       uint64_t critical_duration_us,
+                                       bool stop_enabled)
+{
+    return stop_enabled && pressure_level >= 2u && critical_since_us != 0u &&
+           now_us >= critical_since_us &&
+           now_us - critical_since_us >= critical_duration_us;
+}
+
 void storage_run_state_init(StorageRunState *state)
 {
     if (state) memset(state, 0, sizeof(*state));
