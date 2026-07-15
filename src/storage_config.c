@@ -83,14 +83,22 @@ static void warn_profile_overrides_once(void)
         "SRC_REAL_WRITER_RT_POLICY", "SRC_REAL_PRODUCER_RT_POLICY",
         "SRC_REAL_STORAGE_RING_BYTES", "SRC_REAL_STORAGE_DMA_DESC_BYTES",
     };
-    static const char *const channel_patterns[] = {
-        "SRC_REAL_NVME_CMD_KIB_CH%u", "SRC_REAL_NVME_QD_CH%u",
-        "SRC_REAL_TARGET_QD_CH%u", "SRC_REAL_MAX_ACTIVE_CH%u",
-        "SRC_REAL_CQ_BATCH_CH%u", "SRC_REAL_CROSS_SLOT_CH%u",
-        "SRC_REAL_CH%u_TARGET_QD", "SRC_REAL_CH%u_CQ_BATCH",
-        "SRC_REAL_CH%u_WRITER_RT_PRIO", "SRC_REAL_CH%u_PRODUCER_RT_PRIO",
-        "SRC_REAL_STORAGE_RING_BYTES_CH%u",
-        "SRC_REAL_STORAGE_DMA_DESC_BYTES_CH%u",
+    static const struct {
+        const char *prefix;
+        const char *suffix;
+    } channel_names[] = {
+        {"SRC_REAL_NVME_CMD_KIB_CH", ""},
+        {"SRC_REAL_NVME_QD_CH", ""},
+        {"SRC_REAL_TARGET_QD_CH", ""},
+        {"SRC_REAL_MAX_ACTIVE_CH", ""},
+        {"SRC_REAL_CQ_BATCH_CH", ""},
+        {"SRC_REAL_CROSS_SLOT_CH", ""},
+        {"SRC_REAL_CH", "_TARGET_QD"},
+        {"SRC_REAL_CH", "_CQ_BATCH"},
+        {"SRC_REAL_CH", "_WRITER_RT_PRIO"},
+        {"SRC_REAL_CH", "_PRODUCER_RT_PRIO"},
+        {"SRC_REAL_STORAGE_RING_BYTES_CH", ""},
+        {"SRC_REAL_STORAGE_DMA_DESC_BYTES_CH", ""},
     };
     size_t i;
     uint32_t channel;
@@ -102,11 +110,13 @@ static void warn_profile_overrides_once(void)
     }
     for (channel = 0u; channel < NUM_CHANNELS; ++channel) {
         for (i = 0u;
-             i < sizeof(channel_patterns) / sizeof(channel_patterns[0]); ++i) {
+             i < sizeof(channel_names) / sizeof(channel_names[0]); ++i) {
             char name[96];
             const char *value;
 
-            (void)snprintf(name, sizeof(name), channel_patterns[i], channel);
+            (void)snprintf(name, sizeof(name), "%s%u%s",
+                           channel_names[i].prefix, channel,
+                           channel_names[i].suffix);
             value = getenv(name);
             if (value && value[0] != '\0') warn_deprecated_once(name);
         }
