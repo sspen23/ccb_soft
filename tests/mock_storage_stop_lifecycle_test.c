@@ -187,6 +187,16 @@ static void test_ring_pressure_policy_is_bounded(void)
                                               100000u, false));
 }
 
+static void test_short_perf_window_is_invalid(void)
+{
+    double rate = 123.0;
+
+    assert(!storage_rate_mib_s(400u * 1024u * 1024u, 1u, &rate));
+    assert(rate == 0.0);
+    assert(storage_rate_mib_s(1024u * 1024u, 1000u, &rate));
+    assert(rate > 999.0 && rate < 1001.0);
+}
+
 static void test_input_idle_candidate_and_reactivation(void)
 {
     StorageInputIdleState idle;
@@ -227,6 +237,7 @@ int main(void)
     test_unaligned_tail_does_not_abort_full_prefix();
     test_stop_is_idempotent_and_inflight_blocks_finish();
     test_ring_pressure_policy_is_bounded();
+    test_short_perf_window_is_invalid();
     test_input_idle_candidate_and_reactivation();
     puts("mock_storage_stop_lifecycle_test: ok");
     return 0;

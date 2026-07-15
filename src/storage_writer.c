@@ -23,6 +23,14 @@ bool storage_drain_invariant_ok(const StorageDrainInvariant *invariant)
            invariant->ring_occupied_bytes == 0u;
 }
 
+bool storage_rate_mib_s(uint64_t bytes, uint64_t elapsed_us, double *rate)
+{
+    if (rate) *rate = 0.0;
+    if (!rate || elapsed_us < 100u) return false;
+    *rate = (double)bytes * 1000000.0 / (double)elapsed_us / 1048576.0;
+    return true;
+}
+
 void storage_drain_stable_init(StorageDrainStableState *state)
 {
     if (state) memset(state, 0, sizeof(*state));

@@ -34,6 +34,7 @@ typedef enum {
 } StorageCrossSlotWriterDecision;
 
 bool storage_drain_invariant_ok(const StorageDrainInvariant *invariant);
+bool storage_rate_mib_s(uint64_t bytes, uint64_t elapsed_us, double *rate);
 void storage_drain_stable_init(StorageDrainStableState *state);
 bool storage_drain_stable_observe(StorageDrainStableState *state,
                                   const StorageDrainInvariant *invariant,

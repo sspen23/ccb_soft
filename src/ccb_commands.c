@@ -299,6 +299,19 @@ typedef struct {
     uint64_t last_bd_snapshot_us;
 } StorageProducerStats;
 
+static void storage_stats_observe_bd_snapshot(StorageProducerStats *stats,
+                                              const DmaBdSnapshot *snapshot)
+{
+    if (!stats || !snapshot) return;
+    if (snapshot->completed_unharvested > stats->max_completed_unharvested)
+        stats->max_completed_unharvested = snapshot->completed_unharvested;
+    if (stats->min_dma_writable == UINT32_MAX ||
+        snapshot->dma_writable < stats->min_dma_writable)
+        stats->min_dma_writable = snapshot->dma_writable;
+    if (snapshot->occupied_bytes_est > stats->max_occupied_bytes_est)
+        stats->max_occupied_bytes_est = snapshot->occupied_bytes_est;
+}
+
 static void storage_record_error(StorageProducerStats *stats,
                                  StorageErrorCode code, const char *reason)
 {
@@ -399,6 +412,19 @@ static uint64_t storage_elapsed_us(uint64_t start_us) {
         return 0u;
     }
     return now - start_us;
+}
+
+static void storage_format_rate(char *out, size_t out_size, uint64_t bytes,
+                                uint64_t elapsed_us)
+{
+    double rate;
+
+    if (!out || out_size == 0u) return;
+    if (!storage_rate_mib_s(bytes, elapsed_us, &rate)) {
+        (void)snprintf(out, out_size, "N/A");
+        return;
+    }
+    (void)snprintf(out, out_size, "%.3f", rate);
 }
 
 static int storage_env_fd(const char *name)
@@ -514,6 +540,7 @@ static void storage_emit_final_perf_window(ChannelRuntime *rt,
     pthread_mutex_lock(&q->lock);
     (void)dma_get_bd_snapshot_o1(rt, &q->slots.counts, &bd_snapshot);
     pthread_mutex_unlock(&q->lock);
+    storage_stats_observe_bd_snapshot(stats, &bd_snapshot);
     nvme_bytes = __atomic_load_n(&rt->nvme_write_bytes_done, __ATOMIC_ACQUIRE);
     dma_delta = received_bytes >= stats->perf_window_received_bytes
                     ? received_bytes - stats->perf_window_received_bytes : 0u;
@@ -2197,9 +2224,7 @@ static int storage_capture_bd_snapshot(StorageProducerStats *stats,
                           rt->cfg->id, task_no, (unsigned)file_index, received_bytes);
         return -1;
     }
-    if (out->completed_unharvested > stats->max_completed_unharvested) {
-        stats->max_completed_unharvested = out->completed_unharvested;
-    }
+    storage_stats_observe_bd_snapshot(stats, out);
     {
         uint32_t low_threshold = storage_env_u32_limit("SRC_REAL_DMA_BD_LOW_WATERMARK",
                                                        4u, out->total_slots);
@@ -2217,12 +2242,6 @@ static int storage_capture_bd_snapshot(StorageProducerStats *stats,
         } else if (out->dma_writable > low_threshold) {
             stats->dma_bd_low_active = false;
         }
-    }
-    if (stats->min_dma_writable == UINT32_MAX || out->dma_writable < stats->min_dma_writable) {
-        stats->min_dma_writable = out->dma_writable;
-    }
-    if (out->occupied_bytes_est > stats->max_occupied_bytes_est) {
-        stats->max_occupied_bytes_est = out->occupied_bytes_est;
     }
     if ((out->s2mm_dmasr & 0x00004770u) != 0u ||
         (!rt->gopt.dry_run && (out->s2mm_dmasr & 1u) != 0u)) {
@@ -2449,6 +2468,7 @@ static void storage_stats_print_periodic(StorageProducerStats *stats,
         memset(&bd_snapshot, 0, sizeof(bd_snapshot));
     }
     pthread_mutex_unlock(&q->lock);
+    storage_stats_observe_bd_snapshot(stats, &bd_snapshot);
     nvme_bytes = __atomic_load_n(&rt->nvme_write_bytes_done, __ATOMIC_ACQUIRE);
     nvme_cmd_count = __atomic_load_n(&rt->nvme_cmd_count, __ATOMIC_ACQUIRE);
     nvme_cq_completed = __atomic_load_n(&rt->nvme_cq_completed, __ATOMIC_ACQUIRE);
@@ -4442,6 +4462,8 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                     (void)dma_get_bd_snapshot_o1(&rt, &write_queue.slots.counts,
                                                   &first_snapshot);
                     pthread_mutex_unlock(&write_queue.lock);
+                    storage_stats_observe_bd_snapshot(&producer_stats,
+                                                      &first_snapshot);
                     storage_record_error(&producer_stats, STORAGE_ERR_DMA_DESCRIPTOR,
                                          "first_dma_timeout");
                     storage_emit_line(STORAGE_LOG_ALWAYS_CRITICAL, "storage_first_dma_timeout channel=%d reason=first_dma_timeout"
@@ -4474,6 +4496,8 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                         storage_stop_state_fail(&stop_state);
                         goto out;
                     }
+                    storage_stats_observe_bd_snapshot(&producer_stats,
+                                                      &stop_snapshot);
                     if (storage_stop_harvest_observe(
                             &stop_harvest_state, dma_quiesced, 0u,
                             stop_snapshot.completed_unharvested,
@@ -5070,6 +5094,10 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
         StorageDrainInvariant drain_invariant;
         StorageDrainStableState drain_stable_state;
         bool drain_invariant_ok;
+        char capture_rate[32];
+        char nvme_active_rate[32];
+        char nvme_wall_rate[32];
+        char task_wall_rate[32];
         snprintf(expected_name, sizeof(expected_name),
                  "SRC_REAL_EXPECTED_BYTES_CH%d", cfg->id);
         expected_available = storage_env_u64(expected_name, &expected_bytes) != 0;
@@ -5331,21 +5359,28 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                           integrity_ok ? 1u : 0u,
                           integrity_risk,
                           producer_stats.ring_full_count);
+        storage_format_rate(capture_rate, sizeof(capture_rate),
+                            dma_observed_bytes, dma_observed_us);
+        storage_format_rate(nvme_active_rate, sizeof(nvme_active_rate),
+                            nvme_payload_bytes_done, nvme_write_us);
+        storage_format_rate(nvme_wall_rate, sizeof(nvme_wall_rate),
+                            nvme_payload_bytes_done, nvme_wall_us);
+        storage_format_rate(task_wall_rate, sizeof(task_wall_rate),
+                            nvme_payload_bytes_done, elapsed_us);
         storage_emit_line(STORAGE_LOG_SUMMARY, "storage_result_perf channel=%d task=%s file_index=%u elapsed_ms=%" PRIu64
-                          " nvme_active_ms=%" PRIu64 " nvme_active_mib_s=%.3f"
-                          " nvme_wall_ms=%" PRIu64 " nvme_wall_mib_s=%.3f"
-                          " dma_observed_mib_s=%.3f nvme_qd_effective=%u"
+                          " capture_window_mib_s=%s"
+                          " nvme_active_ms=%" PRIu64 " nvme_active_mib_s=%s"
+                          " nvme_wall_ms=%" PRIu64 " nvme_wall_mib_s=%s"
+                          " task_wall_mib_s=%s nvme_qd_effective=%u"
                           " nvme_active_qd_avg=%.3f nvme_active_qd_max=%u",
                           cfg->id, args->task_no, (unsigned)effective_file_index,
                           elapsed_us / 1000u,
+                          capture_rate,
                           nvme_write_us / 1000u,
-                          nvme_write_us > 0u ? ((double)nvme_write_bytes_done * 1000000.0 /
-                                                   (double)nvme_write_us / 1048576.0) : 0.0,
+                          nvme_active_rate,
                           nvme_wall_us / 1000u,
-                          nvme_wall_us > 0u ? ((double)nvme_write_bytes_done * 1000000.0 /
-                                                 (double)nvme_wall_us / 1048576.0) : 0.0,
-                          dma_observed_us > 0u ? ((double)dma_received_bytes * 1000000.0 /
-                                                   (double)dma_observed_us / 1048576.0) : 0.0,
+                          nvme_wall_rate,
+                          task_wall_rate,
                           (unsigned)rt.nvme_qd_effective,
                           rt.nvme_active_qd_observed_us > 0u
                               ? (double)rt.nvme_active_qd_integral_us /
@@ -5569,6 +5604,8 @@ out:
                                                "slot_ownership_invariant_failed");
                         break;
                     }
+                    storage_stats_observe_bd_snapshot(&producer_stats,
+                                                      &stop_snapshot);
                     if (storage_stop_harvest_observe(
                             &cleanup_harvest_state, true, 0u,
                             stop_snapshot.completed_unharvested,
@@ -5951,18 +5988,37 @@ out:
                                                  : (dma_stop_failed ? "dma_stop_recovery_failed"
                                                                     : "storage_error")),
                           producer_stats.ring_full_count);
-        storage_emit_line(STORAGE_LOG_SUMMARY, "storage_result_perf channel=%d task=%s file_index=%u elapsed_ms=%" PRIu64
-                          " nvme_active_ms=%" PRIu64 " nvme_active_mib_s=%.3f"
-                          " nvme_wall_ms=0 nvme_wall_mib_s=0.000 dma_observed_mib_s=0.000"
-                          " nvme_qd_effective=%u nvme_active_qd_avg=0.000 nvme_active_qd_max=%u",
-                          cfg ? cfg->id : args->channel_id,
-                          args->task_no, (unsigned)effective_file_index,
-                          elapsed_us / 1000u,
-                          nvme_write_us / 1000u,
-                          nvme_write_us > 0u ? ((double)bytes_written * 1000000.0 /
-                                                   (double)nvme_write_us / 1048576.0) : 0.0,
-                          (unsigned)rt.nvme_qd_effective,
-                          (unsigned)__atomic_load_n(&rt.nvme_active_qd_max, __ATOMIC_ACQUIRE));
+        {
+            uint64_t observed_us = producer_stats.last_dma_desc_us >=
+                                       producer_stats.first_dma_desc_us
+                                       ? producer_stats.last_dma_desc_us -
+                                             producer_stats.first_dma_desc_us
+                                       : 0u;
+            char capture_rate[32];
+            char nvme_active_rate[32];
+            char task_wall_rate[32];
+
+            storage_format_rate(capture_rate, sizeof(capture_rate),
+                                dma_observed_bytes, observed_us);
+            storage_format_rate(nvme_active_rate, sizeof(nvme_active_rate),
+                                bytes_written, nvme_write_us);
+            storage_format_rate(task_wall_rate, sizeof(task_wall_rate),
+                                bytes_written, elapsed_us);
+            storage_emit_line(STORAGE_LOG_SUMMARY,
+                              "storage_result_perf channel=%d task=%s file_index=%u elapsed_ms=%" PRIu64
+                              " capture_window_mib_s=%s"
+                              " nvme_active_ms=%" PRIu64 " nvme_active_mib_s=%s"
+                              " nvme_wall_ms=0 nvme_wall_mib_s=N/A"
+                              " task_wall_mib_s=%s nvme_qd_effective=%u"
+                              " nvme_active_qd_avg=0.000 nvme_active_qd_max=%u",
+                              cfg ? cfg->id : args->channel_id,
+                              args->task_no, (unsigned)effective_file_index,
+                              elapsed_us / 1000u, capture_rate,
+                              nvme_write_us / 1000u, nvme_active_rate,
+                              task_wall_rate, (unsigned)rt.nvme_qd_effective,
+                              (unsigned)__atomic_load_n(
+                                  &rt.nvme_active_qd_max, __ATOMIC_ACQUIRE));
+        }
         storage_emit_line(STORAGE_LOG_DEBUG, "storage_result_diag channel=%d task=%s file_index=%u"
                           " ready_q_max=0 ready_q_avg=0"
                           " max_ddr_busy_slots=%u max_ddr_buffered_bytes=%" PRIu64
