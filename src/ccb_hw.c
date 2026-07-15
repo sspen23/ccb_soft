@@ -570,6 +570,9 @@ static uint32_t parse_nvme_feed_mode(ChannelRuntime *rt) {
 }
 
 static void nvme_configure_runtime(ChannelRuntime *rt) {
+    const ChannelStorageConfig *profile = rt && rt->cfg
+        ? storage_config_channel(storage_config_get(), (uint32_t)rt->cfg->id)
+        : NULL;
     uint32_t requested_kib = parse_nvme_cmd_kib(rt);
     uint64_t requested_bytes = (uint64_t)requested_kib * 1024ull;
     uint64_t safe_limit = (uint64_t)NVME_CMD_KIB_MAX * 1024ull;
@@ -615,7 +618,7 @@ static void nvme_configure_runtime(ChannelRuntime *rt) {
     rt->nvme_feed_mode = parse_nvme_feed_mode(rt);
     rt->nvme_cq_pop_batch = parse_channel_u32_env(rt,
                                                   "SRC_REAL_NVME_CQ_POP_BATCH",
-                                                  1u,
+                                                  profile ? profile->cq_batch : 1u,
                                                   NVME_QD_SAFETY_MAX);
     if (rt->nvme_cq_pop_batch == 0u) {
         rt->nvme_cq_pop_batch = 1u;
@@ -624,7 +627,8 @@ static void nvme_configure_runtime(ChannelRuntime *rt) {
     rt->nvme_skip_const_ctx = hw_env_flag_enabled("SRC_REAL_NVME_SKIP_CONST_CTX") != 0;
     rt->nvme_busy_poll_us = parse_channel_u32_env(rt,
                                                   "SRC_REAL_NVME_BUSY_POLL_US",
-                                                  NVME_BUSY_POLL_US_DEFAULT,
+                                                  profile ? profile->busy_poll_us
+                                                          : NVME_BUSY_POLL_US_DEFAULT,
                                                   1000000u);
     rt->nvme_poll_sleep_us = parse_channel_u32_env(rt,
                                                    "SRC_REAL_NVME_POLL_SLEEP_US",

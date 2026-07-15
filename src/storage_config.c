@@ -250,16 +250,31 @@ static void set_channel_profile(AppConfig *config)
         storage->producer_priority = 0u;
         storage->nominal_input_mib_s = channel == LOW_SPEED_CHANNEL_ID
                                           ? 80u : 1200u;
-        storage->scheduler_weight = channel == LOW_SPEED_CHANNEL_ID
-                                        ? 1u : 15u;
-        storage->writer_nice = channel == LOW_SPEED_CHANNEL_ID ? 6 : -6;
-        storage->producer_nice = storage->writer_nice;
-        storage->writer_budget_us = !safe && channel != LOW_SPEED_CHANNEL_ID
-                                        ? 1000u : 300u;
-        storage->busy_poll_us = !safe && channel != LOW_SPEED_CHANNEL_ID
-                                    ? 100u : 20u;
-        storage->empty_sleep_us = !safe && channel != LOW_SPEED_CHANNEL_ID
-                                      ? 0u : 1u;
+        storage->producer_scheduler_weight = channel == LOW_SPEED_CHANNEL_ID
+                                                 ? 1u : 15u;
+        storage->writer_scheduler_weight = storage->producer_scheduler_weight;
+        storage->producer_nice = channel == LOW_SPEED_CHANNEL_ID ? 6 : -6;
+        storage->writer_nice = storage->producer_nice;
+        if (safe) {
+            storage->writer_budget_us = 300u;
+            storage->busy_poll_us = 20u;
+            storage->empty_sleep_us = 1u;
+        } else if (channel == LOW_SPEED_CHANNEL_ID) {
+            /* The producer follows the 1200:80 ingress ratio.  The legacy
+             * writer needs a larger service floor so its QD8 queue is not
+             * starved by the two cross-slot writers. */
+            storage->writer_scheduler_weight = 3u;
+            storage->producer_scheduler_weight = 1u;
+            storage->writer_nice = 2;
+            storage->producer_nice = 6;
+            storage->writer_budget_us = 300u;
+            storage->busy_poll_us = 20u;
+            storage->empty_sleep_us = 1u;
+        } else {
+            storage->writer_budget_us = 1000u;
+            storage->busy_poll_us = 100u;
+            storage->empty_sleep_us = 0u;
+        }
     }
 }
 

@@ -127,13 +127,13 @@ RT priority = 0
 
 PERF_QD8的CFS配置：
 
-| 通道 | nominal输入 | logical weight | writer nice | producer nice |
-|---|---:|---:|---:|---:|
-| ch0 | 1200 MiB/s | 15 | -6 | -6 |
-| ch1 | 1200 MiB/s | 15 | -6 | -6 |
-| ch2 | 80 MiB/s | 1 | 6 | 6 |
+| 通道 | nominal输入 | writer weight | producer weight | writer nice | producer nice |
+|---|---:|---:|---:|---:|---:|
+| ch0 | 1200 MiB/s | 15 | 15 | -6 | -6 |
+| ch1 | 1200 MiB/s | 15 | 15 | -6 | -6 |
+| ch2 | 80 MiB/s | 3 | 1 | 2 | 6 |
 
-ch0/ch1的producer优先获得CPU以快速回收BD，writer获得较高CPU预算以保持NVMe SQ接近QD=8；ch2降低CPU占用。调度只能延迟DDR耗尽，不能解决输入总速率长期大于SSD写入速率的问题。
+producer权重按输入速率保护DMA收割；writer独立分配权重，给ch2 legacy writer保留最低写盘份额，同时让ch0/ch1继续保持NVMe SQ接近QD=8。调度只能延迟DDR耗尽，不能解决输入总速率长期大于SSD写入速率的问题。
 
 ## 8. INPUT_COMPLETE和STORAGE_DRAINED
 

@@ -46,7 +46,8 @@ static void test_perf_profile_defaults(void)
     assert(!config.channels[0].producer_realtime);
     assert(config.channels[0].producer_priority == 0u);
     assert(config.channels[0].nominal_input_mib_s == 1200u);
-    assert(config.channels[0].scheduler_weight == 15u);
+    assert(config.channels[0].writer_scheduler_weight == 15u);
+    assert(config.channels[0].producer_scheduler_weight == 15u);
     assert(config.channels[0].writer_nice == -6);
     assert(config.channels[0].producer_nice == -6);
     assert(config.channels[0].writer_budget_us == 1000u);
@@ -56,8 +57,9 @@ static void test_perf_profile_defaults(void)
     assert(config.channels[2].nvme_qd == 8u);
     assert(config.channels[2].descriptor_bytes == 16u * 1024u * 1024u);
     assert(config.channels[2].nominal_input_mib_s == 80u);
-    assert(config.channels[2].scheduler_weight == 1u);
-    assert(config.channels[2].writer_nice == 6);
+    assert(config.channels[2].writer_scheduler_weight == 3u);
+    assert(config.channels[2].producer_scheduler_weight == 1u);
+    assert(config.channels[2].writer_nice == 2);
     assert(config.channels[2].producer_nice == 6);
 }
 
@@ -91,6 +93,10 @@ static void test_safe_profile_and_primary_values(void)
     assert(config.channels[0].writer_priority == 0u);
     assert(!config.channels[0].producer_realtime);
     assert(config.channels[0].producer_priority == 0u);
+    assert(config.channels[0].writer_scheduler_weight == 15u);
+    assert(config.channels[0].producer_scheduler_weight == 15u);
+    assert(config.channels[0].writer_nice == -6);
+    assert(config.channels[0].producer_nice == -6);
     assert(config.channels[0].writer_budget_us == 300u);
     assert(config.channels[0].busy_poll_us == 20u);
     assert(config.channels[0].empty_sleep_us == 1u);

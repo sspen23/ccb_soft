@@ -100,6 +100,15 @@ int main(void)
     assert(dma_get_bd_snapshot(&rt, state, &snapshot) == 0);
     assert(snapshot.dma_writable == 3u && snapshot.completed_unharvested == 1u);
 
+    /* A completed descriptor rejected by the harvester is software-owned.
+     * FREE keeps its stale status word out of the unharvested count until the
+     * final DMA reset clears the hardware ring. */
+    state[1] = STORAGE_SLOT_FREE;
+    assert(dma_get_bd_snapshot(&rt, state, &snapshot) == 0);
+    assert(snapshot.dma_writable == 3u && snapshot.free_slots == 1u &&
+           snapshot.completed_unharvested == 0u);
+    state[1] = STORAGE_SLOT_DMA_WRITABLE;
+
     desc[0].status = desc[2].status = desc[3].status = TEST_DESC_CMPLT | 1024u;
     assert(dma_get_bd_snapshot(&rt, state, &snapshot) == 0);
     assert(snapshot.dma_writable == 0u && snapshot.completed_unharvested == 4u);

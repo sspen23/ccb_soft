@@ -1389,7 +1389,8 @@ static void storage_apply_cfs_nice(const ChannelRuntime *rt, bool writer)
         " scheduler_weight=%u requested_nice=%d effective_nice=%d",
         rt->cfg->id, role,
         profile ? profile->nominal_input_mib_s : 0u,
-        profile ? profile->scheduler_weight : 1u,
+        profile ? (writer ? profile->writer_scheduler_weight
+                          : profile->producer_scheduler_weight) : 1u,
         requested_nice, effective_nice);
 }
 
@@ -1806,9 +1807,9 @@ static void storage_mark_harvest_slot_failed(StorageWriteQueue *q, uint32_t slot
     pthread_mutex_unlock(&q->lock);
 }
 
-/* A completed STOP tail is software-owned after harvest.  When it cannot be
- * padded safely it must not enter NVMe, but it also must not remain counted as
- * hardware-writable or be requeued after the STOP latch. */
+/* A rejected completed descriptor is software-owned after harvest.  It must
+ * not enter NVMe or return to DMA, but it can be released from the local
+ * ownership ledger without aborting earlier writes. */
 static int storage_release_harvested_slot(StorageWriteQueue *q, uint32_t slot)
 {
     int rc;
@@ -4106,7 +4107,8 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                       " hw_ddr_span_bytes=%" PRIu64 " dma_bd_count=%u"
                       " qd=%u cmd_size=%u log_level=%u writer_rt_policy=%s writer_rt_prio=%u"
                       " producer_rt_policy=%s producer_rt_prio=%u"
-                      " nominal_input_mib_s=%u scheduler_weight=%u"
+                      " nominal_input_mib_s=%u writer_scheduler_weight=%u"
+                      " producer_scheduler_weight=%u"
                       " writer_nice=%d producer_nice=%d"
                       " cross_slot_enabled=%u max_active_slots=%u target_qd=%u cq_batch=%u"
                       " writer_budget_us=%u busy_poll_us=%u empty_sleep_us=%u"
@@ -4142,7 +4144,8 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                           storage_profile_rt_policy(&rt, false))),
                       (unsigned)storage_producer_rt_prio(&rt),
                       storage_profile ? storage_profile->nominal_input_mib_s : 0u,
-                      storage_profile ? storage_profile->scheduler_weight : 1u,
+                      storage_profile ? storage_profile->writer_scheduler_weight : 1u,
+                      storage_profile ? storage_profile->producer_scheduler_weight : 1u,
                       storage_profile ? storage_profile->writer_nice : 0,
                       storage_profile ? storage_profile->producer_nice : 0,
                       cross_slot_qd ? 1u : 0u,
@@ -4919,7 +4922,11 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                             observed_bytes, rt.dma_desc_bytes,
                             harvest_items[i].submission_sequence);
                         storage_record_failure(&producer_stats, "invalid_dma_harvest_bytes");
-                        storage_mark_harvest_slot_failed(&write_queue, harvest_items[i].slot);
+                        if (storage_release_harvested_slot(
+                                &write_queue, harvest_items[i].slot) != 0) {
+                            storage_mark_harvest_slot_failed(
+                                &write_queue, harvest_items[i].slot);
+                        }
                         storage_ring_event(&write_queue.producer_event_ring,
                                            STORAGE_EVENT_DESCRIPTOR_ERROR, &rt,
                                            observed_bytes, rt.dma_desc_bytes, true);
@@ -5866,8 +5873,7 @@ out:
                         uint64_t remaining = bounded && base_offset + batch_bytes < requested_size
                                                  ? requested_size - (base_offset + batch_bytes)
                                                  : (bounded ? 0u : bytes);
-                        if (bytes == 0u || bytes > rt.dma_desc_bytes ||
-                            (bounded && remaining == 0u)) {
+                        if (bytes == 0u || bytes > rt.dma_desc_bytes) {
                             storage_emit_line(
                                 STORAGE_LOG_ALWAYS_CRITICAL,
                                 "storage_invalid_dma_harvest channel=%d task=%s"
@@ -5878,7 +5884,18 @@ out:
                                 stopped_items[i].descriptor_status,
                                 bytes, rt.dma_desc_bytes,
                                 stopped_items[i].submission_sequence);
-                            storage_mark_harvest_slot_failed(&write_queue, stopped_items[i].slot);
+                            if (storage_release_harvested_slot(
+                                    &write_queue, stopped_items[i].slot) != 0) {
+                                storage_mark_harvest_slot_failed(
+                                    &write_queue, stopped_items[i].slot);
+                            }
+                            storage_record_failure(&producer_stats,
+                                                   "fatal_stop_unqueued_dma_data");
+                            continue;
+                        }
+                        if (bounded && remaining == 0u) {
+                            storage_mark_harvest_slot_failed(
+                                &write_queue, stopped_items[i].slot);
                             storage_record_failure(&producer_stats,
                                                    "fatal_stop_unqueued_dma_data");
                             continue;
@@ -6084,15 +6101,7 @@ out:
         }
         storage_maybe_dump_event_rings(&write_queue, &rt,
                                        rc != 0 || write_queue.error, manual_stop_seen);
-        if (write_queue.nvme_engine_quiesced &&
-            (!dma_started || dma_quiesced || dma_stop_result == DMA_STOP_RESET_RECOVERED)) {
-            storage_queue_destroy(&write_queue);
-            write_queue_ready = false;
-        }
-    }
-    if (rc != 0) {
-        if (!data_persisted && write_queue_ready && bytes_written != 0u) {
-            StorageQueueSnapshot persisted_snapshot;
+        if (rc != 0 && !data_persisted && bytes_written != 0u) {
             uint64_t submitted = __atomic_load_n(&rt.nvme_cmd_count,
                                                   __ATOMIC_ACQUIRE);
             uint64_t completed = __atomic_load_n(&rt.nvme_cq_completed,
@@ -6100,19 +6109,24 @@ out:
             uint64_t nvme_bytes = __atomic_load_n(&rt.nvme_payload_bytes_done,
                                                    __ATOMIC_ACQUIRE);
 
-            storage_queue_snapshot(&write_queue, &persisted_snapshot);
             if (write_queue.nvme_engine_quiesced &&
-                persisted_snapshot.ready_depth_current == 0u &&
-                persisted_snapshot.nvme_busy_slots == 0u &&
-                persisted_snapshot.completed_unharvested_slots == 0u &&
-                persisted_snapshot.buffered_bytes == 0u &&
+                final_queue_snapshot.ready_depth_current == 0u &&
+                final_queue_snapshot.nvme_busy_slots == 0u &&
+                final_queue_snapshot.completed_unharvested_slots == 0u &&
+                final_queue_snapshot.buffered_bytes == 0u &&
                 submitted == completed && nvme_bytes == bytes_written) {
-                /* The capture is incomplete, but every accepted payload byte
-                 * is safely on NVMe.  Preserve it for the supervisor's
-                 * partial file-list commit. */
+                /* The task is incomplete, but every accepted payload byte is
+                 * on NVMe and no DDR ownership remains. */
                 data_persisted = true;
             }
         }
+        if (write_queue.nvme_engine_quiesced &&
+            (!dma_started || dma_quiesced || dma_stop_result == DMA_STOP_RESET_RECOVERED)) {
+            storage_queue_destroy(&write_queue);
+            write_queue_ready = false;
+        }
+    }
+    if (rc != 0) {
         if (final_us == 0u) final_us = storage_wall_time_us();
         if (result) {
             result->channel_id = cfg ? cfg->id : args->channel_id;

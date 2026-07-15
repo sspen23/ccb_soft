@@ -5289,7 +5289,7 @@ int main(int argc, char **argv)
         for (channel = 0u; channel < NUM_CHANNELS; ++channel) {
             const ChannelStorageConfig *storage = &config->channels[channel];
             LOG_INFO("SYSTEM",
-                     "Storage channel config: ch=%u pipeline_mode=%s writer_mode=%s legacy_fallback_enabled=0 ring=%" PRIu64 " descriptor=%u command=%u qd=%u active=%u cq_batch=%u writer_policy=%s writer_priority=%u producer_policy=%s producer_priority=%u nominal_input_mib_s=%u scheduler_weight=%u writer_nice=%d producer_nice=%d writer_budget_us=%u busy_poll_us=%u empty_sleep_us=%u",
+                     "Storage channel config: ch=%u pipeline_mode=%s writer_mode=%s legacy_fallback_enabled=0 ring=%" PRIu64 " descriptor=%u command=%u qd=%u active=%u cq_batch=%u writer_policy=%s writer_priority=%u producer_policy=%s producer_priority=%u nominal_input_mib_s=%u writer_scheduler_weight=%u producer_scheduler_weight=%u writer_nice=%d producer_nice=%d writer_budget_us=%u busy_poll_us=%u empty_sleep_us=%u",
                      storage->channel,
                      storage->writer_mode == STORAGE_WRITER_CROSS_SLOT
                          ? "cross_slot" : "legacy",
@@ -5306,7 +5306,8 @@ int main(int argc, char **argv)
                      storage->producer_realtime ? "rr" : "other",
                      storage->producer_priority,
                      storage->nominal_input_mib_s,
-                     storage->scheduler_weight,
+                     storage->writer_scheduler_weight,
+                     storage->producer_scheduler_weight,
                      storage->writer_nice,
                      storage->producer_nice,
                      storage->writer_budget_us,
