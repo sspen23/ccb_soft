@@ -38,6 +38,22 @@ typedef struct {
 } StorageStopHarvestState;
 
 typedef enum {
+    STORAGE_INPUT_IDLE_NO_CHANGE = 0,
+    STORAGE_INPUT_IDLE_CANDIDATE,
+    STORAGE_INPUT_ACTIVE
+} StorageInputIdleEvent;
+
+typedef struct {
+    bool first_data_seen;
+    bool candidate;
+    uint64_t last_dma_activity_us;
+    uint64_t dma_observed_bytes;
+    uint64_t completed_descriptor_count;
+    uint64_t idle_since_us;
+    uint32_t idle_scan_count;
+} StorageInputIdleState;
+
+typedef enum {
     STORAGE_STOP_TAIL_QUEUE = 0,
     STORAGE_STOP_TAIL_DEFER_UNALIGNED,
     STORAGE_STOP_TAIL_DEFER_LATE
@@ -56,6 +72,16 @@ bool storage_stop_boundary_should_quiesce(const StorageStopState *state,
                                           bool rx_packet_open,
                                           uint64_t now_us);
 void storage_stop_harvest_state_init(StorageStopHarvestState *state);
+void storage_input_idle_init(StorageInputIdleState *state);
+StorageInputIdleEvent storage_input_idle_observe(
+    StorageInputIdleState *state,
+    uint64_t now_us,
+    uint64_t dma_observed_bytes,
+    uint64_t completed_descriptor_count,
+    bool rx_packet_open,
+    bool dma_error,
+    uint64_t required_idle_us,
+    uint32_t required_scans);
 bool storage_stop_harvest_observe(StorageStopHarvestState *state,
                                   bool dma_quiesced,
                                   uint32_t harvested_count,

@@ -162,6 +162,39 @@ static void test_ring_pressure_policy_is_bounded(void)
                                               100000u, false));
 }
 
+static void test_input_idle_candidate_and_reactivation(void)
+{
+    StorageInputIdleState idle;
+    uint32_t scan;
+
+    storage_input_idle_init(&idle);
+    for (scan = 0u; scan < 10u; ++scan) {
+        assert(storage_input_idle_observe(&idle, scan * 100000u, 0u, 0u,
+                                          false, false, 500000u, 5u) ==
+               STORAGE_INPUT_IDLE_NO_CHANGE);
+    }
+    assert(!idle.first_data_seen && !idle.candidate);
+
+    assert(storage_input_idle_observe(&idle, 1000000u, 4096u, 1u,
+                                      false, false, 500000u, 5u) ==
+           STORAGE_INPUT_IDLE_NO_CHANGE);
+    for (scan = 1u; scan < 5u; ++scan) {
+        assert(storage_input_idle_observe(&idle,
+                                          1500000u + scan * 100000u,
+                                          4096u, 1u, false, false,
+                                          500000u, 5u) ==
+               STORAGE_INPUT_IDLE_NO_CHANGE);
+    }
+    assert(storage_input_idle_observe(&idle, 1900000u, 4096u, 1u,
+                                      false, false, 500000u, 5u) ==
+           STORAGE_INPUT_IDLE_CANDIDATE);
+    assert(idle.candidate);
+    assert(storage_input_idle_observe(&idle, 2000000u, 8192u, 2u,
+                                      false, false, 500000u, 5u) ==
+           STORAGE_INPUT_ACTIVE);
+    assert(!idle.candidate && idle.idle_scan_count == 0u);
+}
+
 int main(void)
 {
     test_stable_empty_requires_repeated_observation();
@@ -169,6 +202,7 @@ int main(void)
     test_unaligned_tail_does_not_abort_full_prefix();
     test_stop_is_idempotent_and_inflight_blocks_finish();
     test_ring_pressure_policy_is_bounded();
+    test_input_idle_candidate_and_reactivation();
     puts("mock_storage_stop_lifecycle_test: ok");
     return 0;
 }

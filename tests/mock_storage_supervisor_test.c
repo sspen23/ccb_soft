@@ -365,6 +365,38 @@ static void test_multichannel_stop_epoch_and_deferred_isolation(void)
     assert(s.primary_error == STORAGE_ERR_IPC_SEQUENCE);
 }
 
+static void test_multichannel_input_idle_coordination(void)
+{
+    StorageTaskSupervisor s;
+    StorageWorkerEvent value;
+    uint32_t channel;
+
+    storage_supervisor_init(&s, 7u);
+    for (channel = 0u; channel < 3u; ++channel)
+        advance_to_running(&s, channel);
+
+    value = event(STORAGE_WORKER_INPUT_IDLE_CANDIDATE, 2u);
+    assert(storage_supervisor_handle_event(&s, &value) == 0);
+    assert(!storage_supervisor_auto_drain_ready(&s));
+    value = event(STORAGE_WORKER_INPUT_IDLE_CANDIDATE, 0u);
+    assert(storage_supervisor_handle_event(&s, &value) == 0);
+    assert(!storage_supervisor_auto_drain_ready(&s));
+    value = event(STORAGE_WORKER_INPUT_ACTIVE, 2u);
+    assert(storage_supervisor_handle_event(&s, &value) == 0);
+    assert(!storage_supervisor_auto_drain_ready(&s));
+    value = event(STORAGE_WORKER_INPUT_IDLE_CANDIDATE, 2u);
+    assert(storage_supervisor_handle_event(&s, &value) == 0);
+    value = event(STORAGE_WORKER_INPUT_IDLE_CANDIDATE, 1u);
+    assert(storage_supervisor_handle_event(&s, &value) == 0);
+    assert(storage_supervisor_auto_drain_ready(&s));
+    assert(storage_supervisor_begin_auto_drain(&s, 123u));
+    assert(s.auto_drain_epoch == 123u);
+    assert(!storage_supervisor_begin_auto_drain(&s, 124u));
+    value = event(STORAGE_WORKER_INPUT_IDLE_CANDIDATE, 1u);
+    assert(storage_supervisor_handle_event(&s, &value) == 0);
+    assert(s.auto_drain_epoch == 123u);
+}
+
 int main(void)
 {
     test_worker_exit_without_final();
@@ -378,6 +410,7 @@ int main(void)
     test_one_channel_failure_rejects_aggregate();
     test_payload_media_accounting();
     test_multichannel_stop_epoch_and_deferred_isolation();
+    test_multichannel_input_idle_coordination();
     puts("mock_storage_supervisor_test: ok");
     return 0;
 }

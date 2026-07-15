@@ -193,6 +193,8 @@ void storage_ipc_make_event(StorageWorkerEvent *event, StorageWorkerEventType ty
     case STORAGE_WORKER_ARMED:
     case STORAGE_WORKER_RUNNING:
     case STORAGE_WORKER_DRAINED:
+    case STORAGE_WORKER_INPUT_IDLE_CANDIDATE:
+    case STORAGE_WORKER_INPUT_ACTIVE:
         ready = &event->payload.ready;
         ready->received_bytes = received_bytes;
         if (reason) (void)snprintf(ready->reason, sizeof(ready->reason), "%s", reason);
@@ -234,6 +236,8 @@ uint32_t storage_ipc_event_payload_size(StorageWorkerEventType type)
     case STORAGE_WORKER_ARMED:
     case STORAGE_WORKER_RUNNING:
     case STORAGE_WORKER_DRAINED:
+    case STORAGE_WORKER_INPUT_IDLE_CANDIDATE:
+    case STORAGE_WORKER_INPUT_ACTIVE:
         return sizeof(WorkerReadyPayload);
     case STORAGE_WORKER_FATAL:
         return sizeof(WorkerFatalPayload);
@@ -263,7 +267,8 @@ int storage_ipc_validate_event(const StorageWorkerEvent *event)
 
     if (!event || event->magic != STORAGE_IPC_MAGIC ||
         event->version != STORAGE_IPC_VERSION || event->size != sizeof(*event) ||
-        event->type < STORAGE_WORKER_READY || event->type > STORAGE_WORKER_STOP_PHASE)
+        event->type < STORAGE_WORKER_READY ||
+        event->type > STORAGE_WORKER_INPUT_ACTIVE)
         return 0;
     expected_payload_size = storage_ipc_event_payload_size(
         (StorageWorkerEventType)event->type);

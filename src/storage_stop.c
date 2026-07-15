@@ -68,6 +68,60 @@ void storage_stop_harvest_state_init(StorageStopHarvestState *state)
     if (state) memset(state, 0, sizeof(*state));
 }
 
+void storage_input_idle_init(StorageInputIdleState *state)
+{
+    if (state) memset(state, 0, sizeof(*state));
+}
+
+StorageInputIdleEvent storage_input_idle_observe(
+    StorageInputIdleState *state,
+    uint64_t now_us,
+    uint64_t dma_observed_bytes,
+    uint64_t completed_descriptor_count,
+    bool rx_packet_open,
+    bool dma_error,
+    uint64_t required_idle_us,
+    uint32_t required_scans)
+{
+    bool activity;
+    bool was_candidate;
+
+    if (!state) return STORAGE_INPUT_IDLE_NO_CHANGE;
+    activity = dma_observed_bytes != state->dma_observed_bytes ||
+               completed_descriptor_count != state->completed_descriptor_count ||
+               rx_packet_open;
+    was_candidate = state->candidate;
+    if (dma_observed_bytes != 0u || completed_descriptor_count != 0u)
+        state->first_data_seen = true;
+    state->dma_observed_bytes = dma_observed_bytes;
+    state->completed_descriptor_count = completed_descriptor_count;
+
+    if (activity || dma_error || !state->first_data_seen) {
+        if (activity) state->last_dma_activity_us = now_us;
+        state->candidate = false;
+        state->idle_since_us = 0u;
+        state->idle_scan_count = 0u;
+        return was_candidate && activity ? STORAGE_INPUT_ACTIVE
+                                         : STORAGE_INPUT_IDLE_NO_CHANGE;
+    }
+    if (state->last_dma_activity_us == 0u)
+        state->last_dma_activity_us = now_us;
+    if (now_us < state->last_dma_activity_us ||
+        now_us - state->last_dma_activity_us < required_idle_us) {
+        state->idle_since_us = 0u;
+        state->idle_scan_count = 0u;
+        return STORAGE_INPUT_IDLE_NO_CHANGE;
+    }
+    if (required_scans == 0u) required_scans = 1u;
+    if (state->idle_scan_count == 0u) state->idle_since_us = now_us;
+    if (state->idle_scan_count != UINT32_MAX) ++state->idle_scan_count;
+    if (!state->candidate && state->idle_scan_count >= required_scans) {
+        state->candidate = true;
+        return STORAGE_INPUT_IDLE_CANDIDATE;
+    }
+    return STORAGE_INPUT_IDLE_NO_CHANGE;
+}
+
 bool storage_stop_harvest_observe(StorageStopHarvestState *state,
                                   bool dma_quiesced,
                                   uint32_t harvested_count,

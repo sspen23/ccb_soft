@@ -96,6 +96,24 @@ int storage_supervisor_handle_event(StorageTaskSupervisor *s, const StorageWorke
         }
         s->running_mask |= b;
         break;
+    case STORAGE_WORKER_INPUT_IDLE_CANDIDATE:
+        if ((s->running_mask & b) == 0u || (s->drained_mask & b) != 0u ||
+            (s->final_seen_mask & b) != 0u) {
+            fail(s, e->channel, STORAGE_ERR_IPC_SEQUENCE,
+                 "invalid_input_idle_sequence");
+            return -1;
+        }
+        s->idle_candidate_mask |= b;
+        break;
+    case STORAGE_WORKER_INPUT_ACTIVE:
+        if ((s->running_mask & b) == 0u || (s->drained_mask & b) != 0u ||
+            (s->final_seen_mask & b) != 0u || s->auto_drain_triggered) {
+            fail(s, e->channel, STORAGE_ERR_IPC_SEQUENCE,
+                 "invalid_input_active_sequence");
+            return -1;
+        }
+        s->idle_candidate_mask &= ~b;
+        break;
     case STORAGE_WORKER_DRAINED:
         if ((s->running_mask & b) == 0u || (s->drained_mask & b) != 0u ||
             (s->final_seen_mask & b) != 0u) {
@@ -208,6 +226,22 @@ int storage_supervisor_handle_worker_exit(StorageTaskSupervisor *s, uint32_t ch,
     return 0;
 }
 uint32_t storage_supervisor_stop_mask(const StorageTaskSupervisor *s) { return s ? s->stop_requested_mask : 0u; }
+bool storage_supervisor_auto_drain_ready(const StorageTaskSupervisor *s)
+{
+    return s && !s->auto_drain_triggered && s->target_channel_mask != 0u &&
+           (s->idle_candidate_mask & s->target_channel_mask) ==
+               s->target_channel_mask;
+}
+
+bool storage_supervisor_begin_auto_drain(StorageTaskSupervisor *s,
+                                         uint64_t drain_epoch)
+{
+    if (!storage_supervisor_auto_drain_ready(s) || drain_epoch == 0u)
+        return false;
+    s->auto_drain_triggered = true;
+    s->auto_drain_epoch = drain_epoch;
+    return true;
+}
 void storage_supervisor_request_stop(StorageTaskSupervisor *s, uint32_t channel_mask)
 {
     if (s) s->stop_requested_mask |= channel_mask & s->target_channel_mask;

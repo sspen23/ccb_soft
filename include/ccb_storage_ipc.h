@@ -7,7 +7,7 @@
 #include <stdatomic.h>
 
 #define STORAGE_IPC_MAGIC 0x53544732u
-#define STORAGE_IPC_VERSION 7u
+#define STORAGE_IPC_VERSION 8u
 
 typedef enum {
     STORAGE_CTRL_ARM = 1,
@@ -58,7 +58,9 @@ typedef enum {
     STORAGE_WORKER_FINAL_RESULT = 6,
     STORAGE_WORKER_PERF_SAMPLE = 7,
     STORAGE_WORKER_DIAG_EVENT = 8,
-    STORAGE_WORKER_STOP_PHASE = 9
+    STORAGE_WORKER_STOP_PHASE = 9,
+    STORAGE_WORKER_INPUT_IDLE_CANDIDATE = 10,
+    STORAGE_WORKER_INPUT_ACTIVE = 11
 } StorageWorkerEventType;
 
 typedef enum {
