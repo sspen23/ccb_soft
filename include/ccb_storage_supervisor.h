@@ -6,7 +6,7 @@
 typedef enum { STORAGE_TASK_ACTIVE = 0, STORAGE_TASK_SUCCESS, STORAGE_TASK_FAILED } StorageTaskTerminal;
 typedef struct {
     uint32_t target_channel_mask, ready_mask, armed_mask, running_mask, drained_mask, final_seen_mask;
-    uint32_t idle_candidate_mask;
+    uint32_t idle_candidate_mask, auto_drain_sent_mask;
     uint32_t fatal_seen_mask;
     uint32_t unavailable_mask, worker_exited_mask;
     uint32_t stop_requested_mask, stop_sent_mask, stop_failed_mask;
@@ -36,6 +36,10 @@ uint32_t storage_supervisor_stop_mask(const StorageTaskSupervisor *s);
 bool storage_supervisor_auto_drain_ready(const StorageTaskSupervisor *s);
 bool storage_supervisor_begin_auto_drain(StorageTaskSupervisor *s,
                                          uint64_t drain_epoch);
+uint32_t storage_supervisor_auto_drain_pending_mask(
+    const StorageTaskSupervisor *s);
+void storage_supervisor_mark_auto_drain_sent(StorageTaskSupervisor *s,
+                                             uint32_t channel);
 void storage_supervisor_request_stop(StorageTaskSupervisor *s, uint32_t channel_mask);
 uint32_t storage_supervisor_peek_stop_mask(const StorageTaskSupervisor *s);
 void storage_supervisor_mark_stop_sent(StorageTaskSupervisor *s, uint32_t channel);

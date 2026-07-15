@@ -180,6 +180,7 @@ static void drain_storage_events(Task *task, bool report_eof);
 static void poll_storage_events(Task *task);
 static void finalize_storage_task(Task *task, int exit_code);
 static void storage_try_send_pending_stops(void);
+static void storage_try_send_auto_drains(void);
 static void storage_finish_worker_exit(Task *task, int exit_code, int signal_number);
 static void storage_handle_worker_exit(Task *task, int status);
 static int storage_commit_supervised_results(const char *task_id);
@@ -449,7 +450,9 @@ static int request_storage_stop_all(void)
     uint32_t stop_mask = 0u;
 
     if (g_capture_task.stop_epoch == 0u) {
-        uint64_t stop_epoch = storage_ipc_monotonic_us();
+        uint64_t stop_epoch = g_storage_supervisor.auto_drain_epoch != 0u
+                                  ? g_storage_supervisor.auto_drain_epoch
+                                  : storage_ipc_monotonic_us();
         if (stop_epoch == 0u) stop_epoch = 1u;
         (void)capture_task_request_stop(&g_capture_task, stop_epoch);
     }
@@ -851,7 +854,11 @@ static int storage_send_control(Task *task, StorageControlType type, uint64_t ti
 
     if (!task || task->control_fd < 0) return -1;
     storage_ipc_make_control(&msg, type, timestamp_us);
-    if (type == STORAGE_CTRL_STOP) msg.stop_epoch = g_capture_task.stop_epoch;
+    if (type == STORAGE_CTRL_STOP) {
+        msg.stop_epoch = g_capture_task.stop_epoch;
+    } else if (type == STORAGE_CTRL_AUTO_DRAIN) {
+        msg.stop_epoch = g_storage_supervisor.auto_drain_epoch;
+    }
     return storage_ipc_write_control_deadline(task->control_fd, &msg,
                                               storage_ipc_monotonic_us() + send_slice_us);
 }
@@ -923,6 +930,29 @@ static void storage_try_send_pending_stops(void)
         } else if (task->stop_send_attempts >= STORAGE_STOP_MAX_SEND_ATTEMPTS) {
             storage_fallback_stop(task, (uint32_t)i, send_errno);
         }
+    }
+}
+
+static void storage_try_send_auto_drains(void)
+{
+    uint32_t pending = storage_supervisor_auto_drain_pending_mask(
+        &g_storage_supervisor);
+    size_t i;
+
+    for (i = 0u; i < STORAGE_TASK_COUNT; ++i) {
+        Task *task = &storage_tasks[i];
+
+        if ((pending & (1u << i)) == 0u || task->pid <= 0)
+            continue;
+        if (storage_send_control(task, STORAGE_CTRL_AUTO_DRAIN,
+                                 storage_ipc_monotonic_us()) != 0)
+            continue;
+        storage_supervisor_mark_auto_drain_sent(&g_storage_supervisor,
+                                                (uint32_t)i);
+        LOG_INFO("STORAGE",
+                 "AUTO_DRAIN sent: name=%s pid=%d task=%s drain_epoch=%" PRIu64,
+                 task->name, task->pid, task->task_id,
+                 g_storage_supervisor.auto_drain_epoch);
     }
 }
 
@@ -1799,6 +1829,21 @@ static void drain_storage_events(Task *task, bool report_eof)
             task->first_fatal = protocol_fatal;
             continue;
         }
+        if (storage_supervisor_auto_drain_ready(&g_storage_supervisor)) {
+            uint64_t drain_epoch = storage_ipc_monotonic_us();
+
+            if (drain_epoch == 0u) drain_epoch = 1u;
+            if (storage_supervisor_begin_auto_drain(&g_storage_supervisor,
+                                                    drain_epoch)) {
+                system_emit_line(
+                    STORAGE_LOG_SUMMARY,
+                    "storage_input_complete task=%s drain_epoch=%" PRIu64
+                    " target_mask=0x%02X",
+                    task->task_id, drain_epoch,
+                    g_storage_supervisor.target_channel_mask);
+                storage_try_send_auto_drains();
+            }
+        }
         if (event.type == STORAGE_WORKER_PERF_SAMPLE || event.type == STORAGE_WORKER_FATAL ||
             event.type == STORAGE_WORKER_FINAL_RESULT || event.type == STORAGE_WORKER_DIAG_EVENT) {
             (void)storage_perf_log_event(&event, task->task_id);
@@ -1840,6 +1885,7 @@ static void drain_storage_events(Task *task, bool report_eof)
             task->first_fatal = event;
         }
     }
+    storage_try_send_auto_drains();
     if (rc < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
         storage_supervisor_protocol_fail(&g_storage_supervisor, expected_channel,
                                          "event_read_integrity_failed");

@@ -44,6 +44,7 @@
 #define STORAGE_STOP_STABLE_EMPTY_SCANS 3u
 #define STORAGE_STOP_STABLE_EMPTY_US 100ull
 static volatile sig_atomic_t g_storage_stop_requested = 0;
+static bool g_storage_control_drain_latched = false;
 static bool g_storage_control_stop_latched = false;
 static uint64_t g_storage_stop_epoch;
 static _Atomic uint64_t g_storage_dropped_perf_samples;
@@ -695,16 +696,22 @@ static int storage_wait_start_gate(ChannelRuntime *rt, uint64_t *start_skew_us,
     return 0;
 }
 
-static bool storage_control_stop_requested(void)
+static bool storage_control_drain_requested(void)
 {
     StorageControlMessage msg;
     int fd = storage_env_fd(CCB_INTERNAL_STORAGE_CONTROL_FD);
-    if (g_storage_control_stop_latched) return true;
-    if (fd >= 0 && storage_ipc_read_control(fd, &msg) == 0 && msg.type == STORAGE_CTRL_STOP) {
-        g_storage_control_stop_latched = true;
-        g_storage_stop_epoch = msg.stop_epoch;
+    if (g_storage_control_drain_latched) return true;
+    if (fd >= 0 && storage_ipc_read_control(fd, &msg) == 0) {
+        if (msg.type == STORAGE_CTRL_AUTO_DRAIN) {
+            g_storage_control_drain_latched = true;
+            g_storage_stop_epoch = msg.stop_epoch;
+        } else if (msg.type == STORAGE_CTRL_STOP) {
+            g_storage_control_drain_latched = true;
+            g_storage_control_stop_latched = true;
+            g_storage_stop_epoch = msg.stop_epoch;
+        }
     }
-    return g_storage_control_stop_latched;
+    return g_storage_control_drain_latched;
 }
 
 static void storage_emit_line_impl(const char *fmt, ...)
@@ -3163,6 +3170,7 @@ static void *storage_nvme_cross_slot_writer_thread(void *arg) {
 
 void storage_write_reset_stop(void) {
     g_storage_stop_requested = 0;
+    g_storage_control_drain_latched = false;
     g_storage_control_stop_latched = false;
     g_storage_fatal_event_sent = false;
     g_storage_stop_epoch = 0u;
@@ -3504,6 +3512,7 @@ static int flush_slot_to_nvme(ChannelRuntime *rt,
 int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                                    WriteResult *result, StorageWriteMode mode) {
     const ChannelConfig *cfg = find_channel(args->channel_id);
+    const AppConfig *app_config = storage_config_get();
     ChannelRuntime rt;
     FileEntry table[MAX_FILES_TOTAL];
     int rc = -1;
@@ -3540,6 +3549,7 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
     DmaStopResult dma_stop_result = DMA_STOP_OK;
     StorageStopState stop_state;
     StorageStopHarvestState stop_harvest_state;
+    StorageInputIdleState input_idle_state;
     pthread_t writer_thread;
     bool write_queue_ready = false;
     bool writer_started = false;
@@ -3578,6 +3588,7 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
     uint32_t harvest_batch_max_cfg;
     uint32_t dma_idle_done_ms;
     uint64_t first_dma_timeout_us;
+    uint64_t next_input_idle_scan_us = 0u;
     uint32_t supervised_channel_count;
     StorageStopTimeouts stop_timeouts;
     int producer_rt_policy = SCHED_OTHER;
@@ -3586,6 +3597,7 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
     bool pipeline_threaded_mode;
     bool fast_pipeline_enabled;
     bool auto_idle_enabled;
+    bool coordinated_idle_enabled;
     bool require_nonempty_payload;
     uint64_t start_skew_us = 0u;
     const char *start_gate_mode = "standalone_immediate";
@@ -3593,6 +3605,7 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
     storage_write_reset_stop();
     storage_stop_state_init(&stop_state);
     storage_stop_harvest_state_init(&stop_harvest_state);
+    storage_input_idle_init(&input_idle_state);
     atomic_store_explicit(&g_storage_dropped_perf_samples, 0u, memory_order_relaxed);
     atomic_store_explicit(&g_storage_dropped_diag_events, 0u, memory_order_relaxed);
     memset(&producer_stats, 0, sizeof(producer_stats));
@@ -3613,7 +3626,10 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
 
     bounded = args->has_size;
     requested_size = bounded ? args->size_bytes : 0u;
-    dma_idle_done_ms = bounded ? 0u : storage_dma_idle_done_ms();
+    dma_idle_done_ms = bounded ? 0u
+                               : (app_config
+                                      ? app_config->idle_required_ms
+                                      : storage_dma_idle_done_ms());
     stop_timeouts = storage_stop_timeouts(NULL);
     first_dma_timeout_us = storage_first_dma_timeout_us(cfg);
     supervised_channel_count = mode == STORAGE_WRITE_SUPERVISED
@@ -3631,7 +3647,10 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
      * ch2 must not auto-complete and cascade a stop while ch0/ch1 are still
      * waiting for their first input.  The idle policy is retained only for a
      * standalone single-channel capture (and the bounded compatibility path). */
-    auto_idle_enabled = !bounded && supervised_channel_count <= 1u;
+    coordinated_idle_enabled = !bounded && mode == STORAGE_WRITE_SUPERVISED &&
+                               app_config && app_config->auto_input_complete;
+    auto_idle_enabled = !bounded && !coordinated_idle_enabled &&
+                        supervised_channel_count <= 1u;
     storage_poll_sleep_us = storage_channel_env_u32(cfg,
                                                     "PRODUCER_IDLE_SLEEP_US",
                                                     "SRC_REAL_STORAGE_POLL_SLEEP_US",
@@ -4001,11 +4020,18 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                       stop_timeouts.stop_harvest_us, stop_timeouts.writer_drain_us,
                       stop_timeouts.nvme_abort_us);
     storage_emit_line(STORAGE_LOG_SUMMARY, "storage_idle_policy channel=%d supervised_channel_count=%u"
-                      " auto_idle_enabled=%u idle_ms=%u reason=%s",
+                      " auto_idle_enabled=%u coordinated_idle_enabled=%u"
+                      " idle_scan_interval_ms=%u idle_required_ms=%u"
+                      " idle_required_scans=%u reason=%s",
                       cfg->id, (unsigned)supervised_channel_count,
                       auto_idle_enabled ? 1u : 0u,
-                      auto_idle_enabled ? (unsigned)dma_idle_done_ms : 0u,
-                      auto_idle_enabled ? "standalone_single_channel" : "supervised_barrier");
+                      coordinated_idle_enabled ? 1u : 0u,
+                      app_config ? app_config->idle_scan_interval_ms : 100u,
+                      app_config ? app_config->idle_required_ms : 500u,
+                      app_config ? app_config->idle_required_scans : 5u,
+                      coordinated_idle_enabled ? "supervised_barrier" :
+                          (auto_idle_enabled ? "standalone_single_channel"
+                                             : "disabled"));
     storage_emit_line(STORAGE_LOG_SUMMARY, "storage_zero_payload_policy channel=%d require_nonempty=%u first_dma_timeout_us=%" PRIu64
                       " allow_zero_env=%u",
                       cfg->id, require_nonempty_payload ? 1u : 0u,
@@ -4077,6 +4103,8 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
     }
     nvme_reset_sw_timing(&rt);
     capture_start_us = storage_wall_time_us();
+    next_input_idle_scan_us = capture_start_us +
+        (uint64_t)(app_config ? app_config->idle_scan_interval_ms : 100u) * 1000u;
     producer_stats.window_start_us = capture_start_us;
     producer_stats.next_log_us = capture_start_us +
                                  (uint64_t)producer_stats.interval_ms * 1000ull;
@@ -4121,10 +4149,15 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
             bool harvest_fatal;
             bool first_dma_deadline_due;
             int h;
+            bool control_drain_requested = storage_control_drain_requested();
             bool external_stop_requested = storage_write_stop_requested() != 0 ||
-                                           storage_control_stop_requested();
-            bool stop_requested = external_stop_requested || auto_idle_done ||
+                                           g_storage_control_stop_latched;
+            bool stop_requested = external_stop_requested ||
+                                  control_drain_requested || auto_idle_done ||
                                   (bounded && bytes_captured >= requested_size);
+
+            if (control_drain_requested && !g_storage_control_stop_latched)
+                auto_idle_done = true;
 
             first_dma_deadline_due = first_dma_deadline_us != 0u &&
                                      !saw_dma_data && !stop_requested &&
@@ -4466,6 +4499,58 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                                        STORAGE_ERR_DMA_DESCRIPTOR, dma_received_bytes,
                                        "dma_bd_exhausted");
                     goto out;
+                }
+                if (coordinated_idle_enabled && !stop_requested &&
+                    now_us >= next_input_idle_scan_us) {
+                    StorageInputIdleEvent idle_event = storage_input_idle_observe(
+                        &input_idle_state, now_us, dma_observed_bytes,
+                        producer_stats.dma_desc_completed_count,
+                        rt.dma_rx_packet_open,
+                        producer_stats.dma_error_count != 0u,
+                        (uint64_t)(app_config
+                                       ? app_config->idle_required_ms : 500u) *
+                            1000u,
+                        app_config ? app_config->idle_required_scans : 5u);
+                    next_input_idle_scan_us = now_us +
+                        (uint64_t)(app_config
+                                       ? app_config->idle_scan_interval_ms : 100u) *
+                            1000u;
+                    if (idle_event == STORAGE_INPUT_IDLE_CANDIDATE) {
+                        uint64_t idle_ms = now_us >= input_idle_state.last_dma_activity_us
+                                               ? (now_us - input_idle_state.last_dma_activity_us) /
+                                                     1000u
+                                               : 0u;
+                        storage_emit_line(
+                            STORAGE_LOG_SUMMARY,
+                            "storage_input_idle_candidate task=%s channel=%d"
+                            " idle_ms=%" PRIu64 " bytes=%" PRIu64,
+                            args->task_no, cfg->id, idle_ms,
+                            dma_observed_bytes);
+                        if (storage_emit_event(
+                                STORAGE_WORKER_INPUT_IDLE_CANDIDATE, &rt,
+                                STORAGE_ERR_NONE, dma_observed_bytes,
+                                "stable_input_idle") != 0) {
+                            storage_record_error(&producer_stats,
+                                                 STORAGE_ERR_IPC,
+                                                 "input_idle_event_send_failed");
+                            goto out;
+                        }
+                    } else if (idle_event == STORAGE_INPUT_ACTIVE) {
+                        storage_emit_line(
+                            STORAGE_LOG_SUMMARY,
+                            "storage_input_active task=%s channel=%d"
+                            " reason=new_dma_activity bytes=%" PRIu64,
+                            args->task_no, cfg->id, dma_observed_bytes);
+                        if (storage_emit_event(
+                                STORAGE_WORKER_INPUT_ACTIVE, &rt,
+                                STORAGE_ERR_NONE, dma_observed_bytes,
+                                "new_dma_activity") != 0) {
+                            storage_record_error(&producer_stats,
+                                                 STORAGE_ERR_IPC,
+                                                 "input_active_event_send_failed");
+                            goto out;
+                        }
+                    }
                 }
                 if (auto_idle_enabled && !stop_requested && dma_idle_done_ms > 0u &&
                     saw_dma_data && producer_stats.dma_desc_completed_count > 0u &&

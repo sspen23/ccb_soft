@@ -69,6 +69,12 @@ static void test_safe_profile_and_primary_values(void)
     assert(config.channels[0].nvme_qd == 1u);
     assert(config.channels[0].max_active_slots == 1u);
     assert(config.channels[2].nvme_qd == 1u);
+    assert(config.auto_input_complete);
+    assert(config.idle_scan_interval_ms == 100u);
+    assert(config.idle_required_ms == 500u);
+    assert(config.idle_required_scans == 5u);
+    assert(config.drain_stable_scans == 3u);
+    assert(config.drain_stable_us == 100u);
 }
 
 static void test_legacy_mapping_and_validation(void)

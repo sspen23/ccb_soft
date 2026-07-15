@@ -237,6 +237,12 @@ int storage_config_load(AppConfig *out, char *error, size_t error_size)
     }
     out->dump_diag_on_error = !text_is_false(read_primary_or_legacy(
         "CCB_DUMP_DIAG_ON_ERROR", "SRC_REAL_DUMP_EVENT_RING_ON_ERROR"));
+    out->auto_input_complete = true;
+    out->idle_scan_interval_ms = 100u;
+    out->idle_required_ms = 500u;
+    out->idle_required_scans = 5u;
+    out->drain_stable_scans = 3u;
+    out->drain_stable_us = 100u;
     set_channel_profile(out);
     return 0;
 }

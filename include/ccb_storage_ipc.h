@@ -12,7 +12,8 @@
 typedef enum {
     STORAGE_CTRL_ARM = 1,
     STORAGE_CTRL_RUN = 2,
-    STORAGE_CTRL_STOP = 3
+    STORAGE_CTRL_STOP = 3,
+    STORAGE_CTRL_AUTO_DRAIN = 4
 } StorageControlType;
 
 typedef struct {

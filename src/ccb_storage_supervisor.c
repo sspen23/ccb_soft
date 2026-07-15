@@ -242,6 +242,23 @@ bool storage_supervisor_begin_auto_drain(StorageTaskSupervisor *s,
     s->auto_drain_epoch = drain_epoch;
     return true;
 }
+
+uint32_t storage_supervisor_auto_drain_pending_mask(
+    const StorageTaskSupervisor *s)
+{
+    return s && s->auto_drain_triggered
+               ? s->target_channel_mask & ~s->auto_drain_sent_mask : 0u;
+}
+
+void storage_supervisor_mark_auto_drain_sent(StorageTaskSupervisor *s,
+                                             uint32_t channel)
+{
+    uint32_t b = bit(channel);
+
+    if (s && s->auto_drain_triggered &&
+        (s->target_channel_mask & b) != 0u)
+        s->auto_drain_sent_mask |= b;
+}
 void storage_supervisor_request_stop(StorageTaskSupervisor *s, uint32_t channel_mask)
 {
     if (s) s->stop_requested_mask |= channel_mask & s->target_channel_mask;

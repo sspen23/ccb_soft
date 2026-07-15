@@ -391,6 +391,11 @@ static void test_multichannel_input_idle_coordination(void)
     assert(storage_supervisor_auto_drain_ready(&s));
     assert(storage_supervisor_begin_auto_drain(&s, 123u));
     assert(s.auto_drain_epoch == 123u);
+    assert(storage_supervisor_auto_drain_pending_mask(&s) == 7u);
+    storage_supervisor_mark_auto_drain_sent(&s, 0u);
+    storage_supervisor_mark_auto_drain_sent(&s, 1u);
+    storage_supervisor_mark_auto_drain_sent(&s, 2u);
+    assert(storage_supervisor_auto_drain_pending_mask(&s) == 0u);
     assert(!storage_supervisor_begin_auto_drain(&s, 124u));
     value = event(STORAGE_WORKER_INPUT_IDLE_CANDIDATE, 1u);
     assert(storage_supervisor_handle_event(&s, &value) == 0);

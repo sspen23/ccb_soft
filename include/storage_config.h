@@ -60,6 +60,12 @@ typedef struct {
     uint32_t first_data_timeout_ms;
     StorageProfile storage_profile;
     bool dump_diag_on_error;
+    bool auto_input_complete;
+    uint32_t idle_scan_interval_ms;
+    uint32_t idle_required_ms;
+    uint32_t idle_required_scans;
+    uint32_t drain_stable_scans;
+    uint32_t drain_stable_us;
     ChannelStorageConfig channels[NUM_CHANNELS];
 } AppConfig;
 

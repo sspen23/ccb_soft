@@ -52,6 +52,11 @@ int main(void)
     assert(storage_ipc_write_control(p[1], &c) == 0);
     assert(storage_ipc_read_control(p[0], &out) == 0 &&
            out.type == STORAGE_CTRL_STOP && out.stop_epoch == 1234u);
+    storage_ipc_make_control(&c, STORAGE_CTRL_AUTO_DRAIN, 3u);
+    c.stop_epoch = 5678u;
+    assert(storage_ipc_write_control(p[1], &c) == 0);
+    assert(storage_ipc_read_control(p[0], &out) == 0 &&
+           out.type == STORAGE_CTRL_AUTO_DRAIN && out.stop_epoch == 5678u);
     c.magic = 0u; assert(storage_ipc_write_control(p[1], &c) != 0);
     storage_ipc_make_event(&e, STORAGE_WORKER_READY, 0u, STORAGE_ERR_NONE, 0u, "ready");
     assert(e.payload_size == sizeof(WorkerReadyPayload));

@@ -258,7 +258,7 @@ static int storage_ipc_control_valid(const StorageControlMessage *msg)
 {
     return msg && msg->magic == STORAGE_IPC_MAGIC &&
            msg->version == STORAGE_IPC_VERSION && msg->size == sizeof(*msg) &&
-           msg->type >= STORAGE_CTRL_ARM && msg->type <= STORAGE_CTRL_STOP;
+           msg->type >= STORAGE_CTRL_ARM && msg->type <= STORAGE_CTRL_AUTO_DRAIN;
 }
 
 int storage_ipc_validate_event(const StorageWorkerEvent *event)
