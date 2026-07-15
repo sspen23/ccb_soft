@@ -3,6 +3,16 @@
 #include <limits.h>
 #include <string.h>
 
+#define STORAGE_DMA_QUIESCE_WAIT_MAX_US 250000u
+
+uint64_t storage_dma_quiesce_wait_us(uint64_t configured_timeout_us)
+{
+    if (configured_timeout_us == 0u ||
+        configured_timeout_us > STORAGE_DMA_QUIESCE_WAIT_MAX_US)
+        return STORAGE_DMA_QUIESCE_WAIT_MAX_US;
+    return configured_timeout_us;
+}
+
 void storage_stop_state_init(StorageStopState *state)
 {
     if (!state) return;

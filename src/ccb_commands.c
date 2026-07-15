@@ -912,7 +912,8 @@ static StorageStopTimeouts storage_stop_timeouts(const ChannelRuntime *rt)
     compat = storage_timeout_us("SRC_REAL_STORAGE_STOP_TIMEOUT_US",
                                "SRC_REAL_STORAGE_STOP_TIMEOUT_MS", compat);
     t.compat_us = compat;
-    t.dma_quiesce_us = storage_timeout_us("SRC_REAL_DMA_QUIESCE_TIMEOUT_US", NULL, compat);
+    t.dma_quiesce_us = storage_dma_quiesce_wait_us(storage_timeout_us(
+        "SRC_REAL_DMA_QUIESCE_TIMEOUT_US", NULL, compat));
     t.stop_harvest_us = storage_timeout_us("SRC_REAL_STOP_HARVEST_TIMEOUT_US", NULL, compat);
     t.writer_drain_us = storage_timeout_us("SRC_REAL_WRITER_DRAIN_TIMEOUT_US", NULL, compat);
     t.nvme_abort_us = storage_timeout_us("SRC_REAL_NVME_ABORT_TIMEOUT_US", NULL,

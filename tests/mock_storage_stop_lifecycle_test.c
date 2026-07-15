@@ -120,6 +120,8 @@ static void test_stop_is_idempotent_and_inflight_blocks_finish(void)
     StorageDrainStableState stable;
 
     storage_stop_state_init(&stop);
+    assert(storage_dma_quiesce_wait_us(5000000u) == 250000u);
+    assert(storage_dma_quiesce_wait_us(100000u) == 100000u);
     assert(storage_stop_state_latch(&stop, 1000u));
     assert(!storage_stop_state_latch(&stop, 2000u));
     quiesce_call_count = 0;

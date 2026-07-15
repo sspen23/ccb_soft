@@ -60,6 +60,7 @@ typedef enum {
 } StorageStopTailDisposition;
 
 void storage_stop_state_init(StorageStopState *state);
+uint64_t storage_dma_quiesce_wait_us(uint64_t configured_timeout_us);
 int storage_dma_quiesce_once(StorageDmaQuiesceState *state,
                              uint64_t drain_epoch,
                              StorageDmaQuiesceFn quiesce,
