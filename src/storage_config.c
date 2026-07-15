@@ -160,6 +160,10 @@ static void set_channel_profile(AppConfig *config)
         storage->max_active_slots = safe ? 1u :
                                     (channel == LOW_SPEED_CHANNEL_ID ? 1u : 4u);
         storage->cq_batch = safe ? 1u : 8u;
+        storage->writer_realtime = false;
+        storage->writer_priority = 0u;
+        storage->producer_realtime = false;
+        storage->producer_priority = 0u;
     }
 }
 

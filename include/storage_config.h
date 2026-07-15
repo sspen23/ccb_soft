@@ -49,6 +49,10 @@ typedef struct {
     uint32_t nvme_qd;
     uint32_t max_active_slots;
     uint32_t cq_batch;
+    bool writer_realtime;
+    uint32_t writer_priority;
+    bool producer_realtime;
+    uint32_t producer_priority;
 } ChannelStorageConfig;
 
 typedef struct {

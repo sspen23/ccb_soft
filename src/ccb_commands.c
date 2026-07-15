@@ -1220,6 +1220,7 @@ static bool storage_should_print_slot_perf(ChannelRuntime *rt, uint64_t chunk_in
 static uint32_t storage_writer_rt_prio(const ChannelRuntime *rt)
 {
     char name[64];
+    const ChannelStorageConfig *profile;
 
     if (!rt) {
         return 0u;
@@ -1228,12 +1229,15 @@ static uint32_t storage_writer_rt_prio(const ChannelRuntime *rt)
     if (storage_config_compat_getenv(name)) {
         return storage_env_u32_limit(name, 0u, 99u);
     }
-    return 61u;
+    profile = storage_config_channel(storage_config_get(),
+                                     (uint32_t)rt->cfg->id);
+    return profile ? profile->writer_priority : 0u;
 }
 
 static uint32_t storage_producer_rt_prio(const ChannelRuntime *rt)
 {
     char name[64];
+    const ChannelStorageConfig *profile;
 
     if (!rt) {
         return 0u;
@@ -1242,7 +1246,21 @@ static uint32_t storage_producer_rt_prio(const ChannelRuntime *rt)
     if (storage_config_compat_getenv(name)) {
         return storage_env_u32_limit(name, 0u, 99u);
     }
-    return 60u;
+    profile = storage_config_channel(storage_config_get(),
+                                     (uint32_t)rt->cfg->id);
+    return profile ? profile->producer_priority : 0u;
+}
+
+static int storage_profile_rt_policy(const ChannelRuntime *rt, bool writer)
+{
+    const ChannelStorageConfig *profile;
+
+    if (!rt || !rt->cfg) return SCHED_OTHER;
+    profile = storage_config_channel(storage_config_get(),
+                                     (uint32_t)rt->cfg->id);
+    if (!profile) return SCHED_OTHER;
+    return (writer ? profile->writer_realtime : profile->producer_realtime)
+               ? SCHED_RR : SCHED_OTHER;
 }
 
 static int storage_rt_policy(const char *name, int fallback)
@@ -1261,7 +1279,9 @@ static int storage_rt_policy(const char *name, int fallback)
     if (strcmp(value, "other") == 0) {
         return SCHED_OTHER;
     }
-    fprintf(stderr, "warning: invalid %s=%s; fallback=rr\n", name, value);
+    fprintf(stderr, "warning: invalid %s=%s; fallback=%s\n", name, value,
+            fallback == SCHED_RR ? "rr" :
+            (fallback == SCHED_FIFO ? "fifo" : "other"));
     return fallback;
 }
 
@@ -1397,7 +1417,8 @@ static int storage_apply_writer_rt(StorageWriteQueue *q)
         return 0;
     }
     memset(&sp, 0, sizeof(sp));
-    policy = storage_rt_policy("SRC_REAL_WRITER_RT_POLICY", SCHED_RR);
+    policy = storage_rt_policy("SRC_REAL_WRITER_RT_POLICY",
+                               storage_profile_rt_policy(q->rt, true));
     __atomic_store_n(&q->writer_rt_policy, policy, __ATOMIC_RELEASE);
     if (policy == SCHED_OTHER) {
         sp.sched_priority = 0;
@@ -1446,7 +1467,8 @@ static int storage_apply_producer_rt(const ChannelRuntime *rt,
 
     if (!rt) return -1;
     producer_prio = storage_producer_rt_prio(rt);
-    policy = storage_rt_policy("SRC_REAL_PRODUCER_RT_POLICY", SCHED_RR);
+    policy = storage_rt_policy("SRC_REAL_PRODUCER_RT_POLICY",
+                               storage_profile_rt_policy(rt, false));
     requested_prio = producer_prio;
     requested_policy = policy;
     memset(&sp, 0, sizeof(sp));
@@ -3929,9 +3951,13 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                       (unsigned)rt.nvme_qd_effective,
                       (unsigned)rt.nvme_cmd_size_bytes,
                       (unsigned)storage_log_effective_level(),
-                      storage_rt_policy_name(storage_rt_policy("SRC_REAL_WRITER_RT_POLICY", SCHED_RR)),
+                      storage_rt_policy_name(storage_rt_policy(
+                          "SRC_REAL_WRITER_RT_POLICY",
+                          storage_profile_rt_policy(&rt, true))),
                       (unsigned)storage_writer_rt_prio(&rt),
-                      storage_rt_policy_name(storage_rt_policy("SRC_REAL_PRODUCER_RT_POLICY", SCHED_RR)),
+                      storage_rt_policy_name(storage_rt_policy(
+                          "SRC_REAL_PRODUCER_RT_POLICY",
+                          storage_profile_rt_policy(&rt, false))),
                       (unsigned)storage_producer_rt_prio(&rt),
                       cross_slot_qd ? 1u : 0u,
                       (unsigned)cross_slot_config.max_active_slots,

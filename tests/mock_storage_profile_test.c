@@ -39,6 +39,10 @@ static void test_perf_profile_defaults(void)
     assert(config.channels[0].max_active_slots == 4u);
     assert(config.channels[0].descriptor_bytes == 8u * 1024u * 1024u);
     assert(config.channels[0].command_bytes == 256u * 1024u);
+    assert(!config.channels[0].writer_realtime);
+    assert(config.channels[0].writer_priority == 0u);
+    assert(!config.channels[0].producer_realtime);
+    assert(config.channels[0].producer_priority == 0u);
     assert(config.channels[2].writer_mode == STORAGE_WRITER_LEGACY);
     assert(config.channels[2].nvme_qd == 8u);
     assert(config.channels[2].descriptor_bytes == 16u * 1024u * 1024u);
@@ -69,6 +73,10 @@ static void test_safe_profile_and_primary_values(void)
     assert(config.channels[0].nvme_qd == 1u);
     assert(config.channels[0].max_active_slots == 1u);
     assert(config.channels[2].nvme_qd == 1u);
+    assert(!config.channels[0].writer_realtime);
+    assert(config.channels[0].writer_priority == 0u);
+    assert(!config.channels[0].producer_realtime);
+    assert(config.channels[0].producer_priority == 0u);
     assert(config.auto_input_complete);
     assert(config.idle_scan_interval_ms == 100u);
     assert(config.idle_required_ms == 500u);
