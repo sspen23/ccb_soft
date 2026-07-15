@@ -312,6 +312,32 @@ static void test_one_channel_failure_rejects_aggregate(void)
     assert(s.primary_error == STORAGE_ERR_INTEGRITY);
 }
 
+static void test_failed_final_preserves_bytes_and_normal_exit(void)
+{
+    StorageTaskSupervisor s;
+    StorageWorkerEvent value;
+
+    storage_supervisor_init(&s, 1u);
+    value = event(STORAGE_WORKER_FINAL_RESULT, 0u);
+    value.payload.final.result.dma_received_bytes = 8192u;
+    value.payload.final.result.nvme_completed_bytes = 7680u;
+    value.payload.final.result.file_bytes = 7680u;
+    value.payload.final.result.storage_integrity_ok = false;
+    value.payload.final.result.integrity_ok = false;
+    value.payload.final.result.primary_error = STORAGE_ERR_TAIL_UNALIGNED;
+    snprintf(value.payload.final.result.integrity_risk,
+             sizeof(value.payload.final.result.integrity_risk), "%s",
+             "unaligned_payload_not_safely_paddable");
+
+    assert(handle_final(&s, &value) == 0);
+    assert(storage_supervisor_result_status(&s) == STORAGE_TASK_FAILED);
+    assert(storage_supervisor_handle_worker_exit(&s, 0u, 0) == 0);
+    assert(s.final_result[0].file_bytes == 7680u);
+    assert(s.final_result[0].nvme_completed_bytes == 7680u);
+    assert(s.primary_error == STORAGE_ERR_TAIL_UNALIGNED);
+    assert_reason(&s, "unaligned_payload_not_safely_paddable");
+}
+
 static void test_payload_media_accounting(void)
 {
     StorageTaskSupervisor s;
@@ -426,6 +452,7 @@ int main(void)
     test_diag_after_final_is_best_effort();
     test_result_failure_reasons();
     test_one_channel_failure_rejects_aggregate();
+    test_failed_final_preserves_bytes_and_normal_exit();
     test_payload_media_accounting();
     test_multichannel_stop_epoch_and_deferred_isolation();
     test_multichannel_input_idle_coordination();

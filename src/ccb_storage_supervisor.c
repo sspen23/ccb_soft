@@ -32,6 +32,36 @@ static void fail_worker_exit_without_final(StorageTaskSupervisor *s, uint32_t ch
     fail(s, ch, STORAGE_ERR_WORKER_EXIT, "worker_exit_without_final");
 }
 
+static void fail_task_result(StorageTaskSupervisor *s, uint32_t ch,
+                             const WriteResult *result,
+                             StorageErrorCode fallback_code,
+                             const char *fallback_reason)
+{
+    StorageErrorCode primary = fallback_code;
+    const char *reason = fallback_reason;
+
+    if (result && storage_error_code_valid(result->primary_error) &&
+        result->primary_error != STORAGE_ERR_NONE)
+        primary = result->primary_error;
+    if (result && result->integrity_risk[0] != '\0')
+        reason = result->integrity_risk;
+    if (!storage_error_code_valid(primary) || primary == STORAGE_ERR_NONE)
+        primary = STORAGE_ERR_INTEGRITY;
+    storage_error_record(&s->primary_error, &s->secondary_error, primary);
+    if (result && storage_error_code_valid(result->secondary_error) &&
+        result->secondary_error != STORAGE_ERR_NONE)
+        storage_error_record(&s->primary_error, &s->secondary_error,
+                             result->secondary_error);
+    s->fatal_channel = ch;
+    snprintf(s->fatal_reason, sizeof(s->fatal_reason), "%s",
+             reason && reason[0] != '\0' ? reason : "storage_integrity_failed");
+    if (result && result->secondary_reason[0] != '\0')
+        snprintf(s->secondary_reason, sizeof(s->secondary_reason), "%s",
+                 result->secondary_reason);
+    s->result_known_failed = true;
+    s->terminal = STORAGE_TASK_FAILED;
+}
+
 void storage_supervisor_init(StorageTaskSupervisor *s, uint32_t target_mask)
 { memset(s, 0, sizeof(*s)); s->target_channel_mask = target_mask; s->terminal = STORAGE_TASK_ACTIVE; }
 void storage_supervisor_protocol_fail(StorageTaskSupervisor *s, uint32_t ch,
@@ -301,26 +331,32 @@ StorageTaskTerminal storage_supervisor_result_status(StorageTaskSupervisor *s)
         if ((s->target_channel_mask & bit(i)) == 0u) continue;
         r = &s->final_result[i];
         if (!r->receive_integrity_ok) {
-            fail(s, i, STORAGE_ERR_INTEGRITY, "receive_integrity_failed");
-            return s->terminal = STORAGE_TASK_FAILED;
+            fail_task_result(s, i, r, STORAGE_ERR_INTEGRITY,
+                             "receive_integrity_failed");
+            return s->terminal;
         }
         if (!r->data_persisted || !r->storage_integrity_ok || !r->integrity_ok) {
-            fail(s, i, STORAGE_ERR_INTEGRITY, "storage_integrity_failed");
-            return s->terminal = STORAGE_TASK_FAILED;
+            fail_task_result(s, i, r, STORAGE_ERR_INTEGRITY,
+                             "storage_integrity_failed");
+            return s->terminal;
         }
         if (r->dma_received_bytes != r->nvme_completed_bytes) {
-            fail(s, i, STORAGE_ERR_BYTE_MISMATCH, "dma_nvme_byte_mismatch");
-            return s->terminal = STORAGE_TASK_FAILED;
+            fail_task_result(s, i, r, STORAGE_ERR_BYTE_MISMATCH,
+                             "dma_nvme_byte_mismatch");
+            return s->terminal;
         }
         if (r->nvme_completed_bytes != r->file_bytes) {
-            fail(s, i, STORAGE_ERR_BYTE_MISMATCH, "nvme_file_byte_mismatch");
-            return s->terminal = STORAGE_TASK_FAILED;
+            fail_task_result(s, i, r, STORAGE_ERR_BYTE_MISMATCH,
+                             "nvme_file_byte_mismatch");
+            return s->terminal;
         }
     }
     if ((s->target_channel_mask & 3u) == 3u &&
         s->final_result[0].dma_received_bytes != s->final_result[1].dma_received_bytes) {
-        fail(s, 0u, STORAGE_ERR_BYTE_MISMATCH, "split_channel_byte_mismatch");
-        return s->terminal = STORAGE_TASK_FAILED;
+        fail_task_result(s, 0u, &s->final_result[0],
+                         STORAGE_ERR_BYTE_MISMATCH,
+                         "split_channel_byte_mismatch");
+        return s->terminal;
     }
     return s->terminal = STORAGE_TASK_SUCCESS;
 }
