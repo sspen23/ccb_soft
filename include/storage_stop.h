@@ -17,9 +17,19 @@ typedef enum {
     STORAGE_STOP_FAILED
 } StorageStopPhase;
 
+typedef int (*StorageDmaQuiesceFn)(void *opaque);
+
+typedef struct {
+    uint64_t drain_epoch;
+    bool started;
+    bool finished;
+    int result;
+} StorageDmaQuiesceState;
+
 typedef struct {
     StorageStopPhase state;
     uint64_t deadline_us;
+    StorageDmaQuiesceState quiesce;
 } StorageStopState;
 
 typedef struct {
@@ -34,6 +44,10 @@ typedef enum {
 } StorageStopTailDisposition;
 
 void storage_stop_state_init(StorageStopState *state);
+int storage_dma_quiesce_once(StorageDmaQuiesceState *state,
+                             uint64_t drain_epoch,
+                             StorageDmaQuiesceFn quiesce,
+                             void *opaque);
 bool storage_stop_state_latch(StorageStopState *state, uint64_t deadline_us);
 int storage_stop_state_advance(StorageStopState *state, StorageStopPhase next);
 void storage_stop_state_fail(StorageStopState *state);

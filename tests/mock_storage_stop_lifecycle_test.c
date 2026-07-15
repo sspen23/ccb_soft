@@ -3,6 +3,16 @@
 
 #include "ccb_storage_pipeline.h"
 
+static int quiesce_call_count;
+
+static int count_quiesce(void *opaque)
+{
+    int *result = opaque;
+
+    ++quiesce_call_count;
+    return *result;
+}
+
 static void test_stable_empty_requires_repeated_observation(void)
 {
     StorageStopHarvestState state;
@@ -80,10 +90,20 @@ static void test_stop_is_idempotent_and_inflight_blocks_finish(void)
     uint64_t submitted = 7u;
     uint64_t completed = 6u;
     uint64_t global_inflight = 1u;
+    int quiesce_result = 1;
 
     storage_stop_state_init(&stop);
     assert(storage_stop_state_latch(&stop, 1000u));
     assert(!storage_stop_state_latch(&stop, 2000u));
+    quiesce_call_count = 0;
+    assert(storage_dma_quiesce_once(&stop.quiesce, 77u, count_quiesce,
+                                    &quiesce_result) == 1);
+    quiesce_result = -1;
+    assert(storage_dma_quiesce_once(&stop.quiesce, 77u, count_quiesce,
+                                    &quiesce_result) == 1);
+    assert(quiesce_call_count == 1);
+    assert(storage_dma_quiesce_once(&stop.quiesce, 78u, count_quiesce,
+                                    &quiesce_result) == -1);
     assert(submitted - completed == global_inflight);
     assert(global_inflight != 0u);
     assert(!storage_drain_invariant_ok(&invariant));

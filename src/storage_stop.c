@@ -10,6 +10,23 @@ void storage_stop_state_init(StorageStopState *state)
     state->state = STORAGE_STOP_NONE;
 }
 
+int storage_dma_quiesce_once(StorageDmaQuiesceState *state,
+                             uint64_t drain_epoch,
+                             StorageDmaQuiesceFn quiesce,
+                             void *opaque)
+{
+    if (!state || drain_epoch == 0u || !quiesce) return -1;
+    if (state->started) {
+        if (state->drain_epoch != drain_epoch || !state->finished) return -1;
+        return state->result;
+    }
+    state->drain_epoch = drain_epoch;
+    state->started = true;
+    state->result = quiesce(opaque);
+    state->finished = true;
+    return state->result;
+}
+
 bool storage_stop_state_latch(StorageStopState *state, uint64_t deadline_us)
 {
     if (!state || state->state != STORAGE_STOP_NONE) return false;

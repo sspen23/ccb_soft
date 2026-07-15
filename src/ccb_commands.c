@@ -174,6 +174,40 @@ typedef struct {
     pthread_cond_t not_full;
 } StorageWriteQueue;
 
+typedef struct {
+    ChannelRuntime *rt;
+    uint64_t deadline_us;
+    const uint8_t *slot_states;
+    DmaStopReport *report;
+} StorageDmaQuiesceCall;
+
+static int storage_dma_quiesce_invoke(void *opaque)
+{
+    StorageDmaQuiesceCall *call = opaque;
+
+    return (int)dma_quiesce_s2mm_with_state(call->rt, call->deadline_us,
+                                             call->slot_states, call->report);
+}
+
+static DmaStopResult storage_dma_quiesce_epoch(StorageStopState *stop,
+                                                uint64_t drain_epoch,
+                                                ChannelRuntime *rt,
+                                                uint64_t deadline_us,
+                                                const uint8_t *slot_states,
+                                                DmaStopReport *report)
+{
+    StorageDmaQuiesceCall call = {
+        .rt = rt,
+        .deadline_us = deadline_us,
+        .slot_states = slot_states,
+        .report = report,
+    };
+
+    return (DmaStopResult)storage_dma_quiesce_once(
+        stop ? &stop->quiesce : NULL, drain_epoch,
+        storage_dma_quiesce_invoke, &call);
+}
+
 static bool storage_queue_slot_counts_valid_locked(const StorageWriteQueue *q)
 {
     if (!q) return false;
@@ -4187,8 +4221,9 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                                              stop_timeouts.dma_quiesce_us;
                     {
                         DmaStopResult quiesce_result =
-                            dma_quiesce_s2mm_with_state(
-                                &rt, stop_state.deadline_us,
+                            storage_dma_quiesce_epoch(
+                                &stop_state, g_storage_stop_epoch, &rt,
+                                stop_state.deadline_us,
                                 write_queue.slots.states, &dma_stop_report);
                         if (quiesce_result == DMA_STOP_FAILED) {
                             storage_record_failure(
@@ -4240,8 +4275,9 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                 stop_state.deadline_us = storage_wall_time_us() +
                                          stop_timeouts.dma_quiesce_us;
                 {
-                    DmaStopResult quiesce_result = dma_quiesce_s2mm_with_state(
-                        &rt, stop_state.deadline_us, write_queue.slots.states,
+                    DmaStopResult quiesce_result = storage_dma_quiesce_epoch(
+                        &stop_state, g_storage_stop_epoch, &rt,
+                        stop_state.deadline_us, write_queue.slots.states,
                         &dma_stop_report);
                     if (quiesce_result == DMA_STOP_FAILED) {
                     storage_record_failure(&producer_stats,
@@ -5302,6 +5338,10 @@ out:
                                    storage_wall_time_us(),
                                    dma_received_bytes);
     if (dma_started && !dma_stop_attempted) {
+        if (g_storage_stop_epoch == 0u) {
+            g_storage_stop_epoch = storage_wall_time_us();
+            if (g_storage_stop_epoch == 0u) g_storage_stop_epoch = 1u;
+        }
         if (stop_state.state == STORAGE_STOP_NONE) {
             if (stop_request_us == 0u) stop_request_us = storage_wall_time_us();
             (void)storage_stop_state_latch(
@@ -5328,8 +5368,9 @@ out:
                                      stop_timeouts.dma_quiesce_us;
         }
         if (!dma_quiesced) {
-            DmaStopResult quiesce_result = dma_quiesce_s2mm_with_state(
-                &rt, stop_state.deadline_us, write_queue.slots.states,
+            DmaStopResult quiesce_result = storage_dma_quiesce_epoch(
+                &stop_state, g_storage_stop_epoch, &rt,
+                stop_state.deadline_us, write_queue.slots.states,
                 &dma_stop_report);
             if (quiesce_result != DMA_STOP_FAILED) {
                 dma_quiesced = true;
