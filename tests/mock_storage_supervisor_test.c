@@ -130,6 +130,7 @@ static void test_stop_send_state(void)
     value.payload.fatal.reason[0] = '\0';
     assert(storage_supervisor_handle_event(&s, &value) == 0);
     assert_reason(&s, "worker_fatal");
+
 }
 
 static void test_invalid_sequences(void)
@@ -168,6 +169,13 @@ static void test_invalid_sequences(void)
 
     storage_supervisor_init(&s, 1u);
     value = event(STORAGE_WORKER_DRAIN_READY, 0u);
+    assert(storage_supervisor_handle_event(&s, &value) != 0);
+    assert_reason(&s, "invalid_drained_sequence");
+
+    storage_supervisor_init(&s, 1u);
+    advance_to_running(&s, 0u);
+    value = event(STORAGE_WORKER_DRAIN_READY, 0u);
+    assert(storage_supervisor_handle_event(&s, &value) == 0);
     assert(storage_supervisor_handle_event(&s, &value) != 0);
     assert_reason(&s, "invalid_drained_sequence");
 

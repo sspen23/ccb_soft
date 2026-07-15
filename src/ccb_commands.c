@@ -5893,7 +5893,8 @@ out:
                rt.dma_rxeof_count,
                rt.dma_rx_packet_open ? 1u : 0u);
         }
-        storage_emit_line(STORAGE_LOG_ALWAYS_CRITICAL, "storage_result channel=%d task=%s file_index=%u status=failed"
+        if (mode == STORAGE_WRITE_STANDALONE)
+            storage_emit_line(STORAGE_LOG_ALWAYS_CRITICAL, "storage_result channel=%d task=%s file_index=%u status=failed"
                           " file_bytes=%" PRIu64 " data_persisted=%u"
                           " receive_integrity_ok=0 storage_integrity_ok=0 integrity_ok=0"
                           " integrity_risk=%s ring_full_count=%" PRIu64,
