@@ -15,6 +15,8 @@ int main(void)
     desc[0].status = CMPLT | 512u; desc[1].status = CMPLT | 1024u;
     assert(dma_harvest_batch(&rt, out, 4u, 0u, &count) == 0 && count == 2u);
     assert(out[0].slot == 0u && out[1].actual_bytes == 1024u && rt.dma_hw_desc_count == 2u);
+    assert(out[0].submission_sequence == 0u &&
+           out[1].submission_sequence == 1u);
 
     memset(desc, 0, sizeof(desc));
     rt.next_harvest_bd = 0u; rt.dma_hw_desc_count = 4u; count = 0u;
@@ -23,6 +25,8 @@ int main(void)
     desc[2].status = CMPLT | DESC_ERROR;
     assert(dma_harvest_batch(&rt, out, 4u, 0u, &count) != 0 && count == 2u);
     assert(out[0].slot == 0u && out[1].slot == 1u);
+    assert(out[0].submission_sequence == 2u &&
+           out[1].submission_sequence == 3u);
     assert(rt.next_harvest_bd == 2u && rt.dma_hw_desc_count == 2u);
     puts("mock_dma_harvest_batch_test: ok"); return 0;
 }

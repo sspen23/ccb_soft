@@ -3360,6 +3360,7 @@ int channel_runtime_open(ChannelRuntime *rt, const ChannelConfig *cfg, GlobalOpt
     rt->dma_ring_bytes = parse_storage_ring_bytes(rt);
     rt->dma_desc_count = (uint32_t)(rt->dma_ring_bytes / cfg->dma_desc_bytes_default);
     rt->dma_hw_desc_count = 0u;
+    rt->dma_harvest_sequence = 0u;
     rt->pcie_bridge_base_effective = pcie_bridge_base_for_channel(cfg);
 
     if (gopt.dry_run) {
@@ -3926,6 +3927,7 @@ int dma_start_s2mm_ring(ChannelRuntime *rt)
     }
     __atomic_store_n(&rt->dma_hw_desc_count, rt->dma_desc_count, __ATOMIC_RELEASE);
     rt->next_harvest_bd = 0u;
+    rt->dma_harvest_sequence = 0u;
     rt->dma_stop_latched = false;
     rt->dma_requeue_enabled = true;
     return 0;
@@ -3951,6 +3953,7 @@ static int dma_harvest_batch_impl(ChannelRuntime *rt, DmaHarvestItem *items,
             items[count].slot = rt->next_harvest_bd;
             items[count].actual_bytes = rt->dma_desc_bytes;
             items[count].descriptor_status = 0u;
+            items[count].submission_sequence = rt->dma_harvest_sequence++;
             rt->next_harvest_bd = (rt->next_harvest_bd + 1u) % rt->dma_desc_count;
         }
         *out_count = count;
@@ -3977,6 +3980,7 @@ static int dma_harvest_batch_impl(ChannelRuntime *rt, DmaHarvestItem *items,
         items[count].slot = idx;
         items[count].actual_bytes = st & DESC_STS_LEN_MASK;
         items[count].descriptor_status = st;
+        items[count].submission_sequence = rt->dma_harvest_sequence++;
         if ((st & DESC_STS_RXSOF) != 0u) { ++rt->dma_rxsof_count; rt->dma_rx_packet_open = true; }
         if ((st & DESC_STS_RXEOF) != 0u) { ++rt->dma_rxeof_count; rt->dma_rx_packet_open = false; }
         if (allow_halted) {

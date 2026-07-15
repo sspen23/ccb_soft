@@ -52,6 +52,12 @@ static void test_unaligned_tail_does_not_abort_full_prefix(void)
     };
     StoragePipelineItem out;
     bool producer_done = false;
+    const uint64_t descriptor_bytes = 8u * 1024u * 1024u;
+    const uint64_t partial_bytes = descriptor_bytes - 32u;
+    uint64_t harvested_bytes = partial_bytes;
+    uint64_t queued_bytes = 0u;
+    uint64_t tail_unqueued_bytes = 0u;
+    uint32_t i;
 
     assert(storage_pipeline_init(&pipeline, 2u) == 0);
     assert(storage_pipeline_mark_completed(&pipeline, 0u) == 0);
@@ -60,6 +66,24 @@ static void test_unaligned_tail_does_not_abort_full_prefix(void)
     assert(storage_stop_tail_disposition(true, false, 419692512u,
                                          419692544u, false) ==
            STORAGE_STOP_TAIL_DEFER_UNALIGNED);
+    assert(storage_stop_tail_disposition(false, false, 262112u,
+                                         262144u, false) ==
+           STORAGE_STOP_TAIL_DEFER_UNALIGNED);
+    assert(storage_stop_tail_disposition(false, true, 4096u, 4096u, false) ==
+           STORAGE_STOP_TAIL_QUEUE);
+    assert(storage_stop_tail_disposition(true, false, partial_bytes,
+                                         descriptor_bytes, false) ==
+           STORAGE_STOP_TAIL_DEFER_UNALIGNED);
+    tail_unqueued_bytes += partial_bytes;
+    for (i = 0u; i < 64u; ++i) {
+        assert(storage_stop_tail_disposition(true, true, descriptor_bytes,
+                                             descriptor_bytes, false) ==
+               STORAGE_STOP_TAIL_QUEUE);
+        harvested_bytes += descriptor_bytes;
+        queued_bytes += descriptor_bytes;
+    }
+    assert(tail_unqueued_bytes < descriptor_bytes);
+    assert(harvested_bytes == queued_bytes + tail_unqueued_bytes);
     assert(storage_slot_transition(&pipeline.slots, 1u,
                                    STORAGE_SLOT_DMA_COMPLETED_UNHARVESTED,
                                    STORAGE_SLOT_FREE) == 0);

@@ -98,9 +98,14 @@ StorageStopTailDisposition storage_stop_tail_disposition(bool stop_active,
                                                          uint64_t media_bytes,
                                                          bool padding_coherent)
 {
-    if (!stop_active) return STORAGE_STOP_TAIL_QUEUE;
-    if (tail_already_seen) return STORAGE_STOP_TAIL_DEFER_LATE;
-    if (payload_bytes != 0u && media_bytes > payload_bytes && !padding_coherent)
-        return STORAGE_STOP_TAIL_DEFER_UNALIGNED;
-    return STORAGE_STOP_TAIL_QUEUE;
+    /* Alignment safety applies as soon as DMA publishes a completed
+     * descriptor.  Deferring this check until STOP lets an unaligned slot
+     * reach the writer, where the prohibited CPU-padding path turns a
+     * deferred tail into a queue-fatal error and aborts the aligned prefix. */
+    (void)stop_active;
+    if (payload_bytes == 0u || media_bytes == payload_bytes || padding_coherent)
+        return STORAGE_STOP_TAIL_QUEUE;
+    if (media_bytes < payload_bytes) return STORAGE_STOP_TAIL_DEFER_LATE;
+    return tail_already_seen ? STORAGE_STOP_TAIL_DEFER_LATE
+                             : STORAGE_STOP_TAIL_DEFER_UNALIGNED;
 }

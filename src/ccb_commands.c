@@ -4544,7 +4544,6 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
             }
             {
                 PendingDdrSlot pending[16];
-                uint64_t batch_base_chunk_index = producer_stats.dma_desc_completed_count;
                 uint64_t batch_base_file_offset = bytes_captured;
                 uint64_t batch_base_lba = next_queue_lba;
                 uint64_t batch_bytes = 0u;
@@ -4645,7 +4644,6 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                             storage_stop_tail_disposition(
                                 stop_phase, stop_tail_seen, queued_bytes, media_bytes,
                                 false);
-
                     if (tail_disposition != STORAGE_STOP_TAIL_QUEUE) {
                         const char *deferred_reason =
                             tail_disposition == STORAGE_STOP_TAIL_DEFER_LATE
@@ -4677,7 +4675,8 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                     memset(&pending[valid_count], 0, sizeof(pending[valid_count]));
                     pending[valid_count].slot = harvest_items[i].slot;
                     pending[valid_count].bytes = queued_bytes;
-                    pending[valid_count].chunk_index = batch_base_chunk_index + valid_count;
+                    pending[valid_count].chunk_index =
+                        harvest_items[i].submission_sequence;
                     pending[valid_count].file_offset = batch_base_file_offset + batch_bytes;
                     if (batch_sectors > UINT64_MAX - batch_base_lba) {
                         storage_record_failure(&producer_stats, "lba_range_overflow");
@@ -5438,7 +5437,6 @@ out:
                     STORAGE_STOP_STABLE_EMPTY_US);
                 {
                     PendingDdrSlot stopped_pending[16];
-                    uint64_t base_chunk = producer_stats.dma_desc_completed_count;
                     uint64_t base_offset = bytes_captured;
                     uint64_t base_lba = next_queue_lba;
                     uint64_t batch_bytes = 0u;
@@ -5464,7 +5462,10 @@ out:
                             uint64_t sectors = bytes_to_sectors(bytes);
                             uint64_t media_bytes = sectors <= UINT64_MAX / SECTOR_SIZE
                                                        ? sectors * (uint64_t)SECTOR_SIZE : 0u;
-                            bool unsafe_tail = stop_tail_seen || media_bytes != bytes;
+                            StorageStopTailDisposition tail_disposition =
+                                storage_stop_tail_disposition(
+                                    true, stop_tail_seen, bytes, media_bytes,
+                                    false);
 
                             if (sectors == 0u || media_bytes == 0u) {
                                 storage_mark_harvest_slot_failed(
@@ -5487,11 +5488,13 @@ out:
                             dma_received_bytes += bytes;
                             storage_stats_record_dma_desc(&producer_stats,
                                                           storage_wall_time_us());
-                            if (unsafe_tail) {
-                                const char *reason = stop_tail_seen
+                            if (tail_disposition != STORAGE_STOP_TAIL_QUEUE) {
+                                const char *reason =
+                                    tail_disposition == STORAGE_STOP_TAIL_DEFER_LATE
                                     ? "late_completed_descriptor"
                                     : "unaligned_payload_not_safely_paddable";
-                                StorageErrorCode deferred_error = stop_tail_seen
+                                StorageErrorCode deferred_error =
+                                    tail_disposition == STORAGE_STOP_TAIL_DEFER_LATE
                                     ? STORAGE_ERR_LATE_COMPLETION
                                     : STORAGE_ERR_TAIL_UNALIGNED;
                                 if (tail_unqueued_bytes > UINT64_MAX - bytes ||
@@ -5516,7 +5519,8 @@ out:
                         }
                         stopped_pending[valid_count].slot = stopped_items[i].slot;
                         stopped_pending[valid_count].bytes = bytes;
-                        stopped_pending[valid_count].chunk_index = base_chunk + valid_count;
+                        stopped_pending[valid_count].chunk_index =
+                            stopped_items[i].submission_sequence;
                         stopped_pending[valid_count].file_offset = base_offset + batch_bytes;
                         if (batch_sectors > UINT64_MAX - base_lba) {
                             storage_record_failure(&producer_stats, "lba_range_overflow");

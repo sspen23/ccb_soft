@@ -205,6 +205,7 @@ typedef struct {
     uint32_t slot;
     uint32_t actual_bytes;
     uint32_t descriptor_status;
+    uint64_t submission_sequence;
 } DmaHarvestItem;
 int dma_harvest_batch(ChannelRuntime *rt, DmaHarvestItem *items,
                       uint32_t max_items, uint32_t budget_us, uint32_t *out_count);

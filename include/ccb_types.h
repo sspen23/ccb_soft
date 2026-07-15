@@ -297,6 +297,7 @@ typedef struct {
     uint32_t dma_hw_desc_count;
     uint32_t dma_last_completed_bd;
     uint32_t dma_last_completed_status;
+    uint64_t dma_harvest_sequence;
     uint64_t dma_rxsof_count;
     uint64_t dma_rxeof_count;
     bool dma_rx_packet_open;

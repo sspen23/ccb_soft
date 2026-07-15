@@ -51,8 +51,11 @@ int main(void)
         assert(storage_stop_tail_disposition(true, false, 419692512u,
                                              419692544u, false) ==
                STORAGE_STOP_TAIL_DEFER_UNALIGNED);
+        assert(storage_stop_tail_disposition(false, false, 262112u,
+                                             262144u, false) ==
+               STORAGE_STOP_TAIL_DEFER_UNALIGNED);
         assert(storage_stop_tail_disposition(true, true, 4096u, 4096u, false) ==
-               STORAGE_STOP_TAIL_DEFER_LATE);
+               STORAGE_STOP_TAIL_QUEUE);
         assert(!queue_error && !producer_done);
     }
 
