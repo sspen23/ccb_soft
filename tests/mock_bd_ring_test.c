@@ -38,7 +38,7 @@ static void init_runtime(ChannelRuntime *rt,
         (uint32_t)(cfg->desc_dma_base + 3u * sizeof(DmaSgDesc));
 }
 
-static void reproduce_completed_unharvested_quiesce_failure(uint32_t completed)
+static void verify_completed_unharvested_survives_quiesce(uint32_t completed)
 {
     ChannelRuntime rt;
     ChannelConfig cfg;
@@ -46,6 +46,8 @@ static void reproduce_completed_unharvested_quiesce_failure(uint32_t completed)
     uint32_t dma_regs[0x100u / 4u];
     uint8_t state[128];
     DmaStopReport stop_report;
+    DmaHarvestItem harvested[128];
+    uint32_t harvested_count = 0u;
     uint32_t i;
 
     assert(completed <= 128u);
@@ -56,15 +58,21 @@ static void reproduce_completed_unharvested_quiesce_failure(uint32_t completed)
     rt.dma_hw_desc_count = 128u;
     dma_regs[TEST_S2MM_TAILDESC / 4u] =
         (uint32_t)(cfg.desc_dma_base + 127u * sizeof(DmaSgDesc));
+    dma_regs[TEST_S2MM_DMASR / 4u] = 1u;
     for (i = 0u; i < completed; ++i)
         desc[i].status = TEST_DESC_CMPLT | 512u;
 
     dma_latch_stop(&rt);
     memset(&stop_report, 0, sizeof(stop_report));
     assert(dma_quiesce_s2mm_with_state(&rt, 1u, state, &stop_report) ==
-           DMA_STOP_FAILED);
+           DMA_STOP_OK);
     assert(stop_report.completed_unharvested == completed);
-    assert(strcmp(stop_report.reason, "completed_unharvested") == 0);
+    assert(dma_harvest_completed_batch(&rt, harvested, 128u,
+                                       &harvested_count) == 0);
+    assert(harvested_count == completed);
+    assert(dma_harvest_completed_batch(&rt, harvested, 128u,
+                                       &harvested_count) == 0);
+    assert(harvested_count == 0u);
 }
 
 int main(void)
@@ -182,16 +190,20 @@ int main(void)
     assert(dma_requeue_one(&rt, 0u) == -2);
     assert(dma_requeue_after_stop_count(&rt) == 1u);
 
-    /* A non-halted DMA with an unharvested completion is not eligible for
-     * reset recovery: the reset could discard valid DDR data. */
+    /* A completed descriptor no longer blocks reset eligibility.  This mock
+     * MMIO bank cannot self-clear RESET, so the synthetic reset itself times
+     * out after the ownership audit has accepted the completion. */
     init_runtime(&rt, &cfg, desc, dma_regs);
     dma_latch_stop(&rt);
     desc[0].status = TEST_DESC_CMPLT | 512u;
     dma_regs[TEST_S2MM_DMASR / 4u] = 0u;
     memset(state, STORAGE_SLOT_DMA_WRITABLE, sizeof(state));
     memset(&stop_report, 0, sizeof(stop_report));
-    assert(dma_quiesce_s2mm_with_state(&rt, 1u, state, &stop_report) == DMA_STOP_FAILED);
-    assert(strcmp(stop_report.reason, "completed_unharvested") == 0);
+    assert(dma_quiesce_s2mm_with_state(&rt, 1u, state, &stop_report) ==
+           DMA_STOP_FAILED);
+    assert(stop_report.completed_unharvested == 1u);
+    assert(stop_report.reset_attempted);
+    assert(strcmp(stop_report.reason, "dma_reset_failed") == 0);
 
     /* A halted path must apply the same ownership audit before the final
      * reset; it must not discard a completion that the producer did not
@@ -213,10 +225,9 @@ int main(void)
     assert(dma_quiesce_s2mm_with_state(&rt, 1u, state, &stop_report) == DMA_STOP_FAILED);
     assert(strcmp(stop_report.reason, "tail_descriptor_incomplete") == 0);
 
-    /* Board regressions A/B stopped with 114/119 completed descriptors.  The
-     * current implementation reproduces both failures before harvest runs. */
-    reproduce_completed_unharvested_quiesce_failure(114u);
-    reproduce_completed_unharvested_quiesce_failure(119u);
+    /* Board regressions A/B stopped with 114/119 completed descriptors. */
+    verify_completed_unharvested_survives_quiesce(114u);
+    verify_completed_unharvested_survives_quiesce(119u);
 
     puts("mock_bd_ring_test: ok");
     return 0;

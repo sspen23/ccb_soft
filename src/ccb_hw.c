@@ -3959,7 +3959,11 @@ static int dma_harvest_batch_impl(ChannelRuntime *rt, DmaHarvestItem *items,
     while (count < max_items) {
         volatile DmaSgDesc *desc;
         uint32_t idx, st, dsr;
-        if (__atomic_load_n(&rt->dma_hw_desc_count, __ATOMIC_ACQUIRE) == 0u) break;
+        uint32_t hw_owned = __atomic_load_n(&rt->dma_hw_desc_count,
+                                             __ATOMIC_ACQUIRE);
+        /* After a safe reset there are no hardware-owned descriptors, but
+         * completed status words remain available for software harvest. */
+        if (hw_owned == 0u && !allow_halted) break;
         dsr = reg_read32(&rt->dma, S2MM_DMASR);
         if ((dsr & DMA_ERROR_MASK_S2MM) != 0u ||
             (!allow_halted && (dsr & DMA_SR_HALT_BIT) != 0u)) {
@@ -3975,7 +3979,15 @@ static int dma_harvest_batch_impl(ChannelRuntime *rt, DmaHarvestItem *items,
         items[count].descriptor_status = st;
         if ((st & DESC_STS_RXSOF) != 0u) { ++rt->dma_rxsof_count; rt->dma_rx_packet_open = true; }
         if ((st & DESC_STS_RXEOF) != 0u) { ++rt->dma_rxeof_count; rt->dma_rx_packet_open = false; }
-        (void)__atomic_sub_fetch(&rt->dma_hw_desc_count, 1u, __ATOMIC_ACQ_REL);
+        if (allow_halted) {
+            /* No descriptor is requeued after the stop latch.  Clear only the
+             * consumed status word so a ring wrap cannot harvest it twice. */
+            desc[idx].status = 0u;
+            __sync_synchronize();
+        }
+        if (hw_owned != 0u)
+            (void)__atomic_sub_fetch(&rt->dma_hw_desc_count, 1u,
+                                     __ATOMIC_ACQ_REL);
         rt->next_harvest_bd = (idx + 1u) % rt->dma_desc_count;
         ++count;
         if (budget_us != 0u && wall_time_us() - start_us >= budget_us) break;
@@ -4228,11 +4240,11 @@ static bool dma_stop_reset_safe(const ChannelRuntime *rt,
         if (report) (void)snprintf(report->reason, sizeof(report->reason), "slot_ownership_invariant_failed");
         return false;
     }
+    /* Completed descriptors are software-owned, valid DDR data.  Their
+     * presence is expected at quiesce and is handled by the subsequent
+     * stable-empty harvest phase.  The full snapshot above is still required
+     * to reject illegal or unresolved ownership. */
     if (report) report->completed_unharvested = snapshot.completed_unharvested;
-    if (snapshot.completed_unharvested != 0u) {
-        if (report) (void)snprintf(report->reason, sizeof(report->reason), "completed_unharvested");
-        return false;
-    }
     return true;
 }
 
