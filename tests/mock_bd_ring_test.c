@@ -38,6 +38,35 @@ static void init_runtime(ChannelRuntime *rt,
         (uint32_t)(cfg->desc_dma_base + 3u * sizeof(DmaSgDesc));
 }
 
+static void reproduce_completed_unharvested_quiesce_failure(uint32_t completed)
+{
+    ChannelRuntime rt;
+    ChannelConfig cfg;
+    DmaSgDesc desc[128];
+    uint32_t dma_regs[0x100u / 4u];
+    uint8_t state[128];
+    DmaStopReport stop_report;
+    uint32_t i;
+
+    assert(completed <= 128u);
+    init_runtime(&rt, &cfg, desc, dma_regs);
+    memset(desc, 0, sizeof(desc));
+    memset(state, STORAGE_SLOT_DMA_WRITABLE, sizeof(state));
+    rt.dma_desc_count = 128u;
+    rt.dma_hw_desc_count = 128u;
+    dma_regs[TEST_S2MM_TAILDESC / 4u] =
+        (uint32_t)(cfg.desc_dma_base + 127u * sizeof(DmaSgDesc));
+    for (i = 0u; i < completed; ++i)
+        desc[i].status = TEST_DESC_CMPLT | 512u;
+
+    dma_latch_stop(&rt);
+    memset(&stop_report, 0, sizeof(stop_report));
+    assert(dma_quiesce_s2mm_with_state(&rt, 1u, state, &stop_report) ==
+           DMA_STOP_FAILED);
+    assert(stop_report.completed_unharvested == completed);
+    assert(strcmp(stop_report.reason, "completed_unharvested") == 0);
+}
+
 int main(void)
 {
     ChannelRuntime rt;
@@ -183,6 +212,11 @@ int main(void)
     memset(&stop_report, 0, sizeof(stop_report));
     assert(dma_quiesce_s2mm_with_state(&rt, 1u, state, &stop_report) == DMA_STOP_FAILED);
     assert(strcmp(stop_report.reason, "tail_descriptor_incomplete") == 0);
+
+    /* Board regressions A/B stopped with 114/119 completed descriptors.  The
+     * current implementation reproduces both failures before harvest runs. */
+    reproduce_completed_unharvested_quiesce_failure(114u);
+    reproduce_completed_unharvested_quiesce_failure(119u);
 
     puts("mock_bd_ring_test: ok");
     return 0;
