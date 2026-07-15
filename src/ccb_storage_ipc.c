@@ -192,12 +192,20 @@ void storage_ipc_make_event(StorageWorkerEvent *event, StorageWorkerEventType ty
     case STORAGE_WORKER_READY:
     case STORAGE_WORKER_ARMED:
     case STORAGE_WORKER_RUNNING:
-    case STORAGE_WORKER_DRAINED:
     case STORAGE_WORKER_INPUT_IDLE_CANDIDATE:
     case STORAGE_WORKER_INPUT_ACTIVE:
         ready = &event->payload.ready;
         ready->received_bytes = received_bytes;
         if (reason) (void)snprintf(ready->reason, sizeof(ready->reason), "%s", reason);
+        break;
+    case STORAGE_WORKER_DRAIN_READY:
+        event->payload.drain_ready.primary_error = error_code;
+        event->payload.drain_ready.dma_observed_bytes = received_bytes;
+        if (reason) {
+            (void)snprintf(event->payload.drain_ready.reason,
+                           sizeof(event->payload.drain_ready.reason), "%s",
+                           reason);
+        }
         break;
     case STORAGE_WORKER_FATAL:
         event->payload.fatal.error_code = error_code;
@@ -235,10 +243,11 @@ uint32_t storage_ipc_event_payload_size(StorageWorkerEventType type)
     case STORAGE_WORKER_READY:
     case STORAGE_WORKER_ARMED:
     case STORAGE_WORKER_RUNNING:
-    case STORAGE_WORKER_DRAINED:
     case STORAGE_WORKER_INPUT_IDLE_CANDIDATE:
     case STORAGE_WORKER_INPUT_ACTIVE:
         return sizeof(WorkerReadyPayload);
+    case STORAGE_WORKER_DRAIN_READY:
+        return sizeof(WorkerDrainReadyPayload);
     case STORAGE_WORKER_FATAL:
         return sizeof(WorkerFatalPayload);
     case STORAGE_WORKER_FINAL_RESULT:
@@ -279,6 +288,13 @@ int storage_ipc_validate_event(const StorageWorkerEvent *event)
     }
     if (event->type == STORAGE_WORKER_FINAL_RESULT) {
         return storage_error_code_valid(event->payload.final.error_code);
+    }
+    if (event->type == STORAGE_WORKER_DRAIN_READY) {
+        return event->payload.drain_ready.drain_epoch != 0u &&
+               storage_error_code_valid(
+                   event->payload.drain_ready.primary_error) &&
+               storage_error_code_valid(
+                   event->payload.drain_ready.secondary_error);
     }
     if (event->type == STORAGE_WORKER_STOP_PHASE) {
         const WorkerPhasePayload *phase = &event->payload.phase;

@@ -103,6 +103,8 @@ static void test_stop_is_idempotent_and_inflight_blocks_finish(void)
 {
     StorageStopState stop;
     StorageDrainInvariant invariant = {
+        .input_complete = true,
+        .dma_quiesced = true,
         .dma_harvested_payload_bytes = 4096u,
         .queued_payload_bytes = 4096u,
         .nvme_completed_payload_bytes = 4096u,
@@ -115,6 +117,7 @@ static void test_stop_is_idempotent_and_inflight_blocks_finish(void)
     uint64_t completed = 6u;
     uint64_t global_inflight = 1u;
     int quiesce_result = 1;
+    StorageDrainStableState stable;
 
     storage_stop_state_init(&stop);
     assert(storage_stop_state_latch(&stop, 1000u));
@@ -142,6 +145,28 @@ static void test_stop_is_idempotent_and_inflight_blocks_finish(void)
     invariant.completed_unharvested = 0u;
     invariant.ready_count = 1u;
     assert(!storage_drain_invariant_ok(&invariant));
+    invariant.ready_count = 0u;
+    invariant.active_count = 1u;
+    assert(!storage_drain_invariant_ok(&invariant));
+    invariant.active_count = 0u;
+    invariant.queued_payload_bytes = 3584u;
+    assert(!storage_drain_invariant_ok(&invariant));
+    invariant.tail_unqueued_bytes = 512u;
+    invariant.nvme_completed_payload_bytes = 3584u;
+    invariant.file_bytes = 3584u;
+    assert(storage_drain_invariant_ok(&invariant));
+
+    storage_drain_stable_init(&stable);
+    assert(!storage_drain_stable_observe(&stable, &invariant, 1000u, 3u,
+                                         100u));
+    assert(!storage_drain_stable_observe(&stable, &invariant, 1050u, 3u,
+                                         100u));
+    assert(storage_drain_stable_observe(&stable, &invariant, 1100u, 3u,
+                                        100u));
+    invariant.global_inflight = 1u;
+    assert(!storage_drain_stable_observe(&stable, &invariant, 1150u, 3u,
+                                         100u));
+    assert(stable.consecutive_scans == 0u);
 }
 
 static void test_ring_pressure_policy_is_bounded(void)

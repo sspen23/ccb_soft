@@ -20,6 +20,11 @@ static StorageWorkerEvent event(uint32_t type, uint32_t channel)
         value.payload.final.result.dma_received_bytes = 10u;
         value.payload.final.result.nvme_completed_bytes = 10u;
         value.payload.final.result.file_bytes = 10u;
+    } else if (type == STORAGE_WORKER_DRAIN_READY) {
+        value.payload.drain_ready.drain_epoch = 77u;
+        value.payload.drain_ready.primary_error = STORAGE_ERR_NONE;
+        value.payload.drain_ready.secondary_error = STORAGE_ERR_NONE;
+        value.payload.drain_ready.integrity_ok = 1u;
     }
     return value;
 }
@@ -56,7 +61,7 @@ static int handle_final(StorageTaskSupervisor *s, StorageWorkerEvent *value)
 
     advance_to_running(s, value->channel);
     if ((s->drained_mask & bit) == 0u) {
-        drained = event(STORAGE_WORKER_DRAINED, value->channel);
+        drained = event(STORAGE_WORKER_DRAIN_READY, value->channel);
         assert(storage_supervisor_handle_event(s, &drained) == 0);
     }
     return storage_supervisor_handle_event(s, value);
@@ -162,7 +167,7 @@ static void test_invalid_sequences(void)
     assert_reason(&s, "invalid_running_sequence");
 
     storage_supervisor_init(&s, 1u);
-    value = event(STORAGE_WORKER_DRAINED, 0u);
+    value = event(STORAGE_WORKER_DRAIN_READY, 0u);
     assert(storage_supervisor_handle_event(&s, &value) != 0);
     assert_reason(&s, "invalid_drained_sequence");
 

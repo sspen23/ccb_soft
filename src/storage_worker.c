@@ -14,7 +14,8 @@ static bool transition_allowed(StorageWorkerState expected,
     case WORKER_WAIT_BOUNDARY: return next == WORKER_DMA_QUIESCING;
     case WORKER_DMA_QUIESCING: return next == WORKER_HARVESTING;
     case WORKER_HARVESTING: return next == WORKER_DRAINING;
-    case WORKER_DRAINING: return next == WORKER_FINALIZING;
+    case WORKER_DRAINING: return next == WORKER_DRAINED_WAIT_STOP;
+    case WORKER_DRAINED_WAIT_STOP: return next == WORKER_FINALIZING;
     case WORKER_FINALIZING: return next == WORKER_DONE;
     default: return false;
     }
@@ -56,6 +57,7 @@ const char *storage_worker_state_name(StorageWorkerState state)
     case WORKER_DMA_QUIESCING: return "dma_quiescing";
     case WORKER_HARVESTING: return "harvesting";
     case WORKER_DRAINING: return "draining";
+    case WORKER_DRAINED_WAIT_STOP: return "drained_wait_stop";
     case WORKER_FINALIZING: return "finalizing";
     case WORKER_DONE: return "done";
     case WORKER_FAILED: return "failed";

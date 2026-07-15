@@ -24,6 +24,8 @@ static void test_normal_lifecycle(void)
                                      WORKER_DRAINING) == 0);
     assert(storage_worker_producer_done(state));
     assert(storage_worker_transition(&state, WORKER_DRAINING,
+                                     WORKER_DRAINED_WAIT_STOP) == 0);
+    assert(storage_worker_transition(&state, WORKER_DRAINED_WAIT_STOP,
                                      WORKER_FINALIZING) == 0);
     assert(storage_worker_transition(&state, WORKER_FINALIZING,
                                      WORKER_DONE) == 0);

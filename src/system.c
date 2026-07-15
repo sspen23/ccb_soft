@@ -1844,6 +1844,44 @@ static void drain_storage_events(Task *task, bool report_eof)
                 storage_try_send_auto_drains();
             }
         }
+        if (event.type == STORAGE_WORKER_DRAIN_READY &&
+            !g_storage_supervisor.drain_report_emitted &&
+            (g_storage_supervisor.drained_mask &
+             g_storage_supervisor.target_channel_mask) ==
+                g_storage_supervisor.target_channel_mask) {
+            uint32_t channel;
+            bool integrity_ok = true;
+            const char *reason = "none";
+
+            for (channel = 0u; channel < NUM_CHANNELS; ++channel) {
+                const WorkerDrainReadyPayload *drain;
+
+                if ((g_storage_supervisor.target_channel_mask &
+                     (1u << channel)) == 0u)
+                    continue;
+                drain = &g_storage_supervisor.drain_result[channel];
+                if (drain->integrity_ok == 0u) {
+                    integrity_ok = false;
+                    if (strcmp(reason, "none") == 0 &&
+                        drain->reason[0] != '\0')
+                        reason = drain->reason;
+                }
+            }
+            system_emit_line(
+                STORAGE_LOG_ALWAYS_CRITICAL,
+                "storage_capture_drained task=%s ch0_bytes=%" PRIu64
+                " ch1_bytes=%" PRIu64 " ch2_bytes=%" PRIu64
+                " integrity_ok=%u reason=%s ready_for_stop=1",
+                event.payload.drain_ready.task_id,
+                g_storage_supervisor.drain_result[0]
+                    .nvme_completed_payload_bytes,
+                g_storage_supervisor.drain_result[1]
+                    .nvme_completed_payload_bytes,
+                g_storage_supervisor.drain_result[2]
+                    .nvme_completed_payload_bytes,
+                integrity_ok ? 1u : 0u, reason);
+            g_storage_supervisor.drain_report_emitted = true;
+        }
         if (event.type == STORAGE_WORKER_PERF_SAMPLE || event.type == STORAGE_WORKER_FATAL ||
             event.type == STORAGE_WORKER_FINAL_RESULT || event.type == STORAGE_WORKER_DIAG_EVENT) {
             (void)storage_perf_log_event(&event, task->task_id);
@@ -1865,7 +1903,7 @@ static void drain_storage_events(Task *task, bool report_eof)
         if (event.type == STORAGE_WORKER_READY && supervisor_rc == 0) task->ready_seen = true;
         else if (event.type == STORAGE_WORKER_ARMED && supervisor_rc == 0) task->armed_seen = true;
         else if (event.type == STORAGE_WORKER_RUNNING && supervisor_rc == 0) task->running_seen = true;
-        else if (event.type == STORAGE_WORKER_DRAINED && supervisor_rc == 0) task->drained_seen = true;
+        else if (event.type == STORAGE_WORKER_DRAIN_READY && supervisor_rc == 0) task->drained_seen = true;
         else if (event.type == STORAGE_WORKER_FINAL_RESULT) {
             if (task->final_result_seen) {
                 task->fatal_seen = true;
@@ -4537,6 +4575,115 @@ static int storage_worker_event_fd(void)
     return (int)value;
 }
 
+static int storage_worker_control_fd(void)
+{
+    const char *text = storage_config_compat_getenv(
+        CCB_INTERNAL_STORAGE_CONTROL_FD);
+    char *end = NULL;
+    long value;
+
+    if (!text || text[0] == '\0') return -1;
+    errno = 0;
+    value = strtol(text, &end, 10);
+    if (errno != 0 || end == text || *end != '\0' || value < 0 ||
+        value > INT_MAX)
+        return -1;
+    return (int)value;
+}
+
+static bool storage_result_fully_drained(const WriteResult *result)
+{
+    return result && result->data_persisted &&
+           result->final_completed_unharvested == 0u &&
+           result->final_ready_count == 0u &&
+           result->final_active_count == 0u &&
+           result->final_global_inflight == 0u &&
+           result->submit_count == result->completion_count &&
+           result->queued_payload_bytes == result->nvme_completed_bytes &&
+           result->nvme_completed_bytes == result->file_bytes &&
+           result->final_ring_occupied_bytes == 0u &&
+           result->dma_harvested_payload_bytes >= result->queued_payload_bytes &&
+           result->dma_harvested_payload_bytes - result->queued_payload_bytes ==
+               result->tail_unqueued_bytes;
+}
+
+static int storage_worker_wait_for_stop(uint64_t drain_epoch)
+{
+    StorageControlReader reader;
+    StorageControlMessage message;
+    int fd = storage_worker_control_fd();
+
+    if (fd < 0 || drain_epoch == 0u) return -1;
+    storage_ipc_control_reader_init(&reader);
+    for (;;) {
+        uint64_t deadline_us;
+        int rc;
+
+        if (storage_write_finalize_requested()) return 0;
+        deadline_us = storage_ipc_monotonic_us() + 500000u;
+        rc = storage_ipc_read_control_deadline(fd, &reader, &message,
+                                               deadline_us);
+        if (rc != 0) {
+            if (errno == ETIMEDOUT || errno == EAGAIN || errno == EINTR)
+                continue;
+            return -1;
+        }
+        if (message.type == STORAGE_CTRL_AUTO_DRAIN &&
+            message.stop_epoch == drain_epoch)
+            continue;
+        if (message.type != STORAGE_CTRL_STOP ||
+            message.stop_epoch != drain_epoch) {
+            errno = EPROTO;
+            return -1;
+        }
+        return 0;
+    }
+}
+
+static void storage_worker_fill_drain_ready(StorageWorkerEvent *event,
+                                            const WriteResult *result,
+                                            int channel)
+{
+    WorkerDrainReadyPayload *payload;
+    StorageErrorCode primary = result->primary_error;
+
+    if (!storage_error_code_valid(primary)) primary = STORAGE_ERR_NONE;
+    storage_ipc_make_event(event, STORAGE_WORKER_DRAIN_READY,
+                           (uint32_t)channel, primary,
+                           result->dma_observed_bytes,
+                           result->integrity_ok ? "none" : result->integrity_risk);
+    payload = &event->payload.drain_ready;
+    snprintf(payload->task_id, sizeof(payload->task_id), "%s", result->task_no);
+    payload->drain_epoch = result->stop_epoch;
+    payload->dma_observed_bytes = result->dma_observed_bytes;
+    payload->dma_harvested_payload_bytes =
+        result->dma_harvested_payload_bytes;
+    payload->queued_payload_bytes = result->queued_payload_bytes;
+    payload->nvme_completed_payload_bytes = result->nvme_completed_bytes;
+    payload->tail_unqueued_bytes = result->tail_unqueued_bytes;
+    payload->submit_count = result->submit_count;
+    payload->completion_count = result->completion_count;
+    payload->integrity_ok = result->integrity_ok ? 1u : 0u;
+    payload->primary_error = primary;
+    payload->secondary_error = storage_error_code_valid(result->secondary_error)
+                                   ? result->secondary_error : STORAGE_ERR_NONE;
+}
+
+static int storage_worker_emit_finalized(int event_fd,
+                                         const WriteResult *result,
+                                         int channel)
+{
+    StorageWorkerEvent event;
+
+    storage_ipc_make_event(&event, STORAGE_WORKER_STOP_PHASE,
+                           (uint32_t)channel, STORAGE_ERR_NONE,
+                           result->dma_observed_bytes, "finalized");
+    event.payload.phase.stop_epoch = result->stop_epoch;
+    event.payload.phase.stop_phase = STORAGE_WORKER_FINALIZED;
+    return storage_ipc_write_event_deadline(
+        event_fd, &event, storage_ipc_monotonic_us() + 1000000ull);
+}
+
 static int run_storage_worker_main(int argc, char **argv, bool supervised)
 {
     GlobalOptions gopt;
@@ -4595,21 +4742,47 @@ static int run_storage_worker_main(int argc, char **argv, bool supervised)
     {
         StorageWorkerEvent event;
         int event_fd = storage_worker_event_fd();
+        bool drained = storage_result_fully_drained(&result);
         if (supervised && event_fd >= 0) {
             event_channel_present = true;
-            if (rc == 0) {
-                storage_ipc_make_event(&event, STORAGE_WORKER_DRAINED, (uint32_t)args.channel_id,
-                                       STORAGE_ERR_NONE, result.dma_received_bytes, "drained");
+            if (drained) {
+                storage_worker_fill_drain_ready(&event, &result,
+                                                args.channel_id);
                 if (storage_ipc_write_event_deadline(
                         event_fd, &event,
                         storage_ipc_monotonic_us() + 1000000ull) != 0) {
                     rc = -1;
+                    drained = false;
                     (void)snprintf(result.integrity_risk, sizeof(result.integrity_risk),
-                                   "%s", "drained_event_send_failed");
+                                   "%s", "drain_ready_event_send_failed");
                     result.integrity_ok = false;
+                } else {
+                    system_emit_line(
+                        STORAGE_LOG_SUMMARY,
+                        "storage_worker_drain_ready task=%s channel=%d"
+                        " drain_epoch=%" PRIu64
+                        " ready=%u active=%u inflight=%u"
+                        " completed_unharvested=%u submit=%" PRIu64
+                        " completion=%" PRIu64 " bytes=%" PRIu64,
+                        result.task_no, args.channel_id, result.stop_epoch,
+                        result.final_ready_count, result.final_active_count,
+                        result.final_global_inflight,
+                        result.final_completed_unharvested,
+                        result.submit_count, result.completion_count,
+                        result.nvme_completed_bytes);
+                    if (!storage_write_finalize_requested() &&
+                        storage_worker_wait_for_stop(result.stop_epoch) != 0) {
+                        rc = -1;
+                        drained = false;
+                        (void)snprintf(
+                            result.integrity_risk,
+                            sizeof(result.integrity_risk), "%s",
+                            "drained_wait_stop_failed");
+                        result.integrity_ok = false;
+                    }
                 }
             }
-            if (rc != 0) {
+            if (!drained) {
                 if (!storage_write_fatal_event_sent()) {
                     storage_ipc_make_event(&event, STORAGE_WORKER_FATAL, (uint32_t)args.channel_id,
                                            result.primary_error != STORAGE_ERR_NONE
@@ -4624,11 +4797,29 @@ static int run_storage_worker_main(int argc, char **argv, bool supervised)
                     fatal_delivery_ok = true;
                 }
             }
-            /* A failed FINAL is meaningful only after a delivered FATAL.  If
-             * the critical FATAL pipe write itself failed, leave the pipe
-             * without FINAL and exit non-zero; the supervisor will classify
-             * the EOF explicitly instead of accepting an uncaused failure. */
-            if (rc == 0 || fatal_delivery_ok) {
+            if (drained && storage_worker_emit_finalized(
+                               event_fd, &result, args.channel_id) != 0) {
+                drained = false;
+                rc = -1;
+                fatal_delivery_ok = false;
+            }
+            if (drained || fatal_delivery_ok) {
+                system_emit_line(
+                    result.integrity_ok ? STORAGE_LOG_SUMMARY
+                                        : STORAGE_LOG_ALWAYS_CRITICAL,
+                    "storage_result channel=%d task=%s file_index=%u status=%s"
+                    " file_bytes=%" PRIu64 " data_persisted=%u"
+                    " receive_integrity_ok=%u storage_integrity_ok=%u"
+                    " integrity_ok=%u integrity_risk=%s",
+                    args.channel_id, result.task_no,
+                    (unsigned)result.file_index,
+                    result.integrity_ok ? "success" : "failed",
+                    result.file_bytes, result.data_persisted ? 1u : 0u,
+                    result.receive_integrity_ok ? 1u : 0u,
+                    result.storage_integrity_ok ? 1u : 0u,
+                    result.integrity_ok ? 1u : 0u,
+                    result.integrity_risk[0] != '\0'
+                        ? result.integrity_risk : "none");
                 storage_ipc_make_event(&event, STORAGE_WORKER_FINAL_RESULT,
                                        (uint32_t)args.channel_id,
                                        rc == 0 ? STORAGE_ERR_NONE
@@ -4651,10 +4842,11 @@ static int run_storage_worker_main(int argc, char **argv, bool supervised)
                (unsigned)result.file_index,
                result.data_persisted ? 1u : 0u);
     logger_close();
-    /* Standalone storage-write has no supervisor event pipe and retains its
-     * local commit/return contract.  A supervised worker, however, must not
-     * report success when its structured FINAL could not be delivered. */
-    return (rc == 0 && (!supervised || (event_channel_present && final_sent))) ? 0 : 1;
+    /* A delivered FINAL can report a failed task result while the worker
+     * process itself exits normally. */
+    if (supervised)
+        return event_channel_present && final_sent ? 0 : 1;
+    return rc == 0 ? 0 : 1;
 }
 
 static void handle_network_worker_signal(int signo)

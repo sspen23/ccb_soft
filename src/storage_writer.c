@@ -1,20 +1,49 @@
 #include "storage_writer.h"
 
+#include <limits.h>
+#include <string.h>
+
 bool storage_drain_invariant_ok(const StorageDrainInvariant *invariant)
 {
     if (!invariant || invariant->completion_count > invariant->submit_count)
         return false;
-    return invariant->dma_harvested_payload_bytes ==
-               invariant->queued_payload_bytes &&
+    if (invariant->tail_unqueued_bytes > UINT64_MAX -
+            invariant->queued_payload_bytes)
+        return false;
+    return invariant->input_complete && invariant->dma_quiesced &&
+           invariant->dma_harvested_payload_bytes ==
+               invariant->queued_payload_bytes + invariant->tail_unqueued_bytes &&
            invariant->queued_payload_bytes ==
                invariant->nvme_completed_payload_bytes &&
            invariant->nvme_completed_payload_bytes == invariant->file_bytes &&
-           invariant->tail_unqueued_bytes == 0u &&
            invariant->completed_unharvested == 0u &&
            invariant->ready_count == 0u && invariant->active_count == 0u &&
            invariant->global_inflight == 0u &&
-           invariant->submit_count - invariant->completion_count ==
-               invariant->global_inflight;
+           invariant->submit_count == invariant->completion_count &&
+           invariant->ring_occupied_bytes == 0u;
+}
+
+void storage_drain_stable_init(StorageDrainStableState *state)
+{
+    if (state) memset(state, 0, sizeof(*state));
+}
+
+bool storage_drain_stable_observe(StorageDrainStableState *state,
+                                  const StorageDrainInvariant *invariant,
+                                  uint64_t now_us,
+                                  uint32_t required_scans,
+                                  uint64_t stable_us)
+{
+    if (!state || !storage_drain_invariant_ok(invariant)) {
+        storage_drain_stable_init(state);
+        return false;
+    }
+    if (required_scans == 0u) required_scans = 1u;
+    if (state->consecutive_scans == 0u) state->empty_since_us = now_us;
+    if (state->consecutive_scans != UINT32_MAX) ++state->consecutive_scans;
+    return state->consecutive_scans >= required_scans &&
+           now_us >= state->empty_since_us &&
+           now_us - state->empty_since_us >= stable_us;
 }
 
 StorageCrossSlotWriterDecision storage_cross_slot_writer_decide(

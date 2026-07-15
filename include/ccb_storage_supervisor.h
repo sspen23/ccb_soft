@@ -17,7 +17,8 @@ typedef struct {
     StorageErrorCode primary_error, secondary_error;
     uint32_t fatal_channel; char fatal_reason[64]; char secondary_reason[64];
     WriteResult final_result[NUM_CHANNELS];
-    bool aggregate_emitted;
+    WorkerDrainReadyPayload drain_result[NUM_CHANNELS];
+    bool aggregate_emitted, drain_report_emitted;
     StorageTaskTerminal terminal;
 } StorageTaskSupervisor;
 

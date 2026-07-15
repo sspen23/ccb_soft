@@ -62,6 +62,15 @@ int main(void)
     assert(e.payload_size == sizeof(WorkerReadyPayload));
     assert(storage_ipc_write_event(p[1], &e) == 0);
     assert(storage_ipc_read_event(p[0], &eo) == 0 && eo.type == STORAGE_WORKER_READY);
+    storage_ipc_make_event(&e, STORAGE_WORKER_DRAIN_READY, 0u,
+                           STORAGE_ERR_NONE, 4096u, "none");
+    e.payload.drain_ready.drain_epoch = 44u;
+    e.payload.drain_ready.secondary_error = STORAGE_ERR_NONE;
+    assert(e.payload_size == sizeof(WorkerDrainReadyPayload));
+    assert(storage_ipc_write_event(p[1], &e) == 0);
+    assert(storage_ipc_read_event(p[0], &eo) == 0 &&
+           eo.type == STORAGE_WORKER_DRAIN_READY &&
+           eo.payload.drain_ready.drain_epoch == 44u);
     storage_ipc_make_event(&e, STORAGE_WORKER_STOP_PHASE, 0u, STORAGE_ERR_NONE, 0u, "phase");
     e.payload.phase.stop_epoch = 1234u;
     e.payload.phase.stop_phase = STORAGE_WORKER_STOP_REQUESTED;

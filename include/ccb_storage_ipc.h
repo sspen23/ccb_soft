@@ -55,7 +55,7 @@ typedef enum {
     STORAGE_WORKER_ARMED = 2,
     STORAGE_WORKER_RUNNING = 3,
     STORAGE_WORKER_FATAL = 4,
-    STORAGE_WORKER_DRAINED = 5,
+    STORAGE_WORKER_DRAIN_READY = 5,
     STORAGE_WORKER_FINAL_RESULT = 6,
     STORAGE_WORKER_PERF_SAMPLE = 7,
     STORAGE_WORKER_DIAG_EVENT = 8,
@@ -113,6 +113,22 @@ typedef struct {
 } WorkerFatalPayload;
 
 typedef struct {
+    char task_id[12];
+    uint64_t drain_epoch;
+    uint64_t dma_observed_bytes;
+    uint64_t dma_harvested_payload_bytes;
+    uint64_t queued_payload_bytes;
+    uint64_t nvme_completed_payload_bytes;
+    uint64_t tail_unqueued_bytes;
+    uint64_t submit_count;
+    uint64_t completion_count;
+    uint32_t integrity_ok;
+    StorageErrorCode primary_error;
+    StorageErrorCode secondary_error;
+    char reason[64];
+} WorkerDrainReadyPayload;
+
+typedef struct {
     StorageErrorCode error_code;
     uint32_t reserved;
     uint64_t received_bytes;
@@ -133,6 +149,7 @@ typedef struct {
         WorkerReadyPayload ready;
         WorkerPhasePayload phase;
         WorkerFatalPayload fatal;
+        WorkerDrainReadyPayload drain_ready;
         WorkerFinalPayload final;
         StoragePerfSample perf;
         StorageEventRecord diag;

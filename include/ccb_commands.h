@@ -91,6 +91,7 @@ void storage_write_reset_stop(void);
 void storage_write_request_stop(void);
 void storage_write_flush_deferred_diag(void);
 bool storage_write_fatal_event_sent(void);
+bool storage_write_finalize_requested(void);
 
 typedef enum {
     STORAGE_CROSS_SLOT_CONFIG_ENABLED = 0,

@@ -114,13 +114,22 @@ int storage_supervisor_handle_event(StorageTaskSupervisor *s, const StorageWorke
         }
         s->idle_candidate_mask &= ~b;
         break;
-    case STORAGE_WORKER_DRAINED:
+    case STORAGE_WORKER_DRAIN_READY:
         if ((s->running_mask & b) == 0u || (s->drained_mask & b) != 0u ||
-            (s->final_seen_mask & b) != 0u) {
+            (s->final_seen_mask & b) != 0u ||
+            e->payload.drain_ready.drain_epoch == 0u) {
             fail(s, e->channel, STORAGE_ERR_IPC_SEQUENCE, "invalid_drained_sequence");
             return -1;
         }
+        if (s->stop_epoch == 0u)
+            s->stop_epoch = e->payload.drain_ready.drain_epoch;
+        if (s->stop_epoch != e->payload.drain_ready.drain_epoch) {
+            fail(s, e->channel, STORAGE_ERR_IPC_SEQUENCE,
+                 "drain_epoch_mismatch");
+            return -1;
+        }
         s->drained_mask |= b;
+        s->drain_result[e->channel] = e->payload.drain_ready;
         break;
         case STORAGE_WORKER_FATAL:
             if ((s->final_seen_mask & b) != 0u ||
@@ -137,10 +146,7 @@ int storage_supervisor_handle_event(StorageTaskSupervisor *s, const StorageWorke
             fail(s, e->channel, STORAGE_ERR_IPC_SEQUENCE, "duplicate_final");
             return -1;
         }
-        if ((e->payload.final.error_code == STORAGE_ERR_NONE &&
-             (s->drained_mask & b) == 0u) ||
-            (e->payload.final.error_code != STORAGE_ERR_NONE &&
-             (s->fatal_seen_mask & b) == 0u)) {
+        if ((s->drained_mask & b) == 0u && (s->fatal_seen_mask & b) == 0u) {
             fail(s, e->channel, STORAGE_ERR_IPC_SEQUENCE, "invalid_final_sequence");
             return -1;
         }
