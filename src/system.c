@@ -2086,6 +2086,7 @@ static int start_storage_worker(const PlannedFile *planned, const char *task_id,
         setenv(CCB_INTERNAL_STORAGE_CONTROL_FD, start_fd, 1);
         snprintf(event_fd, sizeof(event_fd), "%d", event_pipe[1]);
         setenv(CCB_INTERNAL_STORAGE_EVENT_FD, event_fd, 1);
+        setenv(CCB_INTERNAL_STORAGE_WORKER, "1", 1);
         {
             int flags = fcntl(event_pipe[1], F_GETFL, 0);
             if (flags >= 0) (void)fcntl(event_pipe[1], F_SETFL, flags | O_NONBLOCK);

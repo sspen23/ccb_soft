@@ -69,13 +69,58 @@ static void warn_deprecated_once(const char *name)
             name);
 }
 
+static bool is_storage_worker_process(void)
+{
+    return !text_is_false(getenv(CCB_INTERNAL_STORAGE_WORKER));
+}
+
+static void warn_profile_overrides_once(void)
+{
+    static const char *const global_names[] = {
+        "SRC_REAL_NVME_CMD_KIB", "SRC_REAL_NVME_QD",
+        "SRC_REAL_TARGET_QD", "SRC_REAL_MAX_ACTIVE", "SRC_REAL_CQ_BATCH",
+        "SRC_REAL_CROSS_SLOT", "SRC_REAL_CROSS_SLOT_ENABLED",
+        "SRC_REAL_WRITER_RT_POLICY", "SRC_REAL_PRODUCER_RT_POLICY",
+        "SRC_REAL_STORAGE_RING_BYTES", "SRC_REAL_STORAGE_DMA_DESC_BYTES",
+    };
+    static const char *const channel_patterns[] = {
+        "SRC_REAL_NVME_CMD_KIB_CH%u", "SRC_REAL_NVME_QD_CH%u",
+        "SRC_REAL_TARGET_QD_CH%u", "SRC_REAL_MAX_ACTIVE_CH%u",
+        "SRC_REAL_CQ_BATCH_CH%u", "SRC_REAL_CROSS_SLOT_CH%u",
+        "SRC_REAL_CH%u_TARGET_QD", "SRC_REAL_CH%u_CQ_BATCH",
+        "SRC_REAL_CH%u_WRITER_RT_PRIO", "SRC_REAL_CH%u_PRODUCER_RT_PRIO",
+        "SRC_REAL_STORAGE_RING_BYTES_CH%u",
+        "SRC_REAL_STORAGE_DMA_DESC_BYTES_CH%u",
+    };
+    size_t i;
+    uint32_t channel;
+
+    if (is_storage_worker_process()) return;
+    for (i = 0u; i < sizeof(global_names) / sizeof(global_names[0]); ++i) {
+        const char *value = getenv(global_names[i]);
+        if (value && value[0] != '\0') warn_deprecated_once(global_names[i]);
+    }
+    for (channel = 0u; channel < NUM_CHANNELS; ++channel) {
+        for (i = 0u;
+             i < sizeof(channel_patterns) / sizeof(channel_patterns[0]); ++i) {
+            char name[96];
+            const char *value;
+
+            (void)snprintf(name, sizeof(name), channel_patterns[i], channel);
+            value = getenv(name);
+            if (value && value[0] != '\0') warn_deprecated_once(name);
+        }
+    }
+}
+
 const char *storage_config_compat_getenv(const char *name)
 {
     const char *value;
 
     if (!name) return NULL;
     value = getenv(name);
-    if (value && value[0] != '\0' && strncmp(name, "SRC_REAL_", 9u) == 0)
+    if (value && value[0] != '\0' && strncmp(name, "SRC_REAL_", 9u) == 0 &&
+        !is_storage_worker_process())
         warn_deprecated_once(name);
     if (value && value[0] != '\0' && is_profile_override_name(name) &&
         !storage_config_legacy_compat_enabled())
@@ -221,6 +266,7 @@ int storage_config_load(AppConfig *out, char *error, size_t error_size)
         return -1;
     }
     out->legacy_compat_mode = storage_config_legacy_compat_enabled();
+    warn_profile_overrides_once();
 
     out->status_timeout_ms = DEFAULT_STATUS_TIMEOUT_MS;
     value = getenv("CCB_STATUS_TIMEOUT_MS");
