@@ -54,6 +54,13 @@ typedef struct {
     uint32_t writer_priority;
     bool producer_realtime;
     uint32_t producer_priority;
+    uint32_t nominal_input_mib_s;
+    uint32_t scheduler_weight;
+    int32_t writer_nice;
+    int32_t producer_nice;
+    uint32_t writer_budget_us;
+    uint32_t busy_poll_us;
+    uint32_t empty_sleep_us;
 } ChannelStorageConfig;
 
 typedef struct {

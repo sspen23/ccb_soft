@@ -267,6 +267,7 @@ typedef struct {
     uint32_t nvme_active_qd_current;
     uint64_t nvme_active_qd_integral_us;
     uint64_t nvme_active_qd_observed_us;
+    uint64_t nvme_active_us;
     uint64_t nvme_active_qd_last_update_us;
     uint64_t nvme_submit_calls;
     uint64_t nvme_submit_total_us;

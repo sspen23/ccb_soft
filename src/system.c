@@ -181,9 +181,12 @@ static void poll_storage_events(Task *task);
 static void finalize_storage_task(Task *task, int exit_code);
 static void storage_try_send_pending_stops(void);
 static void storage_try_send_auto_drains(void);
+static void storage_service_idle_auto_drain(void);
 static void storage_finish_worker_exit(Task *task, int exit_code, int signal_number);
 static void storage_handle_worker_exit(Task *task, int status);
-static int storage_commit_supervised_results(const char *task_id);
+static int storage_commit_supervised_results(const char *task_id,
+                                             TaskStatus final_status);
+static bool storage_result_fully_drained(const WriteResult *result);
 static void storage_service_pending_stop(void);
 static void storage_service_pending_start(void);
 static void system_emit_line(StorageLogSeverity severity, const char *fmt, ...);
@@ -215,14 +218,27 @@ static void storage_supervisor_emit_aggregate(void)
             task_id = storage_tasks[i].task_id;
         }
     }
-    if (status == STORAGE_TASK_SUCCESS && storage_commit_supervised_results(task_id) != 0) {
+    if (status == STORAGE_TASK_SUCCESS &&
+        storage_commit_supervised_results(task_id, TASK_COMPLETED) != 0) {
         storage_supervisor_protocol_fail(&g_storage_supervisor, NUM_CHANNELS,
                                          g_storage_commit_state.reason);
         status = STORAGE_TASK_FAILED;
         capture_task_fail(&g_capture_task, STORAGE_ERR_COMMIT);
     } else if (status == STORAGE_TASK_FAILED && task_id[0] != '\0') {
-        (void)task_update_status(task_id, TASK_FAILED);
-        capture_task_fail(&g_capture_task, STORAGE_ERR_WORKER_EXIT);
+        int partial_commit_rc = storage_commit_supervised_results(
+            task_id, TASK_FAILED);
+
+        if (partial_commit_rc > 0)
+            (void)task_update_status(task_id, TASK_FAILED);
+        else if (partial_commit_rc < 0)
+            LOG_ERROR("FILE_LIST",
+                      "Partial persisted file commit failed: task=%s reason=%s",
+                      task_id, g_storage_commit_state.reason);
+        capture_task_fail(
+            &g_capture_task,
+            g_storage_supervisor.primary_error != STORAGE_ERR_NONE
+                ? g_storage_supervisor.primary_error
+                : STORAGE_ERR_INTEGRITY);
     } else if (status == STORAGE_TASK_SUCCESS &&
                g_capture_task.state == CAPTURE_COMMITTING) {
         (void)capture_task_transition(&g_capture_task, CAPTURE_COMMITTING,
@@ -896,7 +912,9 @@ static void storage_try_send_pending_stops(void)
     size_t i;
 
     if (pending != 0u && g_capture_task.stop_epoch == 0u) {
-        uint64_t stop_epoch = storage_ipc_monotonic_us();
+        uint64_t stop_epoch = g_storage_supervisor.auto_drain_epoch != 0u
+                                  ? g_storage_supervisor.auto_drain_epoch
+                                  : storage_ipc_monotonic_us();
         if (stop_epoch == 0u) stop_epoch = 1u;
         (void)capture_task_request_stop(&g_capture_task, stop_epoch);
     }
@@ -1575,12 +1593,14 @@ static int storage_commit_sync_mark_complete(void *ctx, const char *task_id)
     return storage_sync_outbox_mark_complete(storage_sync_outbox_dir(), task_id);
 }
 
-static int storage_commit_supervised_results(const char *task_id)
+static int storage_commit_supervised_results(const char *task_id,
+                                             TaskStatus final_status)
 {
     StorageCommitContext ctx;
     StorageCommitItem items[NUM_CHANNELS];
     StorageCommitOps ops;
     size_t count = 0u;
+    size_t expected_count = 0u;
     uint32_t channel;
 
     memset(&ctx, 0, sizeof(ctx));
@@ -1593,9 +1613,12 @@ static int storage_commit_supervised_results(const char *task_id)
         StorageCommitItem *item;
 
         if ((g_storage_supervisor.target_channel_mask & (1u << channel)) == 0u) continue;
+        ++expected_count;
         task = &storage_tasks[channel];
         planned = &task->planned_file;
         result = &g_storage_supervisor.final_result[channel];
+        if (!storage_result_fully_drained(result) || result->file_bytes == 0u)
+            continue;
         if (!task->has_planned_file || planned->channel_id != (int)channel ||
             result->channel_id != (int)channel || result->metadata_slot >= MAX_FILES_TOTAL ||
             result->file_index > UINT16_MAX || result->sector_count > UINT32_MAX ||
@@ -1637,6 +1660,16 @@ static int storage_commit_supervised_results(const char *task_id)
                  task_id, item->record.file_type, (unsigned)result->file_index);
     }
 
+    if (final_status == TASK_COMPLETED && count != expected_count) {
+        snprintf(g_storage_commit_state.reason,
+                 sizeof(g_storage_commit_state.reason), "%s",
+                 "complete_result_missing_drained_channel");
+        g_storage_commit_state.attempted = true;
+        g_storage_commit_state.success = false;
+        (void)task_update_status(task_id, TASK_FAILED);
+        return -1;
+    }
+    if (count == 0u) return 1;
     ops.ctx = &ctx;
     ops.db_begin = storage_commit_db_begin;
     ops.record_exists = storage_commit_record_exists;
@@ -1651,7 +1684,8 @@ static int storage_commit_supervised_results(const char *task_id)
     ops.flash_sync = storage_commit_flash_sync;
     ops.sync_mark_pending = storage_commit_sync_mark_pending;
     ops.sync_mark_complete = storage_commit_sync_mark_complete;
-    return storage_commit_run_once(&g_storage_commit_state, task_id, items, count, &ops);
+    return storage_commit_run_once_status(&g_storage_commit_state, task_id,
+                                          items, count, final_status, &ops);
 }
 
 static void append_task_output(Task *task, const char *buf, size_t len)
@@ -1829,18 +1863,23 @@ static void drain_storage_events(Task *task, bool report_eof)
             task->first_fatal = protocol_fatal;
             continue;
         }
-        if (storage_supervisor_auto_drain_ready(&g_storage_supervisor)) {
+        if (event.type == STORAGE_WORKER_DRAIN_REQUEST &&
+            !g_storage_supervisor.auto_drain_triggered) {
             uint64_t drain_epoch = storage_ipc_monotonic_us();
 
             if (drain_epoch == 0u) drain_epoch = 1u;
-            if (storage_supervisor_begin_auto_drain(&g_storage_supervisor,
-                                                    drain_epoch)) {
+            if (storage_supervisor_begin_forced_drain(
+                    &g_storage_supervisor, drain_epoch)) {
                 system_emit_line(
-                    STORAGE_LOG_SUMMARY,
-                    "storage_input_complete task=%s drain_epoch=%" PRIu64
-                    " target_mask=0x%02X",
+                    STORAGE_LOG_ALWAYS_CRITICAL,
+                    "storage_pressure_drain_start task=%s drain_epoch=%" PRIu64
+                    " target_mask=0x%02X reason=%s trigger_channel=%u",
                     task->task_id, drain_epoch,
-                    g_storage_supervisor.target_channel_mask);
+                    g_storage_supervisor.target_channel_mask,
+                    event.payload.ready.reason[0] != '\0'
+                        ? event.payload.ready.reason
+                        : "storage_pressure_no_upstream_backpressure",
+                    event.channel);
                 storage_try_send_auto_drains();
             }
         }
@@ -1945,6 +1984,48 @@ static void poll_storage_events(Task *task)
     drain_storage_events(task, true);
     storage_try_send_pending_stops();
     storage_supervisor_emit_aggregate();
+}
+
+static void storage_service_idle_auto_drain(void)
+{
+    const AppConfig *config = storage_config_get();
+    size_t channel;
+    uint64_t now_us;
+    uint64_t stable_us;
+    uint64_t drain_epoch;
+
+    if (!config || !config->auto_input_complete ||
+        g_capture_task.state != CAPTURE_RUNNING)
+        return;
+    now_us = storage_ipc_monotonic_us();
+    stable_us = (uint64_t)config->idle_required_ms * 1000u;
+    if (!storage_supervisor_auto_drain_ready(&g_storage_supervisor,
+                                             now_us, stable_us))
+        return;
+    /* Close the gap between the periodic per-task poll and the irreversible
+     * AUTO_DRAIN command.  A queued INPUT_ACTIVE revocation gets one final
+     * chance to cancel the all-idle barrier before DMA quiesce is committed. */
+    for (channel = 0u; channel < STORAGE_TASK_COUNT; ++channel) {
+        if ((g_storage_supervisor.target_channel_mask & (1u << channel)) != 0u)
+            drain_storage_events(&storage_tasks[channel], false);
+    }
+    now_us = storage_ipc_monotonic_us();
+    if (!storage_supervisor_auto_drain_ready(&g_storage_supervisor,
+                                             now_us, stable_us))
+        return;
+    drain_epoch = now_us != 0u ? now_us : 1u;
+    if (!storage_supervisor_begin_auto_drain(&g_storage_supervisor,
+                                             drain_epoch, now_us,
+                                             stable_us))
+        return;
+    system_emit_line(
+        STORAGE_LOG_SUMMARY,
+        "storage_input_complete task=%s drain_epoch=%" PRIu64
+        " target_mask=0x%02X stable_ms=%u",
+        g_capture_task.task_id, drain_epoch,
+        g_storage_supervisor.target_channel_mask,
+        config->idle_required_ms);
+    storage_try_send_auto_drains();
 }
 
 static int start_storage_worker(const PlannedFile *planned, const char *task_id, time_t overpass_time)
@@ -5208,7 +5289,7 @@ int main(int argc, char **argv)
         for (channel = 0u; channel < NUM_CHANNELS; ++channel) {
             const ChannelStorageConfig *storage = &config->channels[channel];
             LOG_INFO("SYSTEM",
-                     "Storage channel config: ch=%u pipeline_mode=%s writer_mode=%s legacy_fallback_enabled=0 ring=%" PRIu64 " descriptor=%u command=%u qd=%u active=%u cq_batch=%u writer_policy=%s writer_priority=%u producer_policy=%s producer_priority=%u",
+                     "Storage channel config: ch=%u pipeline_mode=%s writer_mode=%s legacy_fallback_enabled=0 ring=%" PRIu64 " descriptor=%u command=%u qd=%u active=%u cq_batch=%u writer_policy=%s writer_priority=%u producer_policy=%s producer_priority=%u nominal_input_mib_s=%u scheduler_weight=%u writer_nice=%d producer_nice=%d writer_budget_us=%u busy_poll_us=%u empty_sleep_us=%u",
                      storage->channel,
                      storage->writer_mode == STORAGE_WRITER_CROSS_SLOT
                          ? "cross_slot" : "legacy",
@@ -5223,7 +5304,14 @@ int main(int argc, char **argv)
                      storage->writer_realtime ? "rr" : "other",
                      storage->writer_priority,
                      storage->producer_realtime ? "rr" : "other",
-                     storage->producer_priority);
+                     storage->producer_priority,
+                     storage->nominal_input_mib_s,
+                     storage->scheduler_weight,
+                     storage->writer_nice,
+                     storage->producer_nice,
+                     storage->writer_budget_us,
+                     storage->busy_poll_us,
+                     storage->empty_sleep_us);
         }
     }
     if (storage_health_start(probe_one_storage_channel, NULL, 5000u) != 0)
@@ -5271,6 +5359,9 @@ int main(int argc, char **argv)
                 check_task(&storage_tasks[i]);
             }
         }
+        /* All worker event pipes have been drained for this loop.  Only now
+         * may a stable all-channel idle barrier become INPUT_COMPLETE. */
+        storage_service_idle_auto_drain();
         storage_service_pending_start();
         storage_service_pending_stop();
         check_task(&transfer_task);

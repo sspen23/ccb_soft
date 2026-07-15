@@ -248,6 +248,18 @@ static void set_channel_profile(AppConfig *config)
         storage->writer_priority = 0u;
         storage->producer_realtime = false;
         storage->producer_priority = 0u;
+        storage->nominal_input_mib_s = channel == LOW_SPEED_CHANNEL_ID
+                                          ? 80u : 1200u;
+        storage->scheduler_weight = channel == LOW_SPEED_CHANNEL_ID
+                                        ? 1u : 15u;
+        storage->writer_nice = channel == LOW_SPEED_CHANNEL_ID ? 6 : -6;
+        storage->producer_nice = storage->writer_nice;
+        storage->writer_budget_us = !safe && channel != LOW_SPEED_CHANNEL_ID
+                                        ? 1000u : 300u;
+        storage->busy_poll_us = !safe && channel != LOW_SPEED_CHANNEL_ID
+                                    ? 100u : 20u;
+        storage->empty_sleep_us = !safe && channel != LOW_SPEED_CHANNEL_ID
+                                      ? 0u : 1u;
     }
 }
 

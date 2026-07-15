@@ -173,7 +173,34 @@ static void test_multislot_out_of_order_and_budget(void)
     assert(nvme_cross_slot_engine_step(value, 300u, done, &mock) == 0);
     assert(mock.callbacks == 2u);
     assert(nvme_cross_slot_engine_active(value) == 0u);
+    assert(__atomic_load_n(&rt.nvme_active_us, __ATOMIC_ACQUIRE) > 0u);
+    assert(__atomic_load_n(&rt.nvme_active_qd_observed_us,
+                           __ATOMIC_ACQUIRE) > 0u);
     nvme_cross_slot_engine_destroy(value);
+}
+
+static void test_reset_clears_active_window(void)
+{
+    ChannelRuntime rt;
+
+    memset(&rt, 0, sizeof(rt));
+    rt.nvme_first_submit_us = 1u;
+    rt.nvme_last_completion_us = 2u;
+    rt.nvme_active_qd_integral_us = 3u;
+    rt.nvme_active_qd_observed_us = 4u;
+    rt.nvme_active_us = 5u;
+    rt.nvme_active_qd_last_update_us = 6u;
+    rt.nvme_active_qd_current = 7u;
+    rt.nvme_active_qd_max = 8u;
+    nvme_reset_sw_timing(&rt);
+    assert(rt.nvme_first_submit_us == 0u);
+    assert(rt.nvme_last_completion_us == 0u);
+    assert(rt.nvme_active_qd_integral_us == 0u);
+    assert(rt.nvme_active_qd_observed_us == 0u);
+    assert(rt.nvme_active_us == 0u);
+    assert(rt.nvme_active_qd_last_update_us == 0u);
+    assert(rt.nvme_active_qd_current == 0u);
+    assert(rt.nvme_active_qd_max == 0u);
 }
 
 static void test_completion_failures(void)
@@ -464,6 +491,7 @@ static void test_submit_acceptance_unknown_retains_cid_until_completion(void)
 
 int main(void)
 {
+    test_reset_clears_active_window();
     test_multislot_out_of_order_and_budget();
     test_completion_failures();
     test_capacity_sq_full_and_callback();

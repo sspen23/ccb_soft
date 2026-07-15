@@ -744,6 +744,14 @@ void nvme_reset_sw_timing(ChannelRuntime *rt) {
     rt->nvme_cq_wait_total_us = 0u;
     rt->nvme_cq_pop_total_us = 0u;
     rt->nvme_cq_completed = 0u;
+    rt->nvme_first_submit_us = 0u;
+    rt->nvme_last_completion_us = 0u;
+    rt->nvme_active_qd_integral_us = 0u;
+    rt->nvme_active_qd_observed_us = 0u;
+    rt->nvme_active_us = 0u;
+    rt->nvme_active_qd_last_update_us = 0u;
+    rt->nvme_active_qd_current = 0u;
+    rt->nvme_active_qd_max = 0u;
     rt->nvme_active_qd_event_sum = 0u;
     rt->nvme_active_qd_event_samples = 0u;
     rt->nvme_active_qd_event_min = UINT32_MAX;
@@ -1059,6 +1067,10 @@ static void nvme_update_active_qd(ChannelRuntime *rt, uint32_t new_qd, uint64_t 
         (void)__atomic_add_fetch(&rt->nvme_active_qd_observed_us,
                                  elapsed_us,
                                  __ATOMIC_RELAXED);
+        if (old_qd != 0u) {
+            (void)__atomic_add_fetch(&rt->nvme_active_us, elapsed_us,
+                                     __ATOMIC_RELAXED);
+        }
     }
     rt->nvme_active_qd_last_update_us = now_us;
     __atomic_store_n(&rt->nvme_active_qd_current, new_qd, __ATOMIC_RELEASE);

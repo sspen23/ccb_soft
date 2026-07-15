@@ -41,6 +41,21 @@ bool storage_ring_pressure_should_stop(uint32_t pressure_level,
            now_us - critical_since_us >= critical_duration_us;
 }
 
+bool storage_ring_pressure_requires_degraded_drain(uint32_t pressure_level,
+                                                   bool drain_requested)
+{
+    return pressure_level >= 2u && !drain_requested;
+}
+
+bool storage_receive_failure_allows_drain(bool safe_discard,
+                                          bool pressure_drain,
+                                          bool dma_error,
+                                          bool descriptor_error)
+{
+    return (safe_discard || pressure_drain) && !dma_error &&
+           !descriptor_error;
+}
+
 StorageFirstDmaDeadlineOutcome storage_first_dma_deadline_outcome(
     bool deadline_due, bool saw_dma_data, bool stop_requested,
     int harvest_rc, uint32_t harvest_count)

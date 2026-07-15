@@ -185,6 +185,31 @@ static void test_invalid_sequences(void)
     assert_reason(&s, "invalid_final_sequence");
 }
 
+static void test_pressure_request_forces_one_global_drain(void)
+{
+    StorageTaskSupervisor s;
+    StorageWorkerEvent value;
+
+    storage_supervisor_init(&s, 7u);
+    advance_to_running(&s, 0u);
+    advance_to_running(&s, 1u);
+    advance_to_running(&s, 2u);
+    value = event(STORAGE_WORKER_DRAIN_REQUEST, 0u);
+    assert(storage_supervisor_handle_event(&s, &value) == 0);
+    assert(s.drain_request_mask == 1u);
+    assert(storage_supervisor_begin_forced_drain(&s, 900u));
+    assert(s.auto_drain_epoch == 900u);
+    assert(storage_supervisor_auto_drain_pending_mask(&s) == 7u);
+    assert(!storage_supervisor_begin_forced_drain(&s, 901u));
+
+    value = event(STORAGE_WORKER_DRAIN_REQUEST, 1u);
+    assert(storage_supervisor_handle_event(&s, &value) == 0);
+    assert(s.drain_request_mask == 3u);
+    assert(storage_supervisor_auto_drain_pending_mask(&s) == 7u);
+    assert(storage_supervisor_handle_event(&s, &value) != 0);
+    assert_reason(&s, "invalid_drain_request_sequence");
+}
+
 static void test_event_pipe_ownership(void)
 {
     StorageTaskSupervisor s;
@@ -415,30 +440,52 @@ static void test_multichannel_input_idle_coordination(void)
         advance_to_running(&s, channel);
 
     value = event(STORAGE_WORKER_INPUT_IDLE_CANDIDATE, 2u);
+    value.timestamp_us = 100u;
     assert(storage_supervisor_handle_event(&s, &value) == 0);
-    assert(!storage_supervisor_auto_drain_ready(&s));
+    assert(!storage_supervisor_auto_drain_ready(&s, 100u, 500u));
     value = event(STORAGE_WORKER_INPUT_IDLE_CANDIDATE, 0u);
+    value.timestamp_us = 200u;
     assert(storage_supervisor_handle_event(&s, &value) == 0);
-    assert(!storage_supervisor_auto_drain_ready(&s));
+    assert(!storage_supervisor_auto_drain_ready(&s, 200u, 500u));
     value = event(STORAGE_WORKER_INPUT_ACTIVE, 2u);
+    value.timestamp_us = 300u;
     assert(storage_supervisor_handle_event(&s, &value) == 0);
-    assert(!storage_supervisor_auto_drain_ready(&s));
+    assert(!storage_supervisor_auto_drain_ready(&s, 800u, 500u));
+    assert(s.idle_all_since_us == 0u);
     value = event(STORAGE_WORKER_INPUT_IDLE_CANDIDATE, 2u);
+    value.timestamp_us = 400u;
     assert(storage_supervisor_handle_event(&s, &value) == 0);
     value = event(STORAGE_WORKER_INPUT_IDLE_CANDIDATE, 1u);
+    value.timestamp_us = 500u;
     assert(storage_supervisor_handle_event(&s, &value) == 0);
-    assert(storage_supervisor_auto_drain_ready(&s));
-    assert(storage_supervisor_begin_auto_drain(&s, 123u));
+    assert(!storage_supervisor_auto_drain_ready(&s, 999u, 500u));
+    value = event(STORAGE_WORKER_INPUT_ACTIVE, 1u);
+    value.timestamp_us = 700u;
+    assert(storage_supervisor_handle_event(&s, &value) == 0);
+    assert(s.idle_all_since_us == 0u);
+    assert(!storage_supervisor_auto_drain_ready(&s, 1200u, 500u));
+    value = event(STORAGE_WORKER_INPUT_IDLE_CANDIDATE, 1u);
+    value.timestamp_us = 800u;
+    assert(storage_supervisor_handle_event(&s, &value) == 0);
+    assert(!storage_supervisor_auto_drain_ready(&s, 1299u, 500u));
+    assert(storage_supervisor_auto_drain_ready(&s, 1300u, 500u));
+    assert(storage_supervisor_begin_auto_drain(&s, 123u, 1300u, 500u));
     assert(s.auto_drain_epoch == 123u);
+    assert(s.stop_epoch == 123u);
     assert(storage_supervisor_auto_drain_pending_mask(&s) == 7u);
     storage_supervisor_mark_auto_drain_sent(&s, 0u);
     storage_supervisor_mark_auto_drain_sent(&s, 1u);
     storage_supervisor_mark_auto_drain_sent(&s, 2u);
     assert(storage_supervisor_auto_drain_pending_mask(&s) == 0u);
-    assert(!storage_supervisor_begin_auto_drain(&s, 124u));
+    assert(!storage_supervisor_begin_auto_drain(&s, 124u, 1500u, 500u));
     value = event(STORAGE_WORKER_INPUT_IDLE_CANDIDATE, 1u);
     assert(storage_supervisor_handle_event(&s, &value) == 0);
     assert(s.auto_drain_epoch == 123u);
+    value = event(STORAGE_WORKER_INPUT_ACTIVE, 1u);
+    assert(storage_supervisor_handle_event(&s, &value) != 0);
+    assert_reason(&s, "input_resumed_after_drain_commit");
+    assert(s.primary_error == STORAGE_ERR_INTEGRITY);
+    assert(s.stop_epoch == 123u);
 }
 
 int main(void)
@@ -447,6 +494,7 @@ int main(void)
     test_unavailable_worker_aggregates();
     test_stop_send_state();
     test_invalid_sequences();
+    test_pressure_request_forces_one_global_drain();
     test_event_pipe_ownership();
     test_final_and_aggregate();
     test_diag_after_final_is_best_effort();
