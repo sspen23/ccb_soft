@@ -41,6 +41,7 @@ static void clear_cross_slot_env(void)
     size_t i;
     int channel;
 
+    unsetenv("CCB_STORAGE_COMPAT_MODE");
     for (i = 0u; i < sizeof(names) / sizeof(names[0]); ++i) unsetenv(names[i]);
     for (channel = 0; channel < 3; ++channel) {
         char name[96];
@@ -94,9 +95,9 @@ static void assert_resolution(int channel, StorageCrossSlotConfigParam param,
 static void test_defaults(void)
 {
     static const uint32_t expected[3][8] = {
-        {1u, 4u, 8u, 32u, 300u, 20u, 1u, 5000000u},
-        {1u, 4u, 8u, 32u, 300u, 20u, 1u, 5000000u},
-        {0u, 1u, 4u, 32u, 300u, 20u, 1u, 5000000u},
+        {1u, 4u, 8u, 8u, 300u, 20u, 1u, 5000000u},
+        {1u, 4u, 8u, 8u, 300u, 20u, 1u, 5000000u},
+        {0u, 1u, 8u, 8u, 300u, 20u, 1u, 5000000u},
     };
     int channel;
     int param;
@@ -107,18 +108,34 @@ static void test_defaults(void)
              param <= STORAGE_CROSS_SLOT_CONFIG_NO_PROGRESS_TIMEOUT_US; ++param) {
             assert_resolution(channel, (StorageCrossSlotConfigParam)param,
                               expected[channel][param], STORAGE_CROSS_SLOT_SOURCE_DEFAULT,
-                              "default");
+                              param <= STORAGE_CROSS_SLOT_CONFIG_CQ_BATCH
+                                  ? "profile" : "default");
         }
     }
     assert(storage_cross_slot_enabled_for_channel(0));
     assert(!storage_cross_slot_enabled_for_channel(2));
     assert(storage_cross_slot_active_slots_for_channel(0) == 4u);
-    assert(storage_cross_slot_default_target_qd(2) == 4u);
+    assert(storage_cross_slot_default_target_qd(2) == 8u);
+}
+
+static void test_profile_is_authoritative_without_compat(void)
+{
+    clear_cross_slot_env();
+    setenv("SRC_REAL_MAX_ACTIVE_CH0", "6", 1);
+    setenv("SRC_REAL_TARGET_QD", "7", 1);
+    setenv("SRC_REAL_CQ_BATCH", "9", 1);
+    assert_resolution(0, STORAGE_CROSS_SLOT_CONFIG_MAX_ACTIVE, 4u,
+                      STORAGE_CROSS_SLOT_SOURCE_DEFAULT, "profile");
+    assert_resolution(0, STORAGE_CROSS_SLOT_CONFIG_TARGET_QD, 8u,
+                      STORAGE_CROSS_SLOT_SOURCE_DEFAULT, "profile");
+    assert_resolution(0, STORAGE_CROSS_SLOT_CONFIG_CQ_BATCH, 8u,
+                      STORAGE_CROSS_SLOT_SOURCE_DEFAULT, "profile");
 }
 
 static void test_max_active_priority_and_aliases(void)
 {
     clear_cross_slot_env();
+    setenv("CCB_STORAGE_COMPAT_MODE", "1", 1);
     setenv("SRC_REAL_CROSS_SLOT_BATCH", "9", 1);
     setenv("SRC_REAL_MAX_ACTIVE", "8", 1);
     setenv("SRC_REAL_CROSS_SLOT_BATCH_CH0", "7", 1);
@@ -138,6 +155,7 @@ static void test_max_active_priority_and_aliases(void)
                       "SRC_REAL_CROSS_SLOT_BATCH");
 
     clear_cross_slot_env();
+    setenv("CCB_STORAGE_COMPAT_MODE", "1", 1);
     setenv("SRC_REAL_NVME_CROSS_SLOT_MAX_ACTIVE_CH0", "3", 1);
     assert_resolution(0, STORAGE_CROSS_SLOT_CONFIG_MAX_ACTIVE, 3u,
                       STORAGE_CROSS_SLOT_SOURCE_CHANNEL_LEGACY,
@@ -163,6 +181,7 @@ static void test_generic_priority_and_all_parameters(void)
     size_t i;
 
     clear_cross_slot_env();
+    setenv("CCB_STORAGE_COMPAT_MODE", "1", 1);
     setenv("SRC_REAL_NVME_CROSS_SLOT_TARGET_QD", "9", 1);
     setenv("SRC_REAL_TARGET_QD", "8", 1);
     setenv("SRC_REAL_CH0_TARGET_QD", "7", 1);
@@ -181,6 +200,7 @@ static void test_generic_priority_and_all_parameters(void)
                       "SRC_REAL_NVME_CROSS_SLOT_TARGET_QD");
 
     clear_cross_slot_env();
+    setenv("CCB_STORAGE_COMPAT_MODE", "1", 1);
     for (i = 0u; i < sizeof(params) / sizeof(params[0]); ++i) {
         char value[32];
         (void)snprintf(value, sizeof(value), "%u", (unsigned)(i + 2u));
@@ -198,6 +218,7 @@ static void test_enabled_and_invalid_fallback(void)
     StorageCrossSlotResolution resolution;
 
     clear_cross_slot_env();
+    setenv("CCB_STORAGE_COMPAT_MODE", "1", 1);
     setenv("SRC_REAL_CROSS_SLOT_ENABLED", "0", 1);
     setenv("SRC_REAL_CROSS_SLOT", "1", 1);
     setenv("SRC_REAL_CROSS_SLOT_ENABLED_CH0", "0", 1);
@@ -217,14 +238,15 @@ static void test_enabled_and_invalid_fallback(void)
                       "SRC_REAL_CROSS_SLOT_ENABLED");
 
     clear_cross_slot_env();
+    setenv("CCB_STORAGE_COMPAT_MODE", "1", 1);
     setenv("SRC_REAL_CQ_BATCH", "55", 1);
     setenv("SRC_REAL_CQ_BATCH_CH0", "invalid", 1);
     resolution = storage_cross_slot_resolve_config(0, STORAGE_CROSS_SLOT_CONFIG_CQ_BATCH);
-    assert(resolution.value == 32u);
+    assert(resolution.value == 8u);
     assert(resolution.source_kind == STORAGE_CROSS_SLOT_SOURCE_DEFAULT);
-    assert(strcmp(resolution.source_name, "default") == 0);
+    assert(strcmp(resolution.source_name, "profile") == 0);
     assert(strcmp(resolution.invalid_source_name, "SRC_REAL_CQ_BATCH_CH0") == 0);
-    assert(strcmp(resolution.fallback_source_name, "default") == 0);
+    assert(strcmp(resolution.fallback_source_name, "profile") == 0);
 }
 
 static void test_stop_error_classification(void)
@@ -239,6 +261,7 @@ static void test_stop_error_classification(void)
 int main(void)
 {
     test_defaults();
+    test_profile_is_authoritative_without_compat();
     test_max_active_priority_and_aliases();
     test_generic_priority_and_all_parameters();
     test_enabled_and_invalid_fallback();

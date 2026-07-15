@@ -5189,27 +5189,40 @@ int main(int argc, char **argv)
         size_t channel;
 
         LOG_INFO("SYSTEM",
-                 "Storage config: profile=%s log=%s status_timeout_ms=%u first_data_timeout_ms=%u perf=%u perf_interval_ms=%u diag_on_error=%u",
+                 "Storage config: profile=%s log=%s status_timeout_ms=%u first_data_timeout_ms=%u perf=%u perf_interval_ms=%u diag_on_error=%u compat_mode=%u auto_input_complete=%u idle_scan_interval_ms=%u idle_required_ms=%u idle_required_scans=%u drain_stable_scans=%u drain_stable_us=%u",
                  storage_config_profile_name(config->storage_profile),
                  storage_config_log_level_name(config->log_level),
                  config->status_timeout_ms,
                  config->first_data_timeout_ms,
                  config->perf_enabled ? 1u : 0u,
                  config->perf_interval_ms,
-                 config->dump_diag_on_error ? 1u : 0u);
+                 config->dump_diag_on_error ? 1u : 0u,
+                 config->legacy_compat_mode ? 1u : 0u,
+                 config->auto_input_complete ? 1u : 0u,
+                 config->idle_scan_interval_ms,
+                 config->idle_required_ms,
+                 config->idle_required_scans,
+                 config->drain_stable_scans,
+                 config->drain_stable_us);
         for (channel = 0u; channel < NUM_CHANNELS; ++channel) {
             const ChannelStorageConfig *storage = &config->channels[channel];
             LOG_INFO("SYSTEM",
-                     "Storage channel config: ch=%u writer=%s ring=%" PRIu64 " descriptor=%u command=%u qd=%u active=%u cq_batch=%u",
+                     "Storage channel config: ch=%u pipeline_mode=%s writer_mode=%s legacy_fallback_enabled=0 ring=%" PRIu64 " descriptor=%u command=%u qd=%u active=%u cq_batch=%u writer_policy=%s writer_priority=%u producer_policy=%s producer_priority=%u",
                      storage->channel,
                      storage->writer_mode == STORAGE_WRITER_CROSS_SLOT
-                         ? "cross-slot" : "legacy",
+                         ? "cross_slot" : "legacy",
+                     storage->writer_mode == STORAGE_WRITER_CROSS_SLOT
+                         ? "cross_slot" : "legacy",
                      storage->ring_bytes,
                      storage->descriptor_bytes,
                      storage->command_bytes,
                      storage->nvme_qd,
                      storage->max_active_slots,
-                     storage->cq_batch);
+                     storage->cq_batch,
+                     storage->writer_realtime ? "rr" : "other",
+                     storage->writer_priority,
+                     storage->producer_realtime ? "rr" : "other",
+                     storage->producer_priority);
         }
     }
     if (storage_health_start(probe_one_storage_channel, NULL, 5000u) != 0)

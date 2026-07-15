@@ -24,6 +24,32 @@ static bool text_is_false(const char *value)
            strcmp(value, "no") == 0 || strcmp(value, "NO") == 0;
 }
 
+bool storage_config_legacy_compat_enabled(void)
+{
+    return !text_is_false(getenv("CCB_STORAGE_COMPAT_MODE"));
+}
+
+static bool is_profile_override_name(const char *name)
+{
+    return name && strncmp(name, "SRC_REAL_", 9u) == 0 &&
+           (strstr(name, "NVME_CMD_KIB") != NULL ||
+            strstr(name, "NVME_QD") != NULL ||
+            strstr(name, "CROSS_SLOT_QD") != NULL ||
+            strstr(name, "MAX_ACTIVE") != NULL ||
+            strstr(name, "CROSS_SLOT_BATCH") != NULL ||
+            strstr(name, "TARGET_QD") != NULL ||
+            strstr(name, "CQ_BATCH") != NULL ||
+            strstr(name, "CROSS_SLOT_ENABLED") != NULL ||
+            strstr(name, "CROSS_SLOT_CH") != NULL ||
+            strcmp(name, "SRC_REAL_CROSS_SLOT") == 0 ||
+            strstr(name, "WRITER_RT_POLICY") != NULL ||
+            strstr(name, "PRODUCER_RT_POLICY") != NULL ||
+            strstr(name, "WRITER_RT_PRIO") != NULL ||
+            strstr(name, "PRODUCER_RT_PRIO") != NULL ||
+            strstr(name, "STORAGE_RING_BYTES") != NULL ||
+            strstr(name, "STORAGE_DMA_DESC_BYTES") != NULL);
+}
+
 static void warn_deprecated_once(const char *name)
 {
     size_t i;
@@ -51,6 +77,9 @@ const char *storage_config_compat_getenv(const char *name)
     value = getenv(name);
     if (value && value[0] != '\0' && strncmp(name, "SRC_REAL_", 9u) == 0)
         warn_deprecated_once(name);
+    if (value && value[0] != '\0' && is_profile_override_name(name) &&
+        !storage_config_legacy_compat_enabled())
+        return NULL;
     return value;
 }
 
@@ -191,6 +220,7 @@ int storage_config_load(AppConfig *out, char *error, size_t error_size)
             snprintf(error, error_size, "invalid CCB_STORAGE_PROFILE=%s", value);
         return -1;
     }
+    out->legacy_compat_mode = storage_config_legacy_compat_enabled();
 
     out->status_timeout_ms = DEFAULT_STATUS_TIMEOUT_MS;
     value = getenv("CCB_STATUS_TIMEOUT_MS");

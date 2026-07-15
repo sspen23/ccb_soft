@@ -63,6 +63,7 @@ typedef struct {
     uint32_t status_timeout_ms;
     uint32_t first_data_timeout_ms;
     StorageProfile storage_profile;
+    bool legacy_compat_mode;
     bool dump_diag_on_error;
     bool auto_input_complete;
     uint32_t idle_scan_interval_ms;
@@ -81,6 +82,7 @@ const ChannelStorageConfig *storage_config_channel(const AppConfig *config,
                                                    uint32_t channel);
 const char *storage_config_profile_name(StorageProfile profile);
 const char *storage_config_log_level_name(CcbLogLevel level);
+bool storage_config_legacy_compat_enabled(void);
 
 /* Transitional compatibility entry point.  Process-environment access is
  * confined to storage_config.c while old overrides move to the snapshot. */

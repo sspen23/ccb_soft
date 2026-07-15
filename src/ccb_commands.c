@@ -376,7 +376,6 @@ static void storage_trace_flush_done(const ChannelRuntime *rt,
                                      const char *task_no);
 void storage_write_request_stop(void);
 static int storage_env_flag_enabled(const char *name);
-static bool storage_env_string_is(const char *name, const char *expected);
 static bool storage_text_output_enabled(void);
 static uint64_t storage_timeout_us(const char *us_name, const char *ms_name,
                                    uint64_t fallback_us);
@@ -906,7 +905,11 @@ static uint64_t storage_first_dma_timeout_us(const ChannelConfig *cfg)
 
 uint32_t storage_cross_slot_default_target_qd(int channel_id)
 {
-    return channel_id == 2 ? 4u : 8u;
+    const ChannelStorageConfig *profile = channel_id >= 0
+        ? storage_config_channel(storage_config_get(), (uint32_t)channel_id)
+        : NULL;
+
+    return profile ? profile->nvme_qd : (channel_id == 2 ? 4u : 8u);
 }
 
 typedef struct {
@@ -915,13 +918,17 @@ typedef struct {
 } StorageCrossSlotCandidate;
 
 static void storage_cross_slot_resolution_default(StorageCrossSlotResolution *out,
-                                                  uint32_t fallback)
+                                                  uint32_t fallback,
+                                                  bool profile_source)
 {
     memset(out, 0, sizeof(*out));
     out->value = fallback;
     out->source_kind = STORAGE_CROSS_SLOT_SOURCE_DEFAULT;
-    (void)snprintf(out->source_name, sizeof(out->source_name), "default");
-    (void)snprintf(out->fallback_source_name, sizeof(out->fallback_source_name), "default");
+    (void)snprintf(out->source_name, sizeof(out->source_name), "%s",
+                   profile_source ? "profile" : "default");
+    (void)snprintf(out->fallback_source_name,
+                   sizeof(out->fallback_source_name), "%s",
+                   profile_source ? "profile" : "default");
 }
 
 const char *storage_cross_slot_source_kind_name(StorageCrossSlotSourceKind kind)
@@ -973,13 +980,13 @@ static bool storage_cross_slot_parse_enabled(const char *value, uint32_t *out)
 }
 
 static StorageCrossSlotResolution storage_cross_slot_resolve_candidates(
-    uint32_t fallback, uint32_t max_value, bool enabled,
+    uint32_t fallback, uint32_t max_value, bool enabled, bool profile_source,
     const StorageCrossSlotCandidate *candidates, size_t count)
 {
     StorageCrossSlotResolution out;
     size_t i;
 
-    storage_cross_slot_resolution_default(&out, fallback);
+    storage_cross_slot_resolution_default(&out, fallback, profile_source);
     for (i = 0u; candidates && i < count; ++i) {
         const char *value = storage_config_compat_getenv(candidates[i].name);
         uint32_t parsed;
@@ -1011,6 +1018,8 @@ StorageCrossSlotResolution storage_cross_slot_resolve_config(
     uint32_t fallback = 0u;
     uint32_t max_value = UINT32_MAX;
     size_t count = 0u;
+    const ChannelStorageConfig *profile = NULL;
+    bool profile_source = false;
 
 #define CROSS_SLOT_ADD(kind_, format_, ...)                                    \
     do {                                                                        \
@@ -1022,12 +1031,18 @@ StorageCrossSlotResolution storage_cross_slot_resolve_config(
 
     if (channel_id < 0) {
         StorageCrossSlotResolution out;
-        storage_cross_slot_resolution_default(&out, 0u);
+        storage_cross_slot_resolution_default(&out, 0u, false);
         return out;
     }
+    profile = storage_config_channel(storage_config_get(),
+                                     (uint32_t)channel_id);
     switch (param) {
     case STORAGE_CROSS_SLOT_CONFIG_ENABLED:
-        fallback = channel_id == 2 ? 0u : 1u;
+        fallback = profile
+                       ? (profile->writer_mode == STORAGE_WRITER_CROSS_SLOT
+                              ? 1u : 0u)
+                       : (channel_id == 2 ? 0u : 1u);
+        profile_source = profile != NULL;
         CROSS_SLOT_ADD(STORAGE_CROSS_SLOT_SOURCE_CHANNEL_NEW,
                        "SRC_REAL_CROSS_SLOT_CH%d", channel_id);
         CROSS_SLOT_ADD(STORAGE_CROSS_SLOT_SOURCE_CHANNEL_LEGACY,
@@ -1040,9 +1055,12 @@ StorageCrossSlotResolution storage_cross_slot_resolve_config(
         CROSS_SLOT_ADD(STORAGE_CROSS_SLOT_SOURCE_GLOBAL_LEGACY,
                        "%s", "SRC_REAL_NVME_CROSS_SLOT_QD");
         return storage_cross_slot_resolve_candidates(fallback, 1u, true,
+                                                     profile_source,
                                                      candidates, count);
     case STORAGE_CROSS_SLOT_CONFIG_MAX_ACTIVE:
-        fallback = channel_id == 2 ? 1u : 4u;
+        fallback = profile ? profile->max_active_slots
+                           : (channel_id == 2 ? 1u : 4u);
+        profile_source = profile != NULL;
         max_value = 64u;
         CROSS_SLOT_ADD(STORAGE_CROSS_SLOT_SOURCE_CHANNEL_NEW,
                        "SRC_REAL_MAX_ACTIVE_CH%d", channel_id);
@@ -1066,15 +1084,19 @@ StorageCrossSlotResolution storage_cross_slot_resolve_config(
         CROSS_SLOT_ADD(STORAGE_CROSS_SLOT_SOURCE_GLOBAL_LEGACY,
                        "%s", "SRC_REAL_NVME_CROSS_SLOT_BATCH");
         return storage_cross_slot_resolve_candidates(fallback, max_value, false,
+                                                     profile_source,
                                                      candidates, count);
     case STORAGE_CROSS_SLOT_CONFIG_TARGET_QD:
         short_name = "TARGET_QD";
-        fallback = storage_cross_slot_default_target_qd(channel_id);
+        fallback = profile ? profile->nvme_qd
+                           : storage_cross_slot_default_target_qd(channel_id);
+        profile_source = profile != NULL;
         max_value = 64u;
         break;
     case STORAGE_CROSS_SLOT_CONFIG_CQ_BATCH:
         short_name = "CQ_BATCH";
-        fallback = 32u;
+        fallback = profile ? profile->cq_batch : 32u;
+        profile_source = profile != NULL;
         max_value = 64u;
         break;
     case STORAGE_CROSS_SLOT_CONFIG_WRITER_BUDGET_US:
@@ -1098,7 +1120,7 @@ StorageCrossSlotResolution storage_cross_slot_resolve_config(
         break;
     default: {
         StorageCrossSlotResolution out;
-        storage_cross_slot_resolution_default(&out, 0u);
+        storage_cross_slot_resolution_default(&out, 0u, false);
         return out;
     }
     }
@@ -1113,6 +1135,7 @@ StorageCrossSlotResolution storage_cross_slot_resolve_config(
     CROSS_SLOT_ADD(STORAGE_CROSS_SLOT_SOURCE_GLOBAL_LEGACY,
                    "SRC_REAL_NVME_CROSS_SLOT_%s", short_name);
     return storage_cross_slot_resolve_candidates(fallback, max_value, false,
+                                                 profile_source,
                                                  candidates, count);
 
 #undef CROSS_SLOT_ADD
@@ -1147,13 +1170,6 @@ static int storage_env_flag_enabled(const char *name)
         return 0;
     }
     return 1;
-}
-
-static bool storage_env_string_is(const char *name, const char *expected)
-{
-    const char *value = storage_config_compat_getenv(name);
-
-    return value && expected && strcmp(value, expected) == 0;
 }
 
 static FILE *storage_slot_perf_log_open(void)
@@ -3624,7 +3640,6 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
     int producer_rt_policy = SCHED_OTHER;
     uint32_t producer_rt_prio = 0u;
     uint64_t requested_ring_bytes;
-    bool pipeline_threaded_mode;
     bool fast_pipeline_enabled;
     bool auto_idle_enabled;
     bool coordinated_idle_enabled;
@@ -3692,7 +3707,6 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
     storage_critical_poll_sleep_us = storage_env_u32_limit("SRC_REAL_STORAGE_CRITICAL_WATERMARK_POLL_US",
                                                            STORAGE_CRITICAL_WATERMARK_POLL_US_DEFAULT,
                                                            1000000u);
-    pipeline_threaded_mode = storage_env_string_is("SRC_REAL_PIPELINE_MODE", "threaded");
     if (cfg && cfg->id == 0) {
         fast_pipeline_enabled = storage_env_flag_enabled("SRC_REAL_CH0_FAST_PIPELINE") != 0;
     } else if (cfg && cfg->id == 1) {
@@ -3919,7 +3933,8 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                (unsigned)rt.nvme_qd_effective, (unsigned)rt.nvme_cmd_size_bytes,
                (unsigned)rt.nvme_max_dts_bytes, cross_slot_qd ? (unsigned)cross_slot_batch : 1u);
     }
-    storage_emit_line(STORAGE_LOG_SUMMARY, "storage_pipeline_config channel=%d mode=%s fast_pipeline=%u"
+    storage_emit_line(STORAGE_LOG_SUMMARY, "storage_pipeline_config channel=%d pipeline_mode=%s"
+                      " writer_mode=%s legacy_fallback_enabled=0 fast_pipeline=%u"
                       " requested_ring_bytes=%" PRIu64
                       " effective_ring_bytes=%" PRIu64
                       " slot_bytes=%u total_slots=%u ring_clamp_reason=%s"
@@ -3935,9 +3950,10 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                       " high_watermark_poll_us=%u critical_watermark_poll_us=%u"
                       " pipeline_stats_sec=%u enable_storage_stats=%u"
                       " slot_write_perf=%u slot_write_perf_sample=%u"
-                      " defer_db_until_stop=1 legacy_fallback=1",
+                      " defer_db_until_stop=1",
                       cfg->id,
-                      pipeline_threaded_mode ? "threaded" : "legacy",
+                      cross_slot_qd ? "cross_slot" : "legacy",
+                      cross_slot_qd ? "cross_slot" : "legacy",
                       fast_pipeline_enabled ? 1u : 0u,
                       requested_ring_bytes,
                       rt.dma_ring_bytes,

@@ -353,9 +353,12 @@ static bool nvme_cmd_kib_allowed(uint32_t kib) {
 }
 
 static uint32_t channel_default_nvme_cmd_kib(const ChannelRuntime *rt) {
-    if (rt && (rt->cfg->id == HIGH_I_CHANNEL_ID || rt->cfg->id == HIGH_Q_CHANNEL_ID)) {
-        return NVME_CMD_KIB_HIGH_DEFAULT;
-    }
+    const ChannelStorageConfig *profile = rt && rt->cfg
+        ? storage_config_channel(storage_config_get(), (uint32_t)rt->cfg->id)
+        : NULL;
+
+    if (profile && profile->command_bytes % 1024u == 0u)
+        return profile->command_bytes / 1024u;
     return NVME_CMD_KIB_DEFAULT;
 }
 
@@ -367,7 +370,13 @@ uint32_t nvme_default_qd_for_channel(int channel_id) {
 }
 
 static uint32_t channel_default_nvme_qd(const ChannelRuntime *rt) {
-    return nvme_default_qd_for_channel(rt && rt->cfg ? rt->cfg->id : -1);
+    const ChannelStorageConfig *profile = rt && rt->cfg
+        ? storage_config_channel(storage_config_get(), (uint32_t)rt->cfg->id)
+        : NULL;
+
+    return profile ? profile->nvme_qd
+                   : nvme_default_qd_for_channel(rt && rt->cfg
+                                                     ? rt->cfg->id : -1);
 }
 
 static const char *channel_env(const ChannelRuntime *rt, const char *prefix, char *buf, size_t buf_size) {

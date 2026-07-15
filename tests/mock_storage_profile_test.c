@@ -11,7 +11,8 @@ static void clear_primary_config(void)
         "UART_DEV_PATH", "CCB_LOG_LEVEL", "CCB_STORAGE_PROFILE",
         "CCB_STATUS_TIMEOUT_MS", "CCB_FIRST_DATA_TIMEOUT_MS",
         "CCB_PERF_ENABLE", "CCB_PERF_INTERVAL_MS",
-        "CCB_DUMP_DIAG_ON_ERROR", "SRC_REAL_LOG_LEVEL",
+        "CCB_DUMP_DIAG_ON_ERROR", "CCB_STORAGE_COMPAT_MODE",
+        "SRC_REAL_LOG_LEVEL", "SRC_REAL_NVME_QD",
         "SRC_REAL_STATUS_TIMEOUT_US", "SRC_REAL_FIRST_DMA_TIMEOUT_US",
         "SRC_REAL_PERF_LOG_ENABLE", "SRC_REAL_PERF_LOG_INTERVAL_SEC",
         "SRC_REAL_DUMP_EVENT_RING_ON_ERROR",
@@ -66,6 +67,7 @@ static void test_safe_profile_and_primary_values(void)
     assert(strcmp(config.uart_device, "/dev/ttyTEST") == 0);
     assert(config.log_level == CCB_LOG_DEBUG);
     assert(config.storage_profile == STORAGE_PROFILE_SAFE_QD1);
+    assert(!config.legacy_compat_mode);
     assert(config.status_timeout_ms == 75u);
     assert(config.first_data_timeout_ms == 1234u);
     assert(config.perf_enabled && config.perf_interval_ms == 500u);
@@ -83,6 +85,15 @@ static void test_safe_profile_and_primary_values(void)
     assert(config.idle_required_scans == 5u);
     assert(config.drain_stable_scans == 3u);
     assert(config.drain_stable_us == 100u);
+}
+
+static void test_profile_override_requires_compat_mode(void)
+{
+    clear_primary_config();
+    setenv("SRC_REAL_NVME_QD", "8", 1);
+    assert(storage_config_compat_getenv("SRC_REAL_NVME_QD") == NULL);
+    setenv("CCB_STORAGE_COMPAT_MODE", "1", 1);
+    assert(strcmp(storage_config_compat_getenv("SRC_REAL_NVME_QD"), "8") == 0);
 }
 
 static void test_legacy_mapping_and_validation(void)
@@ -115,6 +126,7 @@ int main(void)
 {
     test_perf_profile_defaults();
     test_safe_profile_and_primary_values();
+    test_profile_override_requires_compat_mode();
     test_legacy_mapping_and_validation();
     clear_primary_config();
     puts("mock_storage_profile_test: ok");
