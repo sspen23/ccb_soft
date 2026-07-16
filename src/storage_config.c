@@ -207,9 +207,22 @@ static int parse_log_level(const char *value, CcbLogLevel *out)
 
 static int parse_profile(const char *value, StorageProfile *out)
 {
-    if (!value || value[0] == '\0' || strcmp(value, "PERF_QD8") == 0 ||
+    if (!value || value[0] == '\0' ||
+        strcmp(value, "LEGACY_FAST_BASELINE") == 0 ||
+        strcmp(value, "legacy_fast_baseline") == 0 ||
+        strcmp(value, "legacy") == 0) {
+        *out = STORAGE_PROFILE_LEGACY_FAST_BASELINE;
+        return 0;
+    }
+    if (strcmp(value, "PERF_QD8") == 0 ||
         strcmp(value, "perf_qd8") == 0 || strcmp(value, "perf") == 0) {
         *out = STORAGE_PROFILE_PERF_QD8;
+        return 0;
+    }
+    if (strcmp(value, "CROSS_SLOT_EXPERIMENTAL") == 0 ||
+        strcmp(value, "cross_slot_experimental") == 0 ||
+        strcmp(value, "cross_slot") == 0) {
+        *out = STORAGE_PROFILE_CROSS_SLOT_EXPERIMENTAL;
         return 0;
     }
     if (strcmp(value, "SAFE_QD1") == 0 || strcmp(value, "safe_qd1") == 0 ||
@@ -224,15 +237,18 @@ static void set_channel_profile(AppConfig *config)
 {
     uint32_t channel;
     const bool safe = config->storage_profile == STORAGE_PROFILE_SAFE_QD1;
+    const bool cross_slot =
+        config->storage_profile == STORAGE_PROFILE_PERF_QD8 ||
+        config->storage_profile == STORAGE_PROFILE_CROSS_SLOT_EXPERIMENTAL;
 
     for (channel = 0u; channel < NUM_CHANNELS; ++channel) {
         ChannelStorageConfig *storage = &config->channels[channel];
 
         memset(storage, 0, sizeof(*storage));
         storage->channel = channel;
-        storage->writer_mode = channel == LOW_SPEED_CHANNEL_ID
-                                   ? STORAGE_WRITER_LEGACY
-                                   : STORAGE_WRITER_CROSS_SLOT;
+        storage->writer_mode = cross_slot && channel != LOW_SPEED_CHANNEL_ID
+                                   ? STORAGE_WRITER_CROSS_SLOT
+                                   : STORAGE_WRITER_LEGACY;
         storage->ring_bytes = channel == LOW_SPEED_CHANNEL_ID
                                   ? CHANNEL2_DDR_BYTES
                                   : CHANNEL0_DDR_BYTES;
@@ -243,7 +259,7 @@ static void set_channel_profile(AppConfig *config)
          * this request to the SSD-reported MaxTransferSize before use. */
         storage->command_bytes = (safe ? 256u : 512u) * 1024u;
         storage->nvme_qd = safe ? 1u : 8u;
-        storage->max_active_slots = safe ? 1u :
+        storage->max_active_slots = safe || !cross_slot ? 1u :
                                     (channel == LOW_SPEED_CHANNEL_ID ? 1u : 4u);
         storage->cq_batch = safe ? 1u : 8u;
         storage->writer_realtime = false;
@@ -255,13 +271,13 @@ static void set_channel_profile(AppConfig *config)
         storage->producer_scheduler_weight = channel == LOW_SPEED_CHANNEL_ID
                                                  ? 1u : 15u;
         storage->writer_scheduler_weight = storage->producer_scheduler_weight;
-        storage->producer_nice = channel == LOW_SPEED_CHANNEL_ID ? 6 : -6;
-        storage->writer_nice = storage->producer_nice;
+        storage->producer_nice = 0;
+        storage->writer_nice = 0;
         if (safe) {
             storage->writer_budget_us = 300u;
             storage->busy_poll_us = 20u;
             storage->empty_sleep_us = 1u;
-        } else if (channel == LOW_SPEED_CHANNEL_ID) {
+        } else if (cross_slot && channel == LOW_SPEED_CHANNEL_ID) {
             /* The producer follows the 1200:80 ingress ratio.  The legacy
              * writer needs a larger service floor so its QD8 queue is not
              * starved by the two cross-slot writers. */
@@ -392,7 +408,14 @@ const ChannelStorageConfig *storage_config_channel(const AppConfig *config,
 
 const char *storage_config_profile_name(StorageProfile profile)
 {
-    return profile == STORAGE_PROFILE_SAFE_QD1 ? "SAFE_QD1" : "PERF_QD8";
+    switch (profile) {
+    case STORAGE_PROFILE_SAFE_QD1: return "SAFE_QD1";
+    case STORAGE_PROFILE_LEGACY_FAST_BASELINE: return "LEGACY_FAST_BASELINE";
+    case STORAGE_PROFILE_PERF_QD8: return "PERF_QD8";
+    case STORAGE_PROFILE_CROSS_SLOT_EXPERIMENTAL:
+        return "CROSS_SLOT_EXPERIMENTAL";
+    default: return "UNKNOWN";
+    }
 }
 
 const char *storage_config_log_level_name(CcbLogLevel level)

@@ -103,6 +103,7 @@ static void test_defaults(void)
     int param;
 
     clear_cross_slot_env();
+    setenv("CCB_STORAGE_PROFILE", "CROSS_SLOT_EXPERIMENTAL", 1);
     for (channel = 0; channel < 3; ++channel) {
         for (param = STORAGE_CROSS_SLOT_CONFIG_ENABLED;
              param <= STORAGE_CROSS_SLOT_CONFIG_NO_PROGRESS_TIMEOUT_US; ++param) {

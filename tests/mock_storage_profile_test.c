@@ -23,7 +23,7 @@ static void clear_primary_config(void)
     for (i = 0u; i < sizeof(names) / sizeof(names[0]); ++i) unsetenv(names[i]);
 }
 
-static void test_perf_profile_defaults(void)
+static void test_legacy_fast_baseline_defaults(void)
 {
     AppConfig config;
     char error[160];
@@ -31,14 +31,14 @@ static void test_perf_profile_defaults(void)
     clear_primary_config();
     assert(storage_config_load(&config, error, sizeof(error)) == 0);
     assert(strcmp(config.uart_device, "/dev/ttyUL1") == 0);
-    assert(config.storage_profile == STORAGE_PROFILE_PERF_QD8);
+    assert(config.storage_profile == STORAGE_PROFILE_LEGACY_FAST_BASELINE);
     assert(config.log_level == CCB_LOG_INFO);
     assert(config.status_timeout_ms == 100u);
     assert(config.first_data_timeout_ms == 5000u);
     assert(!config.perf_enabled && !config.dump_diag_on_error);
-    assert(config.channels[0].writer_mode == STORAGE_WRITER_CROSS_SLOT);
+    assert(config.channels[0].writer_mode == STORAGE_WRITER_LEGACY);
     assert(config.channels[0].nvme_qd == 8u);
-    assert(config.channels[0].max_active_slots == 4u);
+    assert(config.channels[0].max_active_slots == 1u);
     assert(config.channels[0].descriptor_bytes == 8u * 1024u * 1024u);
     assert(config.channels[0].command_bytes == 512u * 1024u);
     assert(!config.channels[0].writer_realtime);
@@ -48,8 +48,8 @@ static void test_perf_profile_defaults(void)
     assert(config.channels[0].nominal_input_mib_s == 1200u);
     assert(config.channels[0].writer_scheduler_weight == 15u);
     assert(config.channels[0].producer_scheduler_weight == 15u);
-    assert(config.channels[0].writer_nice == -6);
-    assert(config.channels[0].producer_nice == -6);
+    assert(config.channels[0].writer_nice == 0);
+    assert(config.channels[0].producer_nice == 0);
     assert(config.channels[0].writer_budget_us == 1000u);
     assert(config.channels[0].busy_poll_us == 50u);
     assert(config.channels[0].empty_sleep_us == 5u);
@@ -58,10 +58,26 @@ static void test_perf_profile_defaults(void)
     assert(config.channels[2].command_bytes == 512u * 1024u);
     assert(config.channels[2].descriptor_bytes == 16u * 1024u * 1024u);
     assert(config.channels[2].nominal_input_mib_s == 80u);
-    assert(config.channels[2].writer_scheduler_weight == 3u);
+    assert(config.channels[2].writer_scheduler_weight == 1u);
     assert(config.channels[2].producer_scheduler_weight == 1u);
-    assert(config.channels[2].writer_nice == 2);
-    assert(config.channels[2].producer_nice == 6);
+    assert(config.channels[2].writer_nice == 0);
+    assert(config.channels[2].producer_nice == 0);
+}
+
+static void test_cross_slot_experimental_profile(void)
+{
+    AppConfig config;
+    char error[160];
+
+    clear_primary_config();
+    setenv("CCB_STORAGE_PROFILE", "CROSS_SLOT_EXPERIMENTAL", 1);
+    assert(storage_config_load(&config, error, sizeof(error)) == 0);
+    assert(config.storage_profile == STORAGE_PROFILE_CROSS_SLOT_EXPERIMENTAL);
+    assert(config.channels[0].writer_mode == STORAGE_WRITER_CROSS_SLOT);
+    assert(config.channels[0].max_active_slots == 4u);
+    assert(config.channels[0].nvme_qd == 8u);
+    assert(config.channels[0].command_bytes == 512u * 1024u);
+    assert(config.channels[2].writer_mode == STORAGE_WRITER_LEGACY);
 }
 
 static void test_safe_profile_and_primary_values(void)
@@ -97,8 +113,8 @@ static void test_safe_profile_and_primary_values(void)
     assert(config.channels[0].producer_priority == 0u);
     assert(config.channels[0].writer_scheduler_weight == 15u);
     assert(config.channels[0].producer_scheduler_weight == 15u);
-    assert(config.channels[0].writer_nice == -6);
-    assert(config.channels[0].producer_nice == -6);
+    assert(config.channels[0].writer_nice == 0);
+    assert(config.channels[0].producer_nice == 0);
     assert(config.channels[0].writer_budget_us == 300u);
     assert(config.channels[0].busy_poll_us == 20u);
     assert(config.channels[0].empty_sleep_us == 1u);
@@ -147,7 +163,8 @@ static void test_legacy_mapping_and_validation(void)
 
 int main(void)
 {
-    test_perf_profile_defaults();
+    test_legacy_fast_baseline_defaults();
+    test_cross_slot_experimental_profile();
     test_safe_profile_and_primary_values();
     test_profile_override_requires_compat_mode();
     test_legacy_mapping_and_validation();

@@ -4226,6 +4226,28 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                       storage_env_flag_enabled("SRC_REAL_ENABLE_STORAGE_STATS") ? 1u : 0u,
                       storage_env_flag_enabled("SRC_REAL_SLOT_WRITE_PERF") ? 1u : 0u,
                       (unsigned)storage_slot_perf_interval());
+    storage_emit_line(
+        STORAGE_LOG_SUMMARY,
+        "storage_effective_config channel=%d profile=%s source=profile"
+        " pipeline_mode=%s writer_mode=%s"
+        " requested_command_bytes=%u effective_command_bytes=%u"
+        " nvme_max_transfer_bytes=%u nvme_qd=%u descriptor_bytes=%u"
+        " ring_bytes=%" PRIu64 " scheduler_policy=%s scheduler_priority=%u",
+        cfg->id,
+        app_config ? storage_config_profile_name(app_config->storage_profile)
+                   : "UNKNOWN",
+        cross_slot_qd ? "cross_slot" : "legacy",
+        cross_slot_qd ? "cross_slot" : "legacy",
+        storage_profile ? storage_profile->command_bytes : 0u,
+        rt.nvme_cmd_size_bytes,
+        rt.nvme_max_dts_bytes,
+        rt.nvme_qd_effective,
+        rt.dma_desc_bytes,
+        rt.dma_ring_bytes,
+        storage_rt_policy_name(storage_rt_policy(
+            "SRC_REAL_WRITER_RT_POLICY",
+            storage_profile_rt_policy(&rt, true))),
+        storage_writer_rt_prio(&rt));
     storage_emit_line(STORAGE_LOG_SUMMARY, "storage_cross_slot_effective_config channel=%d enabled=%u"
                       " max_active=%u target_qd=%u cq_batch=%u writer_budget_us=%u"
                       " busy_poll_us=%u empty_sleep_us=%u no_progress_timeout_us=%u"
