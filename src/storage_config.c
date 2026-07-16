@@ -239,7 +239,9 @@ static void set_channel_profile(AppConfig *config)
         storage->descriptor_bytes = channel == LOW_SPEED_CHANNEL_ID
                                         ? 16u * MIB
                                         : 8u * MIB;
-        storage->command_bytes = 256u * 1024u;
+        /* PERF halves command/doorbell traffic.  The hardware layer clamps
+         * this request to the SSD-reported MaxTransferSize before use. */
+        storage->command_bytes = (safe ? 256u : 512u) * 1024u;
         storage->nvme_qd = safe ? 1u : 8u;
         storage->max_active_slots = safe ? 1u :
                                     (channel == LOW_SPEED_CHANNEL_ID ? 1u : 4u);
@@ -272,8 +274,8 @@ static void set_channel_profile(AppConfig *config)
             storage->empty_sleep_us = 1u;
         } else {
             storage->writer_budget_us = 1000u;
-            storage->busy_poll_us = 100u;
-            storage->empty_sleep_us = 0u;
+            storage->busy_poll_us = 50u;
+            storage->empty_sleep_us = 5u;
         }
     }
 }

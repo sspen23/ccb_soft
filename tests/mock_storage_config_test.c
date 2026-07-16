@@ -95,8 +95,8 @@ static void assert_resolution(int channel, StorageCrossSlotConfigParam param,
 static void test_defaults(void)
 {
     static const uint32_t expected[3][8] = {
-        {1u, 4u, 8u, 8u, 1000u, 100u, 0u, 5000000u},
-        {1u, 4u, 8u, 8u, 1000u, 100u, 0u, 5000000u},
+        {1u, 4u, 8u, 8u, 1000u, 50u, 5u, 5000000u},
+        {1u, 4u, 8u, 8u, 1000u, 50u, 5u, 5000000u},
         {0u, 1u, 8u, 8u, 300u, 20u, 1u, 5000000u},
     };
     int channel;

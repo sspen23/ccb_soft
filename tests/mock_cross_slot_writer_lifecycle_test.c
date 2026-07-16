@@ -210,11 +210,33 @@ static void test_full_max_active_four_continues_with_backlog(void)
     nvme_cross_slot_engine_destroy(engine);
 }
 
+static void test_command_budget_bounds_one_step(void)
+{
+    ChannelRuntime rt;
+    WriterMock mock;
+    NvmeCrossSlotEngine *engine;
+    NvmeWriteSlotReq req = request(0u, SLOT_SECTORS);
+
+    memset(&mock, 0, sizeof(mock));
+    engine = create_engine(&rt, &mock, 4u);
+    assert(engine != NULL);
+    assert(nvme_cross_slot_engine_add(engine, &req) == 0);
+    assert(nvme_cross_slot_engine_step(engine, 100000u, slot_done, &mock) == 0);
+    assert(nvme_cross_slot_engine_active(engine) == 1u);
+    assert(mock.submit_count == 16u && mock.complete_count == 16u);
+    assert(mock.done_count == 0u);
+    step_until_idle(engine, &mock);
+    assert(mock.submit_count == 32u && mock.complete_count == 32u);
+    assert(mock.done_count == 1u);
+    nvme_cross_slot_engine_destroy(engine);
+}
+
 int main(void)
 {
     test_max_active_one_keeps_processing_ready_slots();
     test_wait_and_terminal_decisions();
     test_full_max_active_four_continues_with_backlog();
+    test_command_budget_bounds_one_step();
     puts("mock_cross_slot_writer_lifecycle_test: ok");
     return 0;
 }

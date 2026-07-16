@@ -44,6 +44,8 @@
 #define STORAGE_EVENT_DEADLINE_US 1000000ull
 #define STORAGE_STOP_STABLE_EMPTY_SCANS 3u
 #define STORAGE_STOP_STABLE_EMPTY_US 100ull
+#define STORAGE_CROSS_SLOT_STATS_SYNC_US 50000ull
+#define STORAGE_HARVEST_BATCH_CAPACITY 64u
 static volatile sig_atomic_t g_storage_stop_requested = 0;
 static bool g_storage_control_drain_latched = false;
 static bool g_storage_control_stop_latched = false;
@@ -442,6 +444,34 @@ static uint64_t storage_wall_time_us(void) {
         return 0u;
     }
     return ((uint64_t)ts.tv_sec * 1000000ull) + (uint64_t)ts.tv_nsec / 1000ull;
+}
+
+static void storage_nanosleep_us(uint32_t sleep_us)
+{
+    struct timespec delay;
+
+    if (sleep_us == 0u) return;
+    delay.tv_sec = sleep_us / 1000000u;
+    delay.tv_nsec = (long)(sleep_us % 1000000u) * 1000L;
+    while (nanosleep(&delay, &delay) != 0 && errno == EINTR) {
+    }
+}
+
+static uint32_t storage_adaptive_idle_sleep_us(uint32_t configured_us,
+                                               uint32_t empty_rounds)
+{
+    uint32_t base_us;
+    uint32_t shift;
+    uint32_t cap_us;
+    uint64_t sleep_us;
+
+    if (empty_rounds <= 4u) return 0u;
+    base_us = configured_us < 5u ? 5u : configured_us;
+    shift = (empty_rounds - 5u) / 8u;
+    if (shift > 4u) shift = 4u;
+    cap_us = base_us > 50u ? base_us : 50u;
+    sleep_us = (uint64_t)base_us << shift;
+    return sleep_us > cap_us ? cap_us : (uint32_t)sleep_us;
 }
 
 static uint64_t storage_elapsed_us(uint64_t start_us) {
@@ -2193,6 +2223,24 @@ static uint64_t storage_queue_written_bytes(const StorageWriteQueue *q) {
     return q ? __atomic_load_n(&q->bytes_written, __ATOMIC_ACQUIRE) : 0u;
 }
 
+static uint32_t storage_queue_harvest_room(StorageWriteQueue *q)
+{
+    uint32_t room;
+
+    if (!q) return 0u;
+    pthread_mutex_lock(&q->lock);
+    if (!storage_queue_slot_counts_valid_locked(q)) {
+        q->error = true;
+        room = 0u;
+    } else {
+        room = q->capacity - q->count;
+        if (room > q->slots.counts.dma_writable)
+            room = q->slots.counts.dma_writable;
+    }
+    pthread_mutex_unlock(&q->lock);
+    return room;
+}
+
 static void storage_queue_snapshot(StorageWriteQueue *q, StorageQueueSnapshot *out) {
     if (!out) {
         return;
@@ -3241,6 +3289,7 @@ static void *storage_nvme_cross_slot_writer_thread(void *arg) {
     NvmeCrossSlotEngine *engine;
     bool writer_failed = false;
     uint64_t expected_run_us = 0u;
+    uint64_t next_stats_sync_us = 0u;
 
     if (!q) {
         return NULL;
@@ -3266,9 +3315,6 @@ static void *storage_nvme_cross_slot_writer_thread(void *arg) {
     storage_queue_set_writer_ready(q, true);
 
     while (1) {
-        PendingDdrSlot item;
-        NvmeWriteSlotReq req;
-        StorageQueuePopResult pop_result = STORAGE_QUEUE_POP_NOT_ATTEMPTED;
         StorageCrossSlotWriterDecision writer_decision;
         bool wait_for_item = nvme_cross_slot_engine_active(engine) == 0u;
 
@@ -3283,16 +3329,21 @@ static void *storage_nvme_cross_slot_writer_thread(void *arg) {
             storage_record_writer_schedule_gap(q, expected_run_us, storage_wall_time_us());
         }
 
-        if (nvme_cross_slot_engine_can_accept(engine)) {
-            pop_result = storage_queue_pop(q, &item, wait_for_item);
-        }
-        if (pop_result == STORAGE_QUEUE_POP_ERROR) {
-            storage_set_writer_error_reason(q, "storage_queue_pop_failed");
-            writer_failed = true;
-            break;
-        }
-        if (pop_result == STORAGE_QUEUE_POP_ITEM) {
+        /* Fill all available engine contexts before stepping the NVMe queue.
+         * Only the first pop may block; subsequent pops are opportunistic. */
+        while (nvme_cross_slot_engine_can_accept(engine)) {
+            PendingDdrSlot item;
+            NvmeWriteSlotReq req;
             uint64_t buffer_offset = 0u;
+            StorageQueuePopResult pop_result = storage_queue_pop(q, &item, wait_for_item);
+
+            if (pop_result == STORAGE_QUEUE_POP_ERROR) {
+                storage_set_writer_error_reason(q, "storage_queue_pop_failed");
+                writer_failed = true;
+                break;
+            }
+            if (pop_result != STORAGE_QUEUE_POP_ITEM) break;
+            wait_for_item = false;
             memset(&req, 0, sizeof(req));
             req.slot = item.slot; req.start_lba = item.start_lba; req.sectors = item.sectors;
             req.hw_addr = item.hw_addr; req.bytes = item.bytes; req.chunk_index = item.chunk_index;
@@ -3312,6 +3363,7 @@ static void *storage_nvme_cross_slot_writer_thread(void *arg) {
                 writer_failed = true; break;
             }
         }
+        if (writer_failed) break;
         {
             uint64_t step_start_us = storage_wall_time_us();
             uint32_t step_budget_us = __atomic_load_n(
@@ -3327,8 +3379,14 @@ static void *storage_nvme_cross_slot_writer_thread(void *arg) {
             (void)__atomic_add_fetch(&q->writer_active_us,
                                      storage_elapsed_us(step_start_us), __ATOMIC_RELEASE);
         }
-        storage_cross_slot_update_stats(q, engine);
-        expected_run_us = storage_wall_time_us();
+        {
+            uint64_t now_us = storage_wall_time_us();
+            if (next_stats_sync_us == 0u || now_us >= next_stats_sync_us) {
+                storage_cross_slot_update_stats(q, engine);
+                next_stats_sync_us = now_us + STORAGE_CROSS_SLOT_STATS_SYNC_US;
+            }
+            expected_run_us = now_us;
+        }
         writer_decision = storage_cross_slot_writer_decision_locked(q, engine);
         if (writer_decision == STORAGE_CROSS_SLOT_WRITER_QUEUE_ERROR) {
             storage_set_writer_error_reason(q, "storage_queue_error");
@@ -3344,6 +3402,7 @@ static void *storage_nvme_cross_slot_writer_thread(void *arg) {
          * returns to the top where active==0 makes storage_queue_pop block on
          * not_empty until the producer supplies work or marks itself done. */
     }
+    storage_cross_slot_update_stats(q, engine);
     if (writer_failed) {
         uint64_t now_us = storage_wall_time_us();
         uint64_t drain_us = q->nvme_abort_timeout_us != 0u
@@ -4355,6 +4414,13 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                       start_gate_mode, start_skew_us);
     {
         uint32_t idle_notice_ms = storage_idle_notice_ms();
+        uint32_t harvest_base_limit = harvest_batch_max_cfg == 0u
+                                          ? 1u : harvest_batch_max_cfg;
+        uint32_t harvest_dynamic_cap = cfg->id == 2
+                                           ? 32u : STORAGE_HARVEST_BATCH_CAPACITY;
+        uint32_t adaptive_harvest_limit;
+        uint32_t saturated_harvest_count = 0u;
+        uint32_t empty_harvest_rounds = 0u;
         uint64_t last_dma_us = storage_wall_time_us();
         uint64_t first_dma_deadline_us = first_dma_timeout_us != 0u
                                             ? last_dma_us + first_dma_timeout_us : 0u;
@@ -4363,11 +4429,16 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
         bool stop_logged = false;
         bool ring_full_logged = false;
 
+        if (harvest_base_limit > harvest_dynamic_cap)
+            harvest_base_limit = harvest_dynamic_cap;
+        adaptive_harvest_limit = harvest_base_limit;
+
         for (;;) {
-            DmaHarvestItem harvest_items[16];
+            DmaHarvestItem harvest_items[STORAGE_HARVEST_BATCH_CAPACITY];
             uint32_t harvest_count = 0u;
-            uint32_t harvest_limit = harvest_batch_max_cfg == 0u ? 1u :
-                                     (harvest_batch_max_cfg > 16u ? 16u : harvest_batch_max_cfg);
+            uint32_t harvest_limit = adaptive_harvest_limit;
+            uint32_t harvest_room = harvest_limit;
+            bool harvest_room_limited = false;
             int harvest_rc;
             bool harvest_fatal;
             bool first_dma_deadline_due;
@@ -4401,6 +4472,15 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
 
             if (producer_stats.watermark_level >= 1u && harvest_limit < 16u)
                 harvest_limit = 16u;
+            if (harvest_limit > harvest_dynamic_cap)
+                harvest_limit = harvest_dynamic_cap;
+            if (harvest_limit > 16u) {
+                harvest_room = storage_queue_harvest_room(&write_queue);
+                if (harvest_limit > harvest_room) {
+                    harvest_limit = harvest_room;
+                    harvest_room_limited = true;
+                }
+            }
 
             if (bounded && stop_state.state == STORAGE_STOP_NONE) {
                 harvest_limit = storage_harvest_limit_for_remaining(
@@ -4586,7 +4666,9 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                 break;
             }
 
-            if (stop_state.state == STORAGE_STOP_HARVESTING) {
+            if (harvest_limit == 0u) {
+                harvest_rc = 0;
+            } else if (stop_state.state == STORAGE_STOP_HARVESTING) {
                 harvest_rc = dma_harvest_completed_batch(&rt, harvest_items,
                                                          harvest_limit, &harvest_count);
             } else {
@@ -4623,6 +4705,10 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                 goto out;
             }
             if (h == 0) {
+                adaptive_harvest_limit = harvest_base_limit;
+                saturated_harvest_count = 0u;
+                if (empty_harvest_rounds != UINT32_MAX)
+                    ++empty_harvest_rounds;
                 if (storage_first_dma_deadline_outcome(first_dma_deadline_due,
                                                        saw_dma_data, stop_requested,
                                                        harvest_rc, harvest_count) ==
@@ -4872,17 +4958,9 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                     } else if (bd_snapshot.dma_writable * 4u <= bd_snapshot.total_slots) {
                         sleep_us = storage_high_poll_sleep_us;
                     }
-                    if (sleep_us == 0u) {
-                        if (producer_rt_policy != SCHED_OTHER &&
-                            producer_rt_prio > storage_writer_rt_prio(&rt)) {
-                            struct timespec ts = {0, 1000L};
-                            (void)nanosleep(&ts, NULL);
-                        } else {
-                            sched_yield();
-                        }
-                    } else {
-                        usleep(sleep_us);
-                    }
+                    sleep_us = storage_adaptive_idle_sleep_us(
+                        sleep_us, empty_harvest_rounds);
+                    if (sleep_us != 0u) storage_nanosleep_us(sleep_us);
                 }
                 storage_stats_print_periodic(&producer_stats,
                                              &write_queue,
@@ -4893,8 +4971,9 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                                              now_us);
                 continue;
             }
+            empty_harvest_rounds = 0u;
             {
-                PendingDdrSlot pending[16];
+                PendingDdrSlot pending[STORAGE_HARVEST_BATCH_CAPACITY];
                 uint64_t batch_base_file_offset = bytes_captured;
                 uint64_t batch_base_lba = next_queue_lba;
                 uint64_t batch_bytes = 0u;
@@ -5135,7 +5214,26 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                                          "degraded_drain_request_send_failed");
                     goto out;
                 }
-                if (harvest_count >= harvest_batch_max_cfg) sched_yield();
+                if (!harvest_room_limited && harvest_count == harvest_limit &&
+                    adaptive_harvest_limit < harvest_dynamic_cap) {
+                    uint64_t saturated = (uint64_t)saturated_harvest_count +
+                                         harvest_count;
+                    uint64_t next_limit = (uint64_t)harvest_limit * 2u;
+
+                    saturated_harvest_count = saturated > UINT32_MAX
+                                                  ? UINT32_MAX
+                                                  : (uint32_t)saturated;
+                    if (saturated_harvest_count > rt.dma_desc_count / 4u) {
+                        adaptive_harvest_limit = harvest_dynamic_cap;
+                    } else {
+                        adaptive_harvest_limit = next_limit > harvest_dynamic_cap
+                                                     ? harvest_dynamic_cap
+                                                     : (uint32_t)next_limit;
+                    }
+                } else if (harvest_count < harvest_limit) {
+                    adaptive_harvest_limit = harvest_base_limit;
+                    saturated_harvest_count = 0u;
+                }
                 continue;
             }
         }

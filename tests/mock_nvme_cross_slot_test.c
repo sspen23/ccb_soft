@@ -15,7 +15,7 @@ typedef struct {
     int sq_full_once;
     unsigned poll_count;
     unsigned release_after_polls;
-    int release_on_yield;
+    int release_on_sleep;
     uint16_t delayed_cid;
     unsigned yield_count;
     unsigned sleep_count;
@@ -71,15 +71,15 @@ static void sleep_us(void *opaque, uint32_t us)
     Mock *mock = opaque;
     ++mock->sleep_count;
     mock->now_us += us;
+    if (mock->release_on_sleep && mock->completion_count == 0u) {
+        queue_completion(mock, mock->delayed_cid, 0);
+    }
 }
 
 static void yield_cpu(void *opaque)
 {
     Mock *mock = opaque;
     ++mock->yield_count;
-    if (mock->release_on_yield && mock->completion_count == 0u) {
-        queue_completion(mock, mock->delayed_cid, 0);
-    }
 }
 
 static int reset_engine(void *opaque)
@@ -310,9 +310,9 @@ static void test_stall_policy_and_stats(void)
     value = engine(&rt, &mock);
     assert(nvme_cross_slot_engine_add(value, &req) == 0);
     mock.delayed_cid = 1u;
-    mock.release_on_yield = 1;
+    mock.release_on_sleep = 1;
     assert(nvme_cross_slot_engine_step(value, 300u, done, &mock) == 0);
-    assert(mock.yield_count > 0u && mock.callbacks == 1u);
+    assert(mock.sleep_count > 0u && mock.yield_count == 0u && mock.callbacks == 1u);
     nvme_cross_slot_engine_destroy(value);
 
     memset(&mock, 0, sizeof(mock));
