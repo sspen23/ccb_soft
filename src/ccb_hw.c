@@ -763,20 +763,19 @@ static void nvme_nanosleep_us(uint32_t sleep_us)
     }
 }
 
-static uint32_t nvme_adaptive_poll_sleep_us(const ChannelRuntime *rt,
-                                            uint32_t waited_us)
+uint32_t nvme_poll_backoff_us(uint32_t busy_poll_us,
+                              uint32_t base_sleep_us,
+                              uint32_t waited_us)
 {
-    uint32_t base_us = rt ? rt->nvme_poll_sleep_us : NVME_POLL_SLEEP_US_DEFAULT;
-    uint32_t busy_us = rt ? rt->nvme_busy_poll_us : 0u;
     uint32_t stalled_us;
     uint32_t multiplier = 1u;
     uint64_t sleep_us;
 
-    if (base_us == 0u || waited_us < busy_us) return 0u;
-    stalled_us = waited_us - busy_us;
+    if (base_sleep_us == 0u || waited_us < busy_poll_us) return 0u;
+    stalled_us = waited_us - busy_poll_us;
     if (stalled_us >= 1000u) multiplier = 4u;
     else if (stalled_us >= 100u) multiplier = 2u;
-    sleep_us = (uint64_t)base_us * multiplier;
+    sleep_us = (uint64_t)base_sleep_us * multiplier;
     return sleep_us > NVME_POLL_SLEEP_US_MAX
                ? NVME_POLL_SLEEP_US_MAX : (uint32_t)sleep_us;
 }
@@ -790,7 +789,9 @@ static void nvme_poll_pause(ChannelRuntime *rt, uint64_t start_us) {
         return;
     }
     waited_us = elapsed_us_since(start_us);
-    sleep_us = nvme_adaptive_poll_sleep_us(rt, waited_us);
+    sleep_us = nvme_poll_backoff_us(rt->nvme_busy_poll_us,
+                                    rt->nvme_poll_sleep_us,
+                                    waited_us);
     if (sleep_us != 0u) nvme_nanosleep_us(sleep_us);
 }
 
@@ -1744,6 +1745,10 @@ static int nvme_simulate_write_qd_payload(ChannelRuntime *rt, uint64_t sectors,
                           : rt->nvme_qd_effective;
 
     (void)__atomic_add_fetch(&rt->nvme_cmd_count, command_count, __ATOMIC_RELAXED);
+    (void)__atomic_add_fetch(&rt->nvme_cq_completed, command_count,
+                             __ATOMIC_RELAXED);
+    (void)__atomic_add_fetch(&rt->nvme_completion_count, command_count,
+                             __ATOMIC_RELAXED);
     (void)__atomic_add_fetch(&rt->nvme_cmd_bytes_total, command_bytes, __ATOMIC_RELAXED);
     (void)__atomic_add_fetch(&rt->nvme_write_bytes_done, command_bytes, __ATOMIC_RELEASE);
     (void)__atomic_add_fetch(&rt->nvme_payload_bytes_done,

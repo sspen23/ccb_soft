@@ -120,6 +120,35 @@ static void test_ambiguous_submit_unknown_cid_is_fatal(void)
     nvme_clear_stop_request();
 }
 
+static void test_qd8_refill_and_adaptive_polling(void)
+{
+    ChannelRuntime rt;
+    ChannelConfig cfg;
+
+    memset(&rt, 0, sizeof(rt));
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.id = 0;
+    rt.cfg = &cfg;
+    rt.gopt.dry_run = true;
+    rt.nvme_qd_effective = 8u;
+    rt.nvme_cmd_sectors = 1024u;
+    rt.nvme_feed_mode = NVME_FEED_MODE_LEGACY;
+    assert(nvme_write_slot_qd_payload(&rt, 0u, 0u, 16384u,
+                                      8u * 1024u * 1024u, 0u) == 0);
+    assert(rt.nvme_cmd_count == 16u);
+    assert(rt.nvme_cq_completed == 16u);
+    assert(rt.nvme_completion_count == 16u);
+    assert(rt.nvme_active_qd_max == 8u);
+
+    assert(nvme_poll_backoff_us(50u, 10u, 49u) == 0u);
+    assert(nvme_poll_backoff_us(50u, 10u, 50u) == 10u);
+    assert(nvme_poll_backoff_us(50u, 10u, 150u) == 20u);
+    assert(nvme_poll_backoff_us(50u, 10u, 1050u) == 40u);
+    assert(nvme_poll_backoff_us(50u, 20u, 10000u) == 50u);
+    /* A completion/refill starts a new wait window, resetting backoff. */
+    assert(nvme_poll_backoff_us(50u, 10u, 0u) == 0u);
+}
+
 int main(void)
 {
     test_stop_before_doorbell();
@@ -127,6 +156,7 @@ int main(void)
     test_ambiguous_submit_drains_matching_cq();
     test_ambiguous_submit_reset_unavailable();
     test_ambiguous_submit_unknown_cid_is_fatal();
+    test_qd8_refill_and_adaptive_polling();
     puts("mock_nvme_legacy_submit_test: ok");
     return 0;
 }

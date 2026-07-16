@@ -25,6 +25,9 @@ int nvme_clamp_command_bytes(uint32_t requested_bytes,
                              uint32_t nvme_max_transfer_bytes,
                              uint32_t logical_block_bytes,
                              uint32_t *effective_bytes);
+uint32_t nvme_poll_backoff_us(uint32_t busy_poll_us,
+                              uint32_t base_sleep_us,
+                              uint32_t waited_us);
 void storage_print_pcie_link_status(ChannelRuntime *rt, const char *reason);
 
 /* Configure data path source and probe NVMe host capabilities. */
