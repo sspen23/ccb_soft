@@ -41,6 +41,7 @@ static void nvme_set_last_error(ChannelRuntime *rt, const char *reason);
 #define NVME_POLL_SLEEP_US_MAX 50u
 #define NVME_CROSS_SLOT_COMMANDS_PER_QD_ROUND 8u
 #define NVME_CROSS_SLOT_VALIDATE_INTERVAL_US 50000u
+#define NVME_CROSS_SLOT_STATS_INTERVAL_US 50000u
 #define NVME_SECTOR_BYTES 512u
 #define NVME_CMD_KIB_DEFAULT 256u
 #define NVME_CMD_KIB_HIGH_DEFAULT 1024u
@@ -2514,6 +2515,15 @@ struct NvmeCrossSlotEngine {
     uint64_t cq_empty_start_us;
     uint64_t no_progress_start_us;
     uint64_t last_full_validation_us;
+    uint64_t stats_last_publish_us;
+    uint64_t stats_last_completion_us;
+    uint64_t stats_cmd_count;
+    uint64_t stats_cmd_bytes;
+    uint64_t stats_payload_bytes;
+    uint64_t stats_latency_total_us;
+    uint64_t stats_latency_samples;
+    uint64_t stats_latency_min_us;
+    uint64_t stats_latency_max_us;
     uint32_t no_progress_rounds;
     NvmeCrossSlotStats stats;
     NvmeCrossSlotState state;
@@ -2575,10 +2585,90 @@ static uint32_t cross_slot_adaptive_sleep_us(const NvmeCrossSlotEngine *e)
     return sleep_us > cap_us ? cap_us : (uint32_t)sleep_us;
 }
 
+static void cross_slot_publish_completion_stats(NvmeCrossSlotEngine *e,
+                                                uint64_t now_us,
+                                                bool force)
+{
+    ChannelRuntime *rt;
+
+    if (!e || !e->rt) return;
+    if (!force) {
+        if (e->stats_last_publish_us == 0u) {
+            e->stats_last_publish_us = now_us;
+            return;
+        }
+        if (now_us >= e->stats_last_publish_us &&
+            now_us - e->stats_last_publish_us <
+                NVME_CROSS_SLOT_STATS_INTERVAL_US)
+            return;
+    }
+    rt = e->rt;
+    if (e->stats_cmd_count != 0u) {
+        (void)__atomic_add_fetch(&rt->nvme_cmd_count,
+                                 e->stats_cmd_count, __ATOMIC_RELAXED);
+        (void)__atomic_add_fetch(&rt->nvme_cmd_bytes_total,
+                                 e->stats_cmd_bytes, __ATOMIC_RELAXED);
+        (void)__atomic_add_fetch(&rt->nvme_write_bytes_done,
+                                 e->stats_cmd_bytes, __ATOMIC_RELEASE);
+        (void)__atomic_add_fetch(&rt->nvme_payload_bytes_done,
+                                 e->stats_payload_bytes, __ATOMIC_RELEASE);
+        if (e->stats_last_completion_us != 0u)
+            __atomic_store_n(&rt->nvme_last_completion_us,
+                             e->stats_last_completion_us, __ATOMIC_RELEASE);
+        if (e->stats_latency_samples != 0u) {
+            (void)__atomic_add_fetch(&rt->nvme_cmd_latency_total_us,
+                                     e->stats_latency_total_us,
+                                     __ATOMIC_RELAXED);
+            (void)__atomic_add_fetch(&rt->nvme_latency_sample_count,
+                                     e->stats_latency_samples,
+                                     __ATOMIC_RELAXED);
+            atomic_update_min_u64(&rt->nvme_cmd_latency_min_us,
+                                  e->stats_latency_min_us);
+            atomic_update_max_u64(&rt->nvme_cmd_latency_max_us,
+                                  e->stats_latency_max_us);
+        }
+        e->stats_cmd_count = 0u;
+        e->stats_cmd_bytes = 0u;
+        e->stats_payload_bytes = 0u;
+        e->stats_latency_total_us = 0u;
+        e->stats_latency_samples = 0u;
+        e->stats_latency_min_us = 0u;
+        e->stats_latency_max_us = 0u;
+    }
+    e->stats_last_publish_us = now_us;
+}
+
+static void cross_slot_record_write_completion(NvmeCrossSlotEngine *e,
+                                               const NvmePendingCmd *pending,
+                                               uint64_t completion_us)
+{
+    uint64_t latency_us;
+
+    if (!e || !pending) return;
+    ++e->stats_cmd_count;
+    e->stats_cmd_bytes += pending->bytes;
+    e->stats_payload_bytes += pending->payload_bytes != 0u
+                                  ? pending->payload_bytes : pending->bytes;
+    e->stats_last_completion_us = completion_us;
+    if (pending->submit_us != 0u && completion_us >= pending->submit_us) {
+        latency_us = completion_us - pending->submit_us;
+        e->stats_latency_total_us += latency_us;
+        ++e->stats_latency_samples;
+        if (e->stats_latency_min_us == 0u ||
+            latency_us < e->stats_latency_min_us)
+            e->stats_latency_min_us = latency_us;
+        if (latency_us > e->stats_latency_max_us)
+            e->stats_latency_max_us = latency_us;
+    }
+    cross_slot_publish_completion_stats(e, completion_us, false);
+}
+
 static int cross_slot_fail_code(NvmeCrossSlotEngine *e, StorageErrorCode code,
                                 const char *reason)
 {
     if (e) {
+        cross_slot_publish_completion_stats(
+            e, e->ops.monotonic_us(e->ops_opaque), true);
         if (e->last_error[0] == '\0') {
             snprintf(e->last_error, sizeof(e->last_error), "%s", reason);
             nvme_set_error(e->rt, code, reason);
@@ -2684,7 +2774,7 @@ static int cross_slot_handle_completion(NvmeCrossSlotEngine *e,
         nvme_record_active_qd_event(e->rt, e->global_inflight);
         return cross_slot_fail(e, "completion_status_error");
     }
-    nvme_record_write_completion(e->rt, entry, completion_us);
+    cross_slot_record_write_completion(e, entry, completion_us);
     entry->valid = false;
     e->completed_cid_seen[completion->cid] = true;
     --ctx->inflight_cmds;
@@ -2861,6 +2951,8 @@ int nvme_cross_slot_engine_drain_abort(NvmeCrossSlotEngine *e,
             e->ops.sleep_us(e->ops_opaque, e->config.empty_sleep_us);
     }
     if (e->global_inflight == 0u) {
+        cross_slot_publish_completion_stats(
+            e, e->ops.monotonic_us(e->ops_opaque), true);
         if (cross_slot_validate_periodic(
                 e, e->ops.monotonic_us(e->ops_opaque), true) != 0)
             return -1;
@@ -3127,6 +3219,7 @@ int nvme_cross_slot_engine_step(NvmeCrossSlotEngine *e, uint32_t budget_us,
         uint64_t end_us = e->ops.monotonic_us(e->ops_opaque);
         bool force = e->active_count == 0u && e->global_inflight == 0u;
 
+        cross_slot_publish_completion_stats(e, end_us, force);
         nvme_update_active_qd(e->rt, e->global_inflight, end_us);
         return cross_slot_validate_periodic(e, end_us, force);
     }

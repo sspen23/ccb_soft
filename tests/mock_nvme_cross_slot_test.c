@@ -216,6 +216,7 @@ static void test_completion_failures(void)
     queue_completion(&mock, mock.submitted[0], 0);
     queue_completion(&mock, mock.submitted[0], 0);
     assert(nvme_cross_slot_engine_step(value, 300u, done, &mock) != 0);
+    assert(__atomic_load_n(&rt.nvme_cmd_count, __ATOMIC_ACQUIRE) == 1u);
     assert(strcmp(nvme_cross_slot_engine_last_error(value), "duplicate_completion_cid") == 0);
     assert(rt.nvme_primary_error == STORAGE_ERR_DUPLICATE_CID);
     assert(nvme_cross_slot_engine_state(value) == NVME_CROSS_SLOT_ABORT_REQUESTED);
@@ -347,6 +348,7 @@ static void test_full_validation_is_not_per_completion(void)
     for (i = 0u; i < 4u; ++i) queue_completion(&mock, mock.submitted[i], 0);
     assert(nvme_cross_slot_engine_step(value, 25u, done, &mock) == 0);
     assert(mock.submitted_count == 8u);
+    assert(__atomic_load_n(&rt.nvme_cmd_count, __ATOMIC_ACQUIRE) == 0u);
     for (i = 4u; i < 8u; ++i) queue_completion(&mock, mock.submitted[i], 0);
     assert(nvme_cross_slot_engine_step(value, 25u, done, &mock) == 0);
     assert(mock.callbacks == 1u);
@@ -354,6 +356,9 @@ static void test_full_validation_is_not_per_completion(void)
     nvme_cross_slot_engine_get_stats(value, &after);
     assert(after.completion_process_count == 8u);
     assert(after.full_validation_count - before.full_validation_count <= 2u);
+    assert(__atomic_load_n(&rt.nvme_cmd_count, __ATOMIC_ACQUIRE) == 8u);
+    assert(__atomic_load_n(&rt.nvme_write_bytes_done,
+                           __ATOMIC_ACQUIRE) == 8u * 512u);
     nvme_cross_slot_engine_destroy(value);
 }
 
@@ -389,6 +394,7 @@ static void test_qd16_submission_and_completion(void)
     assert(mock.completion_index == 16u);
     assert(nvme_cross_slot_engine_inflight(value) == 0u);
     assert(mock.callbacks == 1u);
+    assert(__atomic_load_n(&rt.nvme_cmd_count, __ATOMIC_ACQUIRE) == 16u);
     assert(__atomic_load_n(&rt.nvme_last_completion_us,
                            __ATOMIC_ACQUIRE) != 0u);
     nvme_cross_slot_engine_destroy(value);
