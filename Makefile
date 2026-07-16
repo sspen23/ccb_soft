@@ -123,6 +123,7 @@ storage-host-tests:
 	$(CC) $(CFLAGS) -Wformat=2 -Iinclude tests/mock_storage_perf_test.c \
 		src/ccb_storage_perf.c src/ccb_storage_ipc.c $(STORAGE_CONFIG_SRC) $(STORAGE_ERROR_SRC) -o /tmp/mock_storage_perf_test
 	/tmp/mock_storage_perf_test
+	sh tests/storage_perf_summary_test.sh
 	$(CC) $(CFLAGS) -Wformat=2 -Iinclude tests/mock_storage_log_test.c $(STORAGE_CONFIG_SRC) \
 		-o /tmp/mock_storage_log_test
 	/tmp/mock_storage_log_test
