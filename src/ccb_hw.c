@@ -581,13 +581,13 @@ int nvme_decode_max_transfer(uint32_t raw_value,
     uint64_t actual_blocks;
     uint64_t actual_bytes;
 
-    if (!blocks || !bytes || raw_value > 0x1fffu ||
+    if (!blocks || !bytes || raw_value == 0u || raw_value > 0x1fffu ||
         logical_block_bytes == 0u) {
         return -1;
     }
-    /* MaxTransferSize uses the same NLB-minus-one representation as
-     * CmdSectCnt.  raw=0 therefore means one logical block. */
-    actual_blocks = (uint64_t)raw_value + 1u;
+    /* NVMStatus.MaxTransferSize is a block count, unlike CmdSectCnt which is
+     * NLB-minus-one.  A zero value means the capability is not available. */
+    actual_blocks = raw_value;
     actual_bytes = actual_blocks * logical_block_bytes;
     if (actual_bytes > UINT32_MAX) return -1;
     *blocks = (uint32_t)actual_blocks;
