@@ -11,6 +11,7 @@ typedef struct {
     unsigned completion_count;
     unsigned completion_index;
     unsigned callbacks;
+    uint32_t callback_slots[32];
     unsigned fail_callback;
     int sq_full_once;
     unsigned poll_count;
@@ -92,7 +93,9 @@ static int reset_engine(void *opaque)
 static int done(void *opaque, const NvmeWriteSlotReq *req)
 {
     Mock *mock = opaque;
-    (void)req;
+    assert(mock->callbacks <
+           sizeof(mock->callback_slots) / sizeof(mock->callback_slots[0]));
+    mock->callback_slots[mock->callbacks] = req->slot;
     ++mock->callbacks;
     return mock->fail_callback ? -1 : 0;
 }
@@ -161,21 +164,60 @@ static void test_multislot_out_of_order_and_budget(void)
     assert(mock.submitted_count == 4u);
     assert(__atomic_load_n(&rt.nvme_active_qd_max, __ATOMIC_ACQUIRE) == 4u);
     assert(mock.callbacks == 0u);
-    queue_completion(&mock, mock.submitted[2], 0);
     queue_completion(&mock, mock.submitted[1], 0);
-    assert(nvme_cross_slot_engine_step(value, 300u, done, &mock) == 0);
-    assert(mock.callbacks == 0u);
-    queue_completion(&mock, mock.submitted[0], 0);
-    assert(nvme_cross_slot_engine_step(value, 300u, done, &mock) == 0);
-    assert(mock.callbacks == 1u);
-    assert(nvme_cross_slot_engine_active(value) == 1u);
     queue_completion(&mock, mock.submitted[3], 0);
     assert(nvme_cross_slot_engine_step(value, 300u, done, &mock) == 0);
+    /* Slot B is complete, but its callback would advance DMA TAILDESC past
+     * the still-NVMe-owned slot A. */
+    assert(mock.callbacks == 0u);
+    queue_completion(&mock, mock.submitted[0], 0);
+    queue_completion(&mock, mock.submitted[2], 0);
+    assert(nvme_cross_slot_engine_step(value, 300u, done, &mock) == 0);
     assert(mock.callbacks == 2u);
+    assert(mock.callback_slots[0] == a.slot);
+    assert(mock.callback_slots[1] == b.slot);
     assert(nvme_cross_slot_engine_active(value) == 0u);
     assert(__atomic_load_n(&rt.nvme_active_us, __ATOMIC_ACQUIRE) > 0u);
     assert(__atomic_load_n(&rt.nvme_active_qd_observed_us,
                            __ATOMIC_ACQUIRE) > 0u);
+    nvme_cross_slot_engine_destroy(value);
+}
+
+static void test_reused_context_does_not_bypass_older_slot(void)
+{
+    ChannelRuntime rt;
+    Mock mock;
+    NvmeCrossSlotEngine *value;
+    NvmeWriteSlotReq a = request(4u, 1u);
+    NvmeWriteSlotReq b = request(5u, 1u);
+    NvmeWriteSlotReq c = request(6u, 1u);
+
+    memset(&mock, 0, sizeof(mock));
+    value = engine(&rt, &mock);
+    assert(value);
+    assert(nvme_cross_slot_engine_add(value, &a) == 0);
+    assert(nvme_cross_slot_engine_add(value, &b) == 0);
+    assert(nvme_cross_slot_engine_step(value, 1u, done, &mock) == 0);
+    assert(mock.submitted_count == 2u);
+
+    queue_completion(&mock, mock.submitted[0], 0);
+    assert(nvme_cross_slot_engine_step(value, 300u, done, &mock) == 0);
+    assert(mock.callbacks == 1u && mock.callback_slots[0] == a.slot);
+    assert(nvme_cross_slot_engine_add(value, &c) == 0);
+    assert(nvme_cross_slot_engine_step(value, 1u, done, &mock) == 0);
+    assert(mock.submitted_count == 3u);
+
+    /* C reuses A's lower array index, but B still owns the earlier DMA-ring
+     * position and therefore must receive its callback first. */
+    queue_completion(&mock, mock.submitted[2], 0);
+    assert(nvme_cross_slot_engine_step(value, 300u, done, &mock) == 0);
+    assert(mock.callbacks == 1u);
+    queue_completion(&mock, mock.submitted[1], 0);
+    assert(nvme_cross_slot_engine_step(value, 300u, done, &mock) == 0);
+    assert(mock.callbacks == 3u);
+    assert(mock.callback_slots[1] == b.slot);
+    assert(mock.callback_slots[2] == c.slot);
+    assert(nvme_cross_slot_engine_active(value) == 0u);
     nvme_cross_slot_engine_destroy(value);
 }
 
@@ -566,6 +608,7 @@ int main(void)
 {
     test_reset_clears_active_window();
     test_multislot_out_of_order_and_budget();
+    test_reused_context_does_not_bypass_older_slot();
     test_completion_failures();
     test_capacity_sq_full_and_callback();
     test_stall_policy_and_stats();

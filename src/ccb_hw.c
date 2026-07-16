@@ -2506,6 +2506,9 @@ struct NvmeCrossSlotEngine {
     NvmeSlotWriteContext contexts[NVME_PENDING_CAPACITY];
     NvmeWriteSlotReq reqs[NVME_PENDING_CAPACITY];
     bool active[NVME_PENDING_CAPACITY];
+    uint64_t admission_sequence[NVME_PENDING_CAPACITY];
+    uint64_t next_admission_sequence;
+    uint64_t next_callback_sequence;
     uint32_t active_count;
     NvmeCrossSlotConfig config;
     uint32_t global_inflight;
@@ -2700,8 +2703,15 @@ static int cross_slot_validate(NvmeCrossSlotEngine *e)
             ctx->slot != e->reqs[i].slot || ctx->next_submit_sector > ctx->total_sectors ||
             ctx->completed_cmds > ctx->submitted_cmds ||
             ctx->submitted_cmds !=
-                ctx->completed_cmds + ctx->failed_cmds + ctx->inflight_cmds)
+                ctx->completed_cmds + ctx->failed_cmds + ctx->inflight_cmds ||
+            e->admission_sequence[i] < e->next_callback_sequence ||
+            e->admission_sequence[i] >= e->next_admission_sequence)
             return cross_slot_fail(e, "context_count_invariant_failed");
+        for (uint32_t j = 0u; j < i; ++j) {
+            if (e->active[j] &&
+                e->admission_sequence[j] == e->admission_sequence[i])
+                return cross_slot_fail(e, "context_count_invariant_failed");
+        }
         inflight_count += ctx->inflight_cmds;
     }
     if (active_count != e->active_count || active_count > e->config.max_active_slots)
@@ -2921,6 +2931,7 @@ static void cross_slot_discard_contexts(NvmeCrossSlotEngine *e)
         memset(&e->contexts[i], 0, sizeof(e->contexts[i]));
         e->contexts[i].slot = UINT32_MAX;
         memset(&e->reqs[i], 0, sizeof(e->reqs[i]));
+        e->admission_sequence[i] = 0u;
     }
     e->global_inflight = 0u;
     e->active_count = 0u;
@@ -2998,9 +3009,12 @@ int nvme_cross_slot_engine_add(NvmeCrossSlotEngine *e, const NvmeWriteSlotReq *r
             return cross_slot_fail(e, "duplicate_active_slot");
     }
     if (!nvme_cross_slot_engine_can_accept(e)) return 1;
+    if (e->next_admission_sequence == UINT64_MAX)
+        return cross_slot_fail(e, "admission_sequence_overflow");
     for (i = 0u; i < NVME_PENDING_CAPACITY; ++i) {
         if (!e->active[i]) {
             e->active[i] = true; e->reqs[i] = *req;
+            e->admission_sequence[i] = e->next_admission_sequence++;
             memset(&e->contexts[i], 0, sizeof(e->contexts[i]));
             e->contexts[i].slot = req->slot; e->contexts[i].base_lba = req->start_lba;
             e->contexts[i].base_ddr_addr = req->hw_addr; e->contexts[i].total_sectors = req->sectors;
@@ -3010,6 +3024,49 @@ int nvme_cross_slot_engine_add(NvmeCrossSlotEngine *e, const NvmeWriteSlotReq *r
         }
     }
     return 1;
+}
+
+/* AXI DMA SG tail-pointer ownership is ordered even though NVMe CQ entries
+ * are not.  Storage admits slots in DMA harvest order, so defer a completed
+ * slot callback until every earlier admitted slot is also complete.  This
+ * preserves NVMe command/CQ parallelism while preventing a later TAILDESC
+ * write from exposing an earlier descriptor that NVMe still owns. */
+static int cross_slot_retire_completed_in_order(
+    NvmeCrossSlotEngine *e, NvmeWriteSlotDoneCb done_cb, void *opaque,
+    bool *progress)
+{
+    while (e && e->active_count > 0u) {
+        NvmeSlotWriteContext *ctx = NULL;
+        uint32_t index;
+
+        for (index = 0u; index < NVME_PENDING_CAPACITY; ++index) {
+            if (e->active[index] &&
+                e->admission_sequence[index] == e->next_callback_sequence) {
+                ctx = &e->contexts[index];
+                break;
+            }
+        }
+        if (!ctx)
+            return cross_slot_fail(e, "callback_sequence_invariant_failed");
+        if (ctx->next_submit_sector != ctx->total_sectors ||
+            ctx->completed_cmds != ctx->submitted_cmds ||
+            ctx->inflight_cmds != 0u)
+            return 0;
+        if (ctx->failed_cmds != 0u)
+            return cross_slot_fail(e, "completion_status_error");
+        if (done_cb && done_cb(opaque, &e->reqs[index]) != 0)
+            return cross_slot_fail(e, "slot_callback_failed");
+
+        e->active[index] = false;
+        memset(ctx, 0, sizeof(*ctx));
+        ctx->slot = UINT32_MAX;
+        memset(&e->reqs[index], 0, sizeof(e->reqs[index]));
+        e->admission_sequence[index] = 0u;
+        --e->active_count;
+        ++e->next_callback_sequence;
+        if (progress) *progress = true;
+    }
+    return 0;
 }
 
 int nvme_cross_slot_engine_step(NvmeCrossSlotEngine *e, uint32_t budget_us,
@@ -3062,21 +3119,11 @@ int nvme_cross_slot_engine_step(NvmeCrossSlotEngine *e, uint32_t budget_us,
             ++pops;
             ++command_work;
         }
-        /* Only fully drained contexts may invoke the slot callback. */
-        for (i = 0u; i < NVME_PENDING_CAPACITY; ++i) {
-            NvmeSlotWriteContext *ctx = &e->contexts[i];
-            if (e->active[i] && ctx->next_submit_sector == ctx->total_sectors &&
-                ctx->completed_cmds == ctx->submitted_cmds && ctx->inflight_cmds == 0u) {
-                if (ctx->failed_cmds != 0u) return cross_slot_fail(e, "completion_status_error");
-                if (done_cb && done_cb(opaque, &e->reqs[i]) != 0)
-                    return cross_slot_fail(e, "slot_callback_failed");
-                e->active[i] = false;
-                memset(&e->contexts[i], 0, sizeof(e->contexts[i]));
-                e->contexts[i].slot = UINT32_MAX;
-                memset(&e->reqs[i], 0, sizeof(e->reqs[i]));
-                --e->active_count; progress = true;
-            }
-        }
+        /* CQ completion is unordered.  Slot ownership returns to DMA only
+         * through callbacks retired in the original admission order. */
+        if (cross_slot_retire_completed_in_order(
+                e, done_cb, opaque, &progress) != 0)
+            return -1;
         /* Refill after processing CQ and completed contexts. */
         while (e->global_inflight < qd && command_work < command_budget) {
             bool done[NVME_PENDING_CAPACITY];
