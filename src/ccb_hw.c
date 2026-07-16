@@ -18,6 +18,8 @@
 #include <sched.h>
 #include <time.h>
 
+static void nvme_set_last_error(ChannelRuntime *rt, const char *reason);
+
 /*
  * Hardware access layer:
  * - Maps channel MMIO/DDR regions from /dev/mem
@@ -571,46 +573,77 @@ static uint32_t parse_nvme_feed_mode(ChannelRuntime *rt) {
     return NVME_FEED_MODE_LEGACY;
 }
 
-static void nvme_configure_runtime(ChannelRuntime *rt) {
+int nvme_decode_max_transfer(uint32_t raw_value,
+                             uint32_t logical_block_bytes,
+                             uint32_t *blocks,
+                             uint32_t *bytes)
+{
+    uint64_t actual_blocks;
+    uint64_t actual_bytes;
+
+    if (!blocks || !bytes || raw_value > 0x1fffu ||
+        logical_block_bytes == 0u) {
+        return -1;
+    }
+    /* MaxTransferSize uses the same NLB-minus-one representation as
+     * CmdSectCnt.  raw=0 therefore means one logical block. */
+    actual_blocks = (uint64_t)raw_value + 1u;
+    actual_bytes = actual_blocks * logical_block_bytes;
+    if (actual_bytes > UINT32_MAX) return -1;
+    *blocks = (uint32_t)actual_blocks;
+    *bytes = (uint32_t)actual_bytes;
+    return 0;
+}
+
+int nvme_clamp_command_bytes(uint32_t requested_bytes,
+                             uint32_t nvme_max_transfer_bytes,
+                             uint32_t logical_block_bytes,
+                             uint32_t *effective_bytes)
+{
+    if (!effective_bytes || requested_bytes == 0u ||
+        nvme_max_transfer_bytes == 0u || logical_block_bytes == 0u ||
+        requested_bytes % logical_block_bytes != 0u ||
+        nvme_max_transfer_bytes % logical_block_bytes != 0u) {
+        return -1;
+    }
+    *effective_bytes = requested_bytes < nvme_max_transfer_bytes
+                           ? requested_bytes : nvme_max_transfer_bytes;
+    return 0;
+}
+
+static int nvme_configure_runtime(ChannelRuntime *rt) {
     const ChannelStorageConfig *profile = rt && rt->cfg
         ? storage_config_channel(storage_config_get(), (uint32_t)rt->cfg->id)
         : NULL;
     uint32_t requested_kib = parse_nvme_cmd_kib(rt);
     uint64_t requested_bytes = (uint64_t)requested_kib * 1024ull;
     uint64_t safe_limit = (uint64_t)NVME_CMD_KIB_MAX * 1024ull;
-    uint64_t effective_bytes;
+    uint32_t effective_bytes;
 
     if (rt->nvme_max_dts_bytes > 0u && safe_limit > rt->nvme_max_dts_bytes) {
         safe_limit = rt->nvme_max_dts_bytes;
     }
-    safe_limit -= safe_limit % NVME_SECTOR_BYTES;
-    if (safe_limit < NVME_SECTOR_BYTES) {
-        safe_limit = NVME_SECTOR_BYTES;
+    if (safe_limit > UINT32_MAX ||
+        nvme_clamp_command_bytes((uint32_t)requested_bytes,
+                                 (uint32_t)safe_limit,
+                                 rt->nvme_block_size,
+                                 &effective_bytes) != 0) {
+        nvme_set_last_error(rt, "nvme_command_size_invalid");
+        rt->nvme_cmd_size_bytes = 0u;
+        rt->nvme_cmd_sectors = 0u;
+        return -1;
     }
-
-    effective_bytes = requested_bytes;
-    if (effective_bytes > safe_limit) {
-        uint32_t candidate_kib;
-
-        effective_bytes = safe_limit;
-        for (candidate_kib = NVME_CMD_KIB_DEFAULT; candidate_kib <= NVME_CMD_KIB_MAX;
-             candidate_kib *= 2u) {
-            uint64_t candidate_bytes = (uint64_t)candidate_kib * 1024ull;
-            if (candidate_bytes > safe_limit || candidate_bytes > requested_bytes) {
-                break;
-            }
-            effective_bytes = candidate_bytes;
-        }
+    if (effective_bytes < requested_bytes) {
         fprintf(stderr,
                 "warning: SRC_REAL_NVME_CMD_KIB=%u exceeds NVMe safe limit=%" PRIu64
-                " bytes (max_dts=%u); effective=%" PRIu64 " bytes\n",
+                " bytes (max_dts=%u); effective=%u bytes\n",
                 requested_kib,
                 safe_limit,
                 (unsigned)rt->nvme_max_dts_bytes,
                 effective_bytes);
     }
 
-    rt->nvme_cmd_size_bytes = (uint32_t)effective_bytes;
+    rt->nvme_cmd_size_bytes = effective_bytes;
     rt->nvme_cmd_sectors = rt->nvme_cmd_size_bytes / NVME_SECTOR_BYTES;
     rt->nvme_qd_requested = parse_nvme_qd(rt);
     rt->nvme_qd_effective = rt->nvme_qd_requested;
@@ -664,6 +697,7 @@ static void nvme_configure_runtime(ChannelRuntime *rt) {
                (unsigned)rt->nvme_qd_effective);
         fflush(stdout);
     }
+    return 0;
 }
 
 static void atomic_update_min_u64(uint64_t *target, uint64_t value) {
@@ -3409,7 +3443,7 @@ int channel_runtime_open(ChannelRuntime *rt, const ChannelConfig *cfg, GlobalOpt
     rt->next_cmd_id = 1u;
     rt->next_harvest_bd = 0u;
     rt->nvme_block_size = 512u;
-    rt->nvme_max_dts_bytes = 256u * 1024u;
+    rt->nvme_max_dts_bytes = 0u;
     rt->nvme_cmd_size_bytes = NVME_CMD_KIB_DEFAULT * 1024u;
     rt->nvme_cmd_sectors = rt->nvme_cmd_size_bytes / NVME_SECTOR_BYTES;
     rt->nvme_qd_requested = NVME_QD_DEFAULT;
@@ -3563,7 +3597,8 @@ static int nvme_wait_links(ChannelRuntime *rt) {
 static int nvme_read_capability(ChannelRuntime *rt, const char *tag) {
     uint32_t status = reg_read32(&rt->nvme, GENERIC_REG_OFFSET + GENERIC_NVM_STATUS);
     uint32_t blk_exp = (status >> 29u) & 0x1Fu;
-    uint32_t max_dts_blocks = (status >> 16u) & 0x1FFFu;
+    uint32_t max_dts_raw = (status >> 16u) & 0x1FFFu;
+    uint32_t max_dts_blocks;
     uint32_t lba_l;
     uint32_t lba_h;
 
@@ -3576,14 +3611,12 @@ static int nvme_read_capability(ChannelRuntime *rt, const char *tag) {
         nvme_set_last_error(rt, "nvme_block_size_unsupported");
         return -1;
     }
-    if (max_dts_blocks == 0u) {
-        max_dts_blocks = 512u;
-    }
-    if ((uint64_t)max_dts_blocks * rt->nvme_block_size > UINT32_MAX) {
-        nvme_set_last_error(rt, "nvme_max_dts_overflow");
+    if (nvme_decode_max_transfer(max_dts_raw, rt->nvme_block_size,
+                                 &max_dts_blocks,
+                                 &rt->nvme_max_dts_bytes) != 0) {
+        nvme_set_last_error(rt, "nvme_max_transfer_invalid");
         return -1;
     }
-    rt->nvme_max_dts_bytes = max_dts_blocks * rt->nvme_block_size;
     lba_l = reg_read32(&rt->nvme, GENERIC_REG_OFFSET + GENERIC_MAXLBA_L);
     lba_h = reg_read32(&rt->nvme, GENERIC_REG_OFFSET + GENERIC_MAXLBA_H);
     rt->nvme_max_lba = ((uint64_t)lba_h << 32u) | (uint64_t)lba_l;
@@ -3591,6 +3624,13 @@ static int nvme_read_capability(ChannelRuntime *rt, const char *tag) {
         nvme_set_last_error(rt, "nvme_capacity_unavailable");
         return -1;
     }
+
+    printf("nvme_capability channel=%d max_transfer_raw=%u"
+           " max_transfer_blocks=%u max_transfer_bytes=%u"
+           " logical_block_bytes=%u\n",
+           rt->cfg->id, max_dts_raw, max_dts_blocks,
+           rt->nvme_max_dts_bytes, rt->nvme_block_size);
+    fflush(stdout);
 
     dbg_verbose_printf("[DBG][NVME] probe %s ch=%d status=0x%08x block=%u max_dts=%u max_lba=0x%08" PRIx64
                        " tx_status=0x%08x int=0x%08x\n",
@@ -3610,7 +3650,7 @@ int nvme_probe(ChannelRuntime *rt) {
         rt->nvme_block_size = 512u;
         rt->nvme_max_dts_bytes = NVME_CMD_KIB_MAX * 1024u;
         rt->nvme_max_lba = 1024ull * 1024ull * 1024ull;
-        nvme_configure_runtime(rt);
+        if (nvme_configure_runtime(rt) != 0) return -1;
         storage_print_pcie_link_status(rt, "after_nvme_probe");
         return 0;
     }
@@ -3624,7 +3664,7 @@ int nvme_probe(ChannelRuntime *rt) {
                 rt->cfg->id, rt->nvme_last_error);
         return -1;
     }
-    nvme_configure_runtime(rt);
+    if (nvme_configure_runtime(rt) != 0) return -1;
     storage_print_pcie_link_status(rt, "after_nvme_probe");
 
     return 0;

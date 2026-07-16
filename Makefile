@@ -140,6 +140,9 @@ storage-host-tests:
 		tests/mock_nvme_legacy_submit_test.c src/ccb_hw.c src/debug_uart.c $(STORAGE_CONFIG_SRC) $(STORAGE_ERROR_SRC) -lpthread -Wl,--gc-sections -o /tmp/mock_nvme_legacy_submit_test
 	/tmp/mock_nvme_legacy_submit_test
 	$(CC) $(CFLAGS) -Wformat=2 -ffunction-sections -fdata-sections -Iinclude \
+		tests/mock_nvme_capability_test.c src/ccb_hw.c src/debug_uart.c $(STORAGE_CONFIG_SRC) $(STORAGE_ERROR_SRC) -Wl,--gc-sections -o /tmp/mock_nvme_capability_test
+	/tmp/mock_nvme_capability_test
+	$(CC) $(CFLAGS) -Wformat=2 -ffunction-sections -fdata-sections -Iinclude \
 		tests/mock_dma_harvest_batch_test.c src/ccb_hw.c $(STORAGE_CONFIG_SRC) -Wl,--gc-sections -o /tmp/mock_dma_harvest_batch_test
 	/tmp/mock_dma_harvest_batch_test
 	$(CC) $(CFLAGS) -Wformat=2 -ffunction-sections -fdata-sections -Iinclude \

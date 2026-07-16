@@ -17,6 +17,14 @@ int ddr_addr_validate(const ChannelConfig *cfg, uint64_t cpu_addr, uint64_t size
 int channel_runtime_open(ChannelRuntime *rt, const ChannelConfig *cfg, GlobalOptions gopt);
 void channel_runtime_close(ChannelRuntime *rt);
 uint32_t nvme_default_qd_for_channel(int channel_id);
+int nvme_decode_max_transfer(uint32_t raw_value,
+                             uint32_t logical_block_bytes,
+                             uint32_t *blocks,
+                             uint32_t *bytes);
+int nvme_clamp_command_bytes(uint32_t requested_bytes,
+                             uint32_t nvme_max_transfer_bytes,
+                             uint32_t logical_block_bytes,
+                             uint32_t *effective_bytes);
 void storage_print_pcie_link_status(ChannelRuntime *rt, const char *reason);
 
 /* Configure data path source and probe NVMe host capabilities. */
