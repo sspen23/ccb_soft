@@ -2657,11 +2657,12 @@ static int cross_slot_validate_periodic(NvmeCrossSlotEngine *e,
     return 0;
 }
 
-static int cross_slot_handle_completion(NvmeCrossSlotEngine *e, const NvmeCompletion *completion)
+static int cross_slot_handle_completion(NvmeCrossSlotEngine *e,
+                                        const NvmeCompletion *completion,
+                                        uint64_t completion_us)
 {
     NvmePendingCmd *entry;
     NvmeSlotWriteContext *ctx;
-    uint64_t completion_us = 0u;
     if (!e || !completion) return -1;
     entry = nvme_find_pending_by_cid(e->pending, NVME_PENDING_CAPACITY, completion->cid);
     if (!entry) {
@@ -2674,8 +2675,6 @@ static int cross_slot_handle_completion(NvmeCrossSlotEngine *e, const NvmeComple
     ctx = nvme_find_slot_context(e->contexts, NVME_PENDING_CAPACITY, entry->slot);
     if (!ctx || ctx->inflight_cmds == 0u || e->global_inflight == 0u)
         return cross_slot_fail(e, "pending_cid_state_inconsistent");
-    if (e->rt->nvme_diag_timing)
-        completion_us = e->ops.monotonic_us(e->ops_opaque);
     if (completion->error) {
         ++ctx->failed_cmds;
         entry->valid = false;
@@ -2853,7 +2852,8 @@ int nvme_cross_slot_engine_drain_abort(NvmeCrossSlotEngine *e,
 
         if (rc < 0) break;
         if (rc > 0) {
-            (void)cross_slot_handle_completion(e, &completion);
+            (void)cross_slot_handle_completion(
+                e, &completion, e->ops.monotonic_us(e->ops_opaque));
             if (e->global_inflight < before) continue;
         }
         if (e->ops.yield_cpu) e->ops.yield_cpu(e->ops_opaque);
@@ -2959,7 +2959,8 @@ int nvme_cross_slot_engine_step(NvmeCrossSlotEngine *e, uint32_t budget_us,
             cross_slot_clear_cq_empty(e, poll_end_us);
             {
                 uint64_t process_start_us = poll_end_us;
-                if (cross_slot_handle_completion(e, &cpl) != 0) return -1;
+                if (cross_slot_handle_completion(e, &cpl, poll_end_us) != 0)
+                    return -1;
                 ++e->stats.completion_process_count;
                 if (e->rt->nvme_diag_timing)
                     cross_slot_update_max(&e->stats.completion_process_max_us,
@@ -3090,7 +3091,8 @@ int nvme_cross_slot_engine_step(NvmeCrossSlotEngine *e, uint32_t budget_us,
                 cross_slot_clear_cq_empty(e, poll_end_us);
                 {
                     uint64_t process_start_us = poll_end_us;
-                    if (cross_slot_handle_completion(e, &cpl) != 0) return -1;
+                    if (cross_slot_handle_completion(e, &cpl, poll_end_us) != 0)
+                        return -1;
                     ++e->stats.completion_process_count;
                     if (e->rt->nvme_diag_timing)
                         cross_slot_update_max(&e->stats.completion_process_max_us,

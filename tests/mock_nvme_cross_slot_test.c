@@ -389,6 +389,8 @@ static void test_qd16_submission_and_completion(void)
     assert(mock.completion_index == 16u);
     assert(nvme_cross_slot_engine_inflight(value) == 0u);
     assert(mock.callbacks == 1u);
+    assert(__atomic_load_n(&rt.nvme_last_completion_us,
+                           __ATOMIC_ACQUIRE) != 0u);
     nvme_cross_slot_engine_destroy(value);
 }
 
