@@ -16,6 +16,13 @@ static StorageErrorCode fake_probe(uint32_t channel, void *ctx,
     snapshot->pcie_link = true;
     snapshot->nvme_ready = channel != 1u;
     snapshot->capacity_valid = channel != 1u;
+    snapshot->logical_block_bytes = 512u;
+    snapshot->max_transfer_raw = 512u + channel;
+    snapshot->max_transfer_blocks = 512u + channel;
+    snapshot->max_transfer_bytes = (512u + channel) * 512u;
+    snapshot->requested_command_bytes = 512u * 1024u;
+    snapshot->effective_command_bytes = snapshot->max_transfer_bytes;
+    snapshot->nvme_qd = 8u;
     return channel == 1u ? STORAGE_ERR_NVME_PROBE : STORAGE_ERR_NONE;
 }
 
@@ -49,6 +56,10 @@ int main(void)
                after.tv_nsec - before.tv_nsec < 100000000L);
     assert(snapshots[0].nvme_ready);
     assert(!snapshots[1].nvme_ready);
+    assert(snapshots[0].max_transfer_raw == 512u);
+    assert(snapshots[0].max_transfer_bytes == 256u * 1024u);
+    assert(snapshots[0].requested_command_bytes == 512u * 1024u);
+    assert(snapshots[0].effective_command_bytes == 256u * 1024u);
     storage_health_stop();
     puts("mock_storage_health_test: ok");
     return 0;

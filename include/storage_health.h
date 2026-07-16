@@ -11,6 +11,13 @@ typedef struct {
     bool pcie_link;
     bool nvme_ready;
     bool capacity_valid;
+    uint32_t logical_block_bytes;
+    uint32_t max_transfer_raw;
+    uint32_t max_transfer_blocks;
+    uint32_t max_transfer_bytes;
+    uint32_t requested_command_bytes;
+    uint32_t effective_command_bytes;
+    uint32_t nvme_qd;
     uint64_t checked_us;
     StorageErrorCode error;
 } StorageHealthSnapshot;

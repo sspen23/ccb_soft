@@ -3474,6 +3474,8 @@ int channel_runtime_open(ChannelRuntime *rt, const ChannelConfig *cfg, GlobalOpt
     rt->next_cmd_id = 1u;
     rt->next_harvest_bd = 0u;
     rt->nvme_block_size = 512u;
+    rt->nvme_max_dts_raw = 0u;
+    rt->nvme_max_dts_blocks = 0u;
     rt->nvme_max_dts_bytes = 0u;
     rt->nvme_cmd_size_bytes = NVME_CMD_KIB_DEFAULT * 1024u;
     rt->nvme_cmd_sectors = rt->nvme_cmd_size_bytes / NVME_SECTOR_BYTES;
@@ -3648,6 +3650,8 @@ static int nvme_read_capability(ChannelRuntime *rt, const char *tag) {
         nvme_set_last_error(rt, "nvme_max_transfer_invalid");
         return -1;
     }
+    rt->nvme_max_dts_raw = max_dts_raw;
+    rt->nvme_max_dts_blocks = max_dts_blocks;
     lba_l = reg_read32(&rt->nvme, GENERIC_REG_OFFSET + GENERIC_MAXLBA_L);
     lba_h = reg_read32(&rt->nvme, GENERIC_REG_OFFSET + GENERIC_MAXLBA_H);
     rt->nvme_max_lba = ((uint64_t)lba_h << 32u) | (uint64_t)lba_l;
@@ -3679,6 +3683,8 @@ static int nvme_read_capability(ChannelRuntime *rt, const char *tag) {
 int nvme_probe(ChannelRuntime *rt) {
     if (rt->gopt.dry_run) {
         rt->nvme_block_size = 512u;
+        rt->nvme_max_dts_raw = NVME_CMD_KIB_MAX * 2u;
+        rt->nvme_max_dts_blocks = rt->nvme_max_dts_raw;
         rt->nvme_max_dts_bytes = NVME_CMD_KIB_MAX * 1024u;
         rt->nvme_max_lba = 1024ull * 1024ull * 1024ull;
         if (nvme_configure_runtime(rt) != 0) return -1;

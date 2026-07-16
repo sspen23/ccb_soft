@@ -207,6 +207,32 @@ void dbg_printf(const char *fmt, ...)
     (void)written;
 }
 
+void dbg_status_printf(const char *fmt, ...)
+{
+    char buf[DEBUG_BUF_BYTES];
+    va_list ap;
+    int n;
+    ssize_t written;
+
+    if (!fmt) {
+        return;
+    }
+    if (g_debug_fd < 0 && debug_uart_init() != 0) {
+        return;
+    }
+    va_start(ap, fmt);
+    n = vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    if (n <= 0) {
+        return;
+    }
+    if (n > (int)sizeof(buf)) {
+        n = (int)sizeof(buf);
+    }
+    written = write(g_debug_fd, buf, (size_t)n);
+    (void)written;
+}
+
 int dbg_verbose_enabled(void)
 {
     if (g_verbose_cached < 0) {

@@ -241,6 +241,8 @@ typedef struct {
     uint32_t next_harvest_bd;
     uint16_t next_cmd_id;
     uint32_t nvme_block_size;
+    uint32_t nvme_max_dts_raw;
+    uint32_t nvme_max_dts_blocks;
     uint32_t nvme_max_dts_bytes;
     uint64_t nvme_max_lba;
     uint32_t nvme_cmd_size_bytes;

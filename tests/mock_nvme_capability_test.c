@@ -20,6 +20,13 @@ int main(void)
                                     &bytes) == 0);
     assert(bytes == 512u * 1024u);
 
+    assert(nvme_decode_max_transfer(512u, 512u, &blocks, &bytes) == 0);
+    assert(blocks == 512u);
+    assert(bytes == 256u * 1024u);
+    assert(nvme_clamp_command_bytes(512u * 1024u, bytes, 512u,
+                                    &bytes) == 0);
+    assert(bytes == 256u * 1024u);
+
     assert(nvme_decode_max_transfer(0u, 512u, &blocks, &bytes) != 0);
     assert(nvme_decode_max_transfer(0u, 0u, &blocks, &bytes) != 0);
     assert(nvme_decode_max_transfer(0x2000u, 512u, &blocks, &bytes) != 0);

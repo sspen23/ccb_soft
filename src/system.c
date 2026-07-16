@@ -4181,6 +4181,8 @@ static StorageErrorCode probe_one_storage_channel(
 {
     const ChannelConfig *cfg = find_channel((int)channel);
     const AppConfig *config = storage_config_get();
+    const ChannelStorageConfig *storage =
+        storage_config_channel(config, channel);
     GlobalOptions gopt;
     ChannelRuntime rt;
 
@@ -4188,6 +4190,7 @@ static StorageErrorCode probe_one_storage_channel(
     if (!snapshot) return STORAGE_ERR_INTERNAL;
     memset(snapshot, 0, sizeof(*snapshot));
     snapshot->channel = channel;
+    snapshot->requested_command_bytes = storage ? storage->command_bytes : 0u;
     memset(&gopt, 0, sizeof(gopt));
     gopt.timeout_us = config && config->status_timeout_ms <= UINT32_MAX / 1000u
                            ? config->status_timeout_ms * 1000u
@@ -4204,6 +4207,12 @@ static StorageErrorCode probe_one_storage_channel(
         return STORAGE_ERR_NVME_PROBE;
     }
     snapshot->nvme_ready = true;
+    snapshot->logical_block_bytes = rt.nvme_block_size;
+    snapshot->max_transfer_raw = rt.nvme_max_dts_raw;
+    snapshot->max_transfer_blocks = rt.nvme_max_dts_blocks;
+    snapshot->max_transfer_bytes = rt.nvme_max_dts_bytes;
+    snapshot->effective_command_bytes = rt.nvme_cmd_size_bytes;
+    snapshot->nvme_qd = rt.nvme_qd_effective;
 
     if (rt.nvme_block_size == 0u ||
         rt.nvme_max_dts_bytes < rt.nvme_block_size ||
@@ -4220,6 +4229,28 @@ static uint8_t get_status_query_result(void)
 {
     StorageHealthSnapshot snapshots[NUM_CHANNELS];
     StorageHealthResult result = storage_health_query(15000000ull, snapshots);
+    uint32_t channel;
+
+    for (channel = 0u; channel < NUM_CHANNELS; ++channel) {
+        const StorageHealthSnapshot *snapshot = &snapshots[channel];
+
+        dbg_status_printf(
+            "storage_status_nvme_capability channel=%u valid=%u"
+            " max_transfer_raw=%u max_transfer_blocks=%u"
+            " max_transfer_bytes=%u logical_block_bytes=%u"
+            " requested_command_bytes=%u effective_command_bytes=%u"
+            " nvme_qd=%u error=%s\n",
+            channel,
+            snapshot->nvme_ready && snapshot->capacity_valid ? 1u : 0u,
+            snapshot->max_transfer_raw,
+            snapshot->max_transfer_blocks,
+            snapshot->max_transfer_bytes,
+            snapshot->logical_block_bytes,
+            snapshot->requested_command_bytes,
+            snapshot->effective_command_bytes,
+            snapshot->nvme_qd,
+            storage_error_string(snapshot->error));
+    }
 
     if (result == STORAGE_HEALTH_OK) return ACK_SUCCESS;
     if (result == STORAGE_HEALTH_RETRYING) {
