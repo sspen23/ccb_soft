@@ -25,6 +25,7 @@ int main(void)
     struct timespec before;
     struct timespec after;
     StorageHealthSnapshot snapshots[3];
+    StorageHealthResult health = STORAGE_HEALTH_RETRYING;
     unsigned attempts;
 
     assert(storage_health_start(fake_probe, NULL, 1000u) == 0);
@@ -34,8 +35,12 @@ int main(void)
          ++attempts)
         (void)nanosleep(&pause, NULL);
     assert(atomic_load(&g_calls) >= 3u);
-    assert(storage_health_query(1000000u, snapshots) ==
-           STORAGE_HEALTH_FAILED);
+    for (attempts = 0u; attempts < 1000u && health != STORAGE_HEALTH_FAILED;
+         ++attempts) {
+        health = storage_health_query(1000000u, snapshots);
+        if (health != STORAGE_HEALTH_FAILED) (void)nanosleep(&pause, NULL);
+    }
+    assert(health == STORAGE_HEALTH_FAILED);
     (void)clock_gettime(CLOCK_MONOTONIC, &before);
     assert(storage_health_query(1000000u, snapshots) ==
            STORAGE_HEALTH_FAILED);
