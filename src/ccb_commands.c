@@ -3438,9 +3438,11 @@ static void *storage_nvme_cross_slot_writer_thread(void *arg) {
         }
         {
             uint64_t now_us = storage_wall_time_us();
-            if (next_stats_sync_us == 0u || now_us >= next_stats_sync_us) {
+            if (storage_metrics_publish_due(now_us, next_stats_sync_us,
+                                            false)) {
                 storage_cross_slot_update_stats(q, engine);
-                next_stats_sync_us = now_us + STORAGE_CROSS_SLOT_STATS_SYNC_US;
+                next_stats_sync_us = storage_metrics_next_publish_us(
+                    now_us, STORAGE_CROSS_SLOT_STATS_SYNC_US);
             }
             expected_run_us = now_us;
         }

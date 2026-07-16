@@ -84,6 +84,13 @@ int main(void)
     assert(!storage_dma_producer_may_idle(1u, 0u));
     assert(!storage_dma_producer_may_idle(0u, 1u));
     assert(storage_dma_producer_may_idle(0u, 0u));
+    assert(storage_metrics_publish_due(1000u, 0u, false));
+    assert(!storage_metrics_publish_due(1001u, 51000u, false));
+    assert(storage_metrics_publish_due(51000u, 51000u, false));
+    assert(storage_metrics_publish_due(1001u, 51000u, true));
+    assert(storage_metrics_next_publish_us(1000u, 50000u) == 51000u);
+    assert(storage_metrics_next_publish_us(UINT64_MAX - 1u, 50000u) ==
+           UINT64_MAX);
     assert(storage_pipeline_mark_completed(&p, 0u) == 0);
     assert(storage_pipeline_mark_completed(&p, 1u) == 0);
     assert(storage_queue_push_batch(&p, a, 2u) == 0);

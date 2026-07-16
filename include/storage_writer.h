@@ -44,5 +44,9 @@ bool storage_drain_stable_observe(StorageDrainStableState *state,
 StorageCrossSlotWriterDecision storage_cross_slot_writer_decide(
     bool producer_done, uint32_t queue_count, bool queue_error,
     uint32_t engine_active, uint32_t engine_inflight);
+bool storage_metrics_publish_due(uint64_t now_us, uint64_t next_publish_us,
+                                 bool force);
+uint64_t storage_metrics_next_publish_us(uint64_t now_us,
+                                         uint64_t interval_us);
 
 #endif
