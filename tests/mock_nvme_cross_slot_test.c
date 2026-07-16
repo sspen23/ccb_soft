@@ -327,6 +327,36 @@ static void test_stall_policy_and_stats(void)
     nvme_cross_slot_engine_destroy(value);
 }
 
+static void test_full_validation_is_not_per_completion(void)
+{
+    ChannelRuntime rt;
+    Mock mock;
+    NvmeCrossSlotEngine *value;
+    NvmeCrossSlotStats before;
+    NvmeCrossSlotStats after;
+    NvmeWriteSlotReq req = request(16u, 8u);
+    unsigned i;
+
+    memset(&mock, 0, sizeof(mock));
+    value = engine(&rt, &mock);
+    assert(value && nvme_cross_slot_engine_add(value, &req) == 0);
+    assert(nvme_cross_slot_engine_step(value, 25u, done, &mock) == 0);
+    assert(mock.submitted_count == 4u);
+    nvme_cross_slot_engine_get_stats(value, &before);
+
+    for (i = 0u; i < 4u; ++i) queue_completion(&mock, mock.submitted[i], 0);
+    assert(nvme_cross_slot_engine_step(value, 25u, done, &mock) == 0);
+    assert(mock.submitted_count == 8u);
+    for (i = 4u; i < 8u; ++i) queue_completion(&mock, mock.submitted[i], 0);
+    assert(nvme_cross_slot_engine_step(value, 25u, done, &mock) == 0);
+    assert(mock.callbacks == 1u);
+
+    nvme_cross_slot_engine_get_stats(value, &after);
+    assert(after.completion_process_count == 8u);
+    assert(after.full_validation_count - before.full_validation_count <= 2u);
+    nvme_cross_slot_engine_destroy(value);
+}
+
 static void test_no_progress_timeout(void)
 {
     ChannelRuntime rt;
@@ -496,6 +526,7 @@ int main(void)
     test_completion_failures();
     test_capacity_sq_full_and_callback();
     test_stall_policy_and_stats();
+    test_full_validation_is_not_per_completion();
     test_no_progress_timeout();
     test_abort_reset_and_submit_failure();
     test_multislot_error_drains_without_callbacks();

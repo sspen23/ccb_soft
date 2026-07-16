@@ -105,6 +105,7 @@ typedef struct {
     uint64_t completion_process_count;
     uint64_t completion_process_max_us;
     uint64_t no_progress_sleep_count;
+    uint64_t full_validation_count;
 } NvmeCrossSlotStats;
 typedef enum {
     NVME_CROSS_SLOT_RUNNING = 0,
