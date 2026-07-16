@@ -3374,6 +3374,10 @@ static void *storage_nvme_cross_slot_writer_thread(void *arg) {
     while (1) {
         StorageCrossSlotWriterDecision writer_decision;
         bool wait_for_item = nvme_cross_slot_engine_active(engine) == 0u;
+        uint32_t admitted = 0u;
+        uint32_t admission_limit = storage_cross_slot_admission_limit(
+            nvme_cross_slot_engine_capacity(engine) -
+            nvme_cross_slot_engine_active(engine));
 
         if (storage_queue_abort_requested(q)) {
             storage_set_writer_error_reason(q, "writer_abort_requested");
@@ -3388,7 +3392,8 @@ static void *storage_nvme_cross_slot_writer_thread(void *arg) {
 
         /* Fill all available engine contexts before stepping the NVMe queue.
          * Only the first pop may block; subsequent pops are opportunistic. */
-        while (nvme_cross_slot_engine_can_accept(engine)) {
+        while (admitted < admission_limit &&
+               nvme_cross_slot_engine_can_accept(engine)) {
             PendingDdrSlot item;
             NvmeWriteSlotReq req;
             uint64_t buffer_offset = 0u;
@@ -3419,6 +3424,7 @@ static void *storage_nvme_cross_slot_writer_thread(void *arg) {
                 storage_set_writer_error_reason(q, nvme_cross_slot_engine_last_error(engine));
                 writer_failed = true; break;
             }
+            ++admitted;
         }
         if (writer_failed) break;
         {

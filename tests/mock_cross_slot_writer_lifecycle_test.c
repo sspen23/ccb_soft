@@ -231,12 +231,21 @@ static void test_command_budget_bounds_one_step(void)
     nvme_cross_slot_engine_destroy(engine);
 }
 
+static void test_admission_budget(void)
+{
+    assert(storage_cross_slot_admission_limit(0u) == 0u);
+    assert(storage_cross_slot_admission_limit(1u) == 1u);
+    assert(storage_cross_slot_admission_limit(4u) == 4u);
+    assert(storage_cross_slot_admission_limit(8u) == 4u);
+}
+
 int main(void)
 {
     test_max_active_one_keeps_processing_ready_slots();
     test_wait_and_terminal_decisions();
     test_full_max_active_four_continues_with_backlog();
     test_command_budget_bounds_one_step();
+    test_admission_budget();
     puts("mock_cross_slot_writer_lifecycle_test: ok");
     return 0;
 }

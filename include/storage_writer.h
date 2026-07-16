@@ -48,5 +48,6 @@ bool storage_metrics_publish_due(uint64_t now_us, uint64_t next_publish_us,
                                  bool force);
 uint64_t storage_metrics_next_publish_us(uint64_t now_us,
                                          uint64_t interval_us);
+uint32_t storage_cross_slot_admission_limit(uint32_t available_contexts);
 
 #endif
