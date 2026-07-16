@@ -6,6 +6,12 @@ least five times.  The script prints the profile environment and the commit
 that defines the code stage; it never checks out a revision or controls the
 board.
 
+Build each revision in an isolated worktree. For cases B through G, apply the
+printed `required_fixup=fbadb40` before building; that follow-up uses the NVMe
+Host Core manual's block-count semantics for `MaxTransferSize` and rejects a
+zero/unavailable capability. Do not modify a measurement worktree between the
+five repeats of a case.
+
 ```sh
 eval "$(sh tools/storage_ab_env.sh C)"
 /etc/init.d/storage restart
@@ -13,6 +19,8 @@ eval "$(sh tools/storage_ab_env.sh C)"
 cp /tmp/storage_perf.log storage-perf-C-run1.log
 awk -v wanted_task=TASK_ID -f tools/storage_perf_summary.awk \
     storage-perf-C-run1.log
+# In another terminal, record CPU and context switches.
+pidstat -u -w -p "$(pidof src_real_app)" 1
 ```
 
 Cases A through G correspond to current cross-slot 256 KiB, legacy 256 KiB,

@@ -52,6 +52,9 @@ case "$case_name" in
 esac
 
 echo "# revision=$revision"
+if [ "$case_name" != A ]; then
+    echo "# required_fixup=fbadb40"
+fi
 echo "export CCB_STORAGE_PROFILE=$profile"
 echo "export CCB_STORAGE_COMPAT_MODE=$compat"
 echo "export CCB_PERF_ENABLE=1"
