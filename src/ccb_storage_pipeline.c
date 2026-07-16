@@ -68,6 +68,42 @@ StorageFirstDmaDeadlineOutcome storage_first_dma_deadline_outcome(
     return STORAGE_FIRST_DMA_DEADLINE_WAIT;
 }
 
+uint32_t storage_dma_harvest_batch_limit(uint32_t base_limit,
+                                         uint32_t total_slots,
+                                         uint32_t completed_unharvested,
+                                         uint32_t available_limit)
+{
+    uint32_t limit = base_limit;
+    uint32_t quarter;
+    uint32_t half;
+
+    if (base_limit == 0u || total_slots == 0u || available_limit == 0u)
+        return 0u;
+    quarter = (total_slots + 3u) / 4u;
+    half = (total_slots + 1u) / 2u;
+    if (completed_unharvested >= half && limit < 64u) limit = 64u;
+    else if (completed_unharvested >= quarter && limit < 32u) limit = 32u;
+    if (limit > available_limit) limit = available_limit;
+    return limit;
+}
+
+bool storage_dma_emergency_harvest(uint32_t dma_writable,
+                                   uint32_t completed_unharvested,
+                                   uint32_t total_slots)
+{
+    uint32_t half;
+
+    if (total_slots == 0u) return false;
+    half = (total_slots + 1u) / 2u;
+    return dma_writable == 0u || completed_unharvested >= half;
+}
+
+bool storage_dma_producer_may_idle(uint32_t harvested,
+                                   uint32_t completed_unharvested)
+{
+    return harvested == 0u && completed_unharvested == 0u;
+}
+
 int storage_pipeline_counts_valid(const StoragePipeline *p)
 {
     if (!p) return 0;

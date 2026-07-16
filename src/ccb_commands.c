@@ -4495,8 +4495,7 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
         uint32_t idle_notice_ms = storage_idle_notice_ms();
         uint32_t harvest_base_limit = harvest_batch_max_cfg == 0u
                                           ? 1u : harvest_batch_max_cfg;
-        uint32_t harvest_dynamic_cap = cfg->id == 2
-                                           ? 32u : STORAGE_HARVEST_BATCH_CAPACITY;
+        uint32_t harvest_dynamic_cap = STORAGE_HARVEST_BATCH_CAPACITY;
         uint32_t adaptive_harvest_limit;
         uint32_t saturated_harvest_count = 0u;
         uint32_t empty_harvest_rounds = 0u;
@@ -4903,7 +4902,26 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                                              "degraded_drain_request_send_failed");
                         goto out;
                     }
-                    usleep(50u);
+                    adaptive_harvest_limit = storage_dma_harvest_batch_limit(
+                        harvest_base_limit, bd_snapshot.total_slots,
+                        bd_snapshot.completed_unharvested,
+                        harvest_dynamic_cap);
+                    /* dma_writable=0 is already an integrity risk because the
+                     * source has no backpressure.  Keep harvesting/draining
+                     * the confirmed prefix instead of sleeping or failing at
+                     * the first observation. */
+                    continue;
+                }
+                if (storage_dma_emergency_harvest(
+                        bd_snapshot.dma_writable,
+                        bd_snapshot.completed_unharvested,
+                        bd_snapshot.total_slots) ||
+                    !storage_dma_producer_may_idle(
+                        harvest_count, bd_snapshot.completed_unharvested)) {
+                    adaptive_harvest_limit = storage_dma_harvest_batch_limit(
+                        harvest_base_limit, bd_snapshot.total_slots,
+                        bd_snapshot.completed_unharvested,
+                        harvest_dynamic_cap);
                     continue;
                 }
                 {
@@ -5297,18 +5315,13 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                     adaptive_harvest_limit < harvest_dynamic_cap) {
                     uint64_t saturated = (uint64_t)saturated_harvest_count +
                                          harvest_count;
-                    uint64_t next_limit = (uint64_t)harvest_limit * 2u;
 
                     saturated_harvest_count = saturated > UINT32_MAX
                                                   ? UINT32_MAX
                                                   : (uint32_t)saturated;
-                    if (saturated_harvest_count > rt.dma_desc_count / 4u) {
-                        adaptive_harvest_limit = harvest_dynamic_cap;
-                    } else {
-                        adaptive_harvest_limit = next_limit > harvest_dynamic_cap
-                                                     ? harvest_dynamic_cap
-                                                     : (uint32_t)next_limit;
-                    }
+                    adaptive_harvest_limit = storage_dma_harvest_batch_limit(
+                        harvest_base_limit, rt.dma_desc_count,
+                        saturated_harvest_count, harvest_dynamic_cap);
                 } else if (harvest_count < harvest_limit) {
                     adaptive_harvest_limit = harvest_base_limit;
                     saturated_harvest_count = 0u;
