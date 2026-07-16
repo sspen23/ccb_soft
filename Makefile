@@ -82,8 +82,11 @@ storage-host-tests:
 		$(STORAGE_HEALTH_SRC) -lpthread -o /tmp/mock_storage_health_test
 	/tmp/mock_storage_health_test
 	$(CC) $(CFLAGS) -Wformat=2 -Iinclude tests/mock_storage_queue_test.c \
-		$(STORAGE_QUEUE_SRC) -o /tmp/mock_storage_queue_test
+		$(STORAGE_QUEUE_SRC) -lpthread -o /tmp/mock_storage_queue_test
 	/tmp/mock_storage_queue_test
+	$(CC) $(CFLAGS) -Wformat=2 -Iinclude tests/mock_storage_requeue_test.c \
+		$(STORAGE_QUEUE_SRC) -lpthread -o /tmp/mock_storage_requeue_test
+	/tmp/mock_storage_requeue_test
 	$(CC) $(CFLAGS) -Wformat=2 -Iinclude tests/mock_storage_worker_state_test.c \
 		$(STORAGE_WORKER_SRC) -o /tmp/mock_storage_worker_state_test
 	/tmp/mock_storage_worker_state_test

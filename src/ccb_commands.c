@@ -162,7 +162,7 @@ typedef struct {
     StorageWorkerState worker_state;
     bool writer_ready;
     bool producer_ready;
-    bool requeue_enabled;
+    StorageRequeueGate requeue_gate;
     bool error;
     char error_reason[64];
     StorageErrorCode deferred_stop_error;
@@ -184,6 +184,22 @@ typedef struct {
     const uint8_t *slot_states;
     DmaStopReport *report;
 } StorageDmaQuiesceCall;
+
+typedef struct {
+    ChannelRuntime *rt;
+    uint32_t slot;
+} StorageDmaRequeueCall;
+
+static int storage_dma_requeue_action(void *opaque)
+{
+    StorageDmaRequeueCall *call = opaque;
+    return call ? dma_requeue_one(call->rt, call->slot) : -1;
+}
+
+static void storage_dma_latch_stop_action(void *opaque)
+{
+    dma_latch_stop((ChannelRuntime *)opaque);
+}
 
 static int storage_dma_quiesce_invoke(void *opaque)
 {
@@ -1889,12 +1905,33 @@ static int storage_queue_init(StorageWriteQueue *q,
     q->cross_slot_qd = cross_slot_qd;
     q->cross_slot_batch = cross_slot_batch;
     q->nvme_engine_quiesced = true;
-    q->requeue_enabled = true;
     q->worker_state = WORKER_INIT;
     q->backlog_mode = storage_env_flag_enabled("SRC_REAL_WRITER_BACKLOG_MODE") != 0;
-    if (pthread_mutex_init(&q->lock, NULL) != 0 ||
-        pthread_cond_init(&q->not_empty, NULL) != 0 ||
-        pthread_cond_init(&q->not_full, NULL) != 0) {
+    if (pthread_mutex_init(&q->lock, NULL) != 0) {
+        free(q->items);
+        storage_slot_table_destroy(&q->slots);
+        q->items = NULL;
+        return -1;
+    }
+    if (storage_requeue_gate_init(&q->requeue_gate) != 0) {
+        (void)pthread_mutex_destroy(&q->lock);
+        free(q->items);
+        storage_slot_table_destroy(&q->slots);
+        q->items = NULL;
+        return -1;
+    }
+    if (pthread_cond_init(&q->not_empty, NULL) != 0) {
+        storage_requeue_gate_destroy(&q->requeue_gate);
+        (void)pthread_mutex_destroy(&q->lock);
+        free(q->items);
+        storage_slot_table_destroy(&q->slots);
+        q->items = NULL;
+        return -1;
+    }
+    if (pthread_cond_init(&q->not_full, NULL) != 0) {
+        (void)pthread_cond_destroy(&q->not_empty);
+        storage_requeue_gate_destroy(&q->requeue_gate);
+        (void)pthread_mutex_destroy(&q->lock);
         free(q->items);
         storage_slot_table_destroy(&q->slots);
         q->items = NULL;
@@ -1910,6 +1947,7 @@ static void storage_queue_destroy(StorageWriteQueue *q) {
     if (!q->nvme_engine_quiesced) return;
     (void)pthread_cond_destroy(&q->not_full);
     (void)pthread_cond_destroy(&q->not_empty);
+    storage_requeue_gate_destroy(&q->requeue_gate);
     (void)pthread_mutex_destroy(&q->lock);
     free(q->items);
     storage_slot_table_destroy(&q->slots);
@@ -2066,14 +2104,15 @@ static bool storage_queue_latch_stop(StorageWriteQueue *q)
                                             WORKER_DMA_QUIESCING) == 0)
             first = true;
     }
-    q->requeue_enabled = false;
-    /* Serialize the software latch with a completion's requeue.  The
-     * DMA-side latch is lock-free, so it is safe to publish it while the
-     * queue lock is held and gives stop a single linearization point. */
-    if (q->rt) dma_latch_stop(q->rt);
     pthread_cond_broadcast(&q->not_empty);
     pthread_cond_broadcast(&q->not_full);
     pthread_mutex_unlock(&q->lock);
+    /* Locking rule: queue lock and requeue gate are never nested.  STOP and
+     * DMA MMIO serialize only on the gate, so a slow TAILDESC transaction
+     * cannot block ready-queue producers. */
+    (void)storage_requeue_gate_latch_stop(
+        &q->requeue_gate, g_storage_stop_epoch,
+        storage_dma_latch_stop_action, q->rt);
     return first;
 }
 
@@ -2821,6 +2860,8 @@ static void storage_stats_print_periodic(StorageProducerStats *stats,
 
 static int storage_complete_slot(StorageWriteQueue *q, const PendingDdrSlot *item) {
     bool should_requeue;
+    StorageRequeueResult requeue_result;
+    StorageDmaRequeueCall requeue_call;
 
     if (!q || !item || item->slot >= q->capacity) {
         return -1;
@@ -2852,22 +2893,44 @@ static int storage_complete_slot(StorageWriteQueue *q, const PendingDdrSlot *ite
     } else {
         q->buffered_bytes = 0u;
     }
-    should_requeue = q->requeue_enabled &&
-                     storage_worker_can_requeue(q->worker_state);
+    should_requeue = storage_worker_can_requeue(q->worker_state);
+    if (should_requeue && q->recycled_slot_count == UINT64_MAX) {
+        q->error = true;
+        pthread_mutex_unlock(&q->lock);
+        return -1;
+    }
     if (storage_local_slot_transition_locked(q, item->slot, STORAGE_SLOT_NVME_BUSY,
                                              should_requeue ? STORAGE_SLOT_REQUEUE_PENDING : STORAGE_SLOT_FREE) != 0) {
         pthread_mutex_unlock(&q->lock); return -1;
     }
+    pthread_mutex_unlock(&q->lock);
+
     if (should_requeue) {
-        if (q->recycled_slot_count == UINT64_MAX) {
-            q->error = true;
-            pthread_mutex_unlock(&q->lock);
-            return -1;
-        }
-        /* Keep the queue lock through the DMA requeue.  storage_queue_latch_stop
-         * takes the same lock, so a stop either linearizes before this call or
-         * after it; it can never observe a post-latch requeue race. */
-        if (dma_requeue_one(q->rt, item->slot) != 0) {
+        requeue_call.rt = q->rt;
+        requeue_call.slot = item->slot;
+        /* No queue lock is held while the gate executes descriptor MMIO. */
+        requeue_result = storage_requeue_gate_run(
+            &q->requeue_gate, storage_dma_requeue_action, &requeue_call);
+
+        pthread_mutex_lock(&q->lock);
+        if (requeue_result == STORAGE_REQUEUE_EXECUTED) {
+            if (storage_local_slot_transition_locked(
+                    q, item->slot, STORAGE_SLOT_REQUEUE_PENDING,
+                    STORAGE_SLOT_DMA_WRITABLE) != 0) {
+                pthread_mutex_unlock(&q->lock);
+                storage_fail_fatal(q);
+                return -1;
+            }
+            ++q->recycled_slot_count;
+        } else if (requeue_result == STORAGE_REQUEUE_STOPPED) {
+            if (storage_local_slot_transition_locked(
+                    q, item->slot, STORAGE_SLOT_REQUEUE_PENDING,
+                    STORAGE_SLOT_FREE) != 0) {
+                pthread_mutex_unlock(&q->lock);
+                storage_fail_fatal(q);
+                return -1;
+            }
+        } else {
             storage_queue_fail_locked(q);
             if (q->error_reason[0] == '\0')
                 (void)snprintf(q->error_reason, sizeof(q->error_reason),
@@ -2878,14 +2941,8 @@ static int storage_complete_slot(StorageWriteQueue *q, const PendingDdrSlot *ite
             storage_fail_fatal(q);
             return -1;
         }
-        if (storage_local_slot_transition_locked(q, item->slot, STORAGE_SLOT_REQUEUE_PENDING,
-                                                 STORAGE_SLOT_DMA_WRITABLE) != 0) {
-            pthread_mutex_unlock(&q->lock);
-            return -1;
-        }
-        ++q->recycled_slot_count;
+        pthread_mutex_unlock(&q->lock);
     }
-    pthread_mutex_unlock(&q->lock);
     if (!should_requeue && q->rt && dma_requeue_after_stop_count(q->rt) != 0u) {
         storage_set_writer_error_reason(q, "requeue_after_stop_latched");
         storage_fail_fatal(q);
