@@ -4228,8 +4228,11 @@ static StorageErrorCode probe_one_storage_channel(
 static uint8_t get_status_query_result(void)
 {
     StorageHealthSnapshot snapshots[NUM_CHANNELS];
-    StorageHealthResult result = storage_health_query(15000000ull, snapshots);
+    StorageHealthResult result;
     uint32_t channel;
+
+    memset(snapshots, 0, sizeof(snapshots));
+    result = storage_health_query(15000000ull, snapshots);
 
     for (channel = 0u; channel < NUM_CHANNELS; ++channel) {
         const StorageHealthSnapshot *snapshot = &snapshots[channel];
