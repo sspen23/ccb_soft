@@ -80,6 +80,25 @@ static void test_cross_slot_experimental_profile(void)
     assert(config.channels[2].writer_mode == STORAGE_WRITER_LEGACY);
 }
 
+static void test_cross_slot_qd16_experimental_profile(void)
+{
+    AppConfig config;
+    char error[160];
+
+    clear_primary_config();
+    setenv("CCB_STORAGE_PROFILE", "CROSS_SLOT_QD16_EXPERIMENTAL", 1);
+    assert(storage_config_load(&config, error, sizeof(error)) == 0);
+    assert(config.storage_profile ==
+           STORAGE_PROFILE_CROSS_SLOT_QD16_EXPERIMENTAL);
+    assert(config.channels[0].writer_mode == STORAGE_WRITER_CROSS_SLOT);
+    assert(config.channels[0].max_active_slots == 4u);
+    assert(config.channels[0].nvme_qd == 16u);
+    assert(config.channels[0].cq_batch == 16u);
+    assert(config.channels[1].nvme_qd == 16u);
+    assert(config.channels[2].writer_mode == STORAGE_WRITER_LEGACY);
+    assert(config.channels[2].nvme_qd == 8u);
+}
+
 static void test_safe_profile_and_primary_values(void)
 {
     AppConfig config;
@@ -165,6 +184,7 @@ int main(void)
 {
     test_legacy_fast_baseline_defaults();
     test_cross_slot_experimental_profile();
+    test_cross_slot_qd16_experimental_profile();
     test_safe_profile_and_primary_values();
     test_profile_override_requires_compat_mode();
     test_legacy_mapping_and_validation();

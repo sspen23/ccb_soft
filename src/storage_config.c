@@ -225,6 +225,12 @@ static int parse_profile(const char *value, StorageProfile *out)
         *out = STORAGE_PROFILE_CROSS_SLOT_EXPERIMENTAL;
         return 0;
     }
+    if (strcmp(value, "CROSS_SLOT_QD16_EXPERIMENTAL") == 0 ||
+        strcmp(value, "cross_slot_qd16_experimental") == 0 ||
+        strcmp(value, "cross_slot_qd16") == 0) {
+        *out = STORAGE_PROFILE_CROSS_SLOT_QD16_EXPERIMENTAL;
+        return 0;
+    }
     if (strcmp(value, "SAFE_QD1") == 0 || strcmp(value, "safe_qd1") == 0 ||
         strcmp(value, "safe") == 0) {
         *out = STORAGE_PROFILE_SAFE_QD1;
@@ -239,7 +245,10 @@ static void set_channel_profile(AppConfig *config)
     const bool safe = config->storage_profile == STORAGE_PROFILE_SAFE_QD1;
     const bool cross_slot =
         config->storage_profile == STORAGE_PROFILE_PERF_QD8 ||
-        config->storage_profile == STORAGE_PROFILE_CROSS_SLOT_EXPERIMENTAL;
+        config->storage_profile == STORAGE_PROFILE_CROSS_SLOT_EXPERIMENTAL ||
+        config->storage_profile == STORAGE_PROFILE_CROSS_SLOT_QD16_EXPERIMENTAL;
+    const bool qd16 =
+        config->storage_profile == STORAGE_PROFILE_CROSS_SLOT_QD16_EXPERIMENTAL;
 
     for (channel = 0u; channel < NUM_CHANNELS; ++channel) {
         ChannelStorageConfig *storage = &config->channels[channel];
@@ -258,10 +267,11 @@ static void set_channel_profile(AppConfig *config)
         /* PERF halves command/doorbell traffic.  The hardware layer clamps
          * this request to the SSD-reported MaxTransferSize before use. */
         storage->command_bytes = (safe ? 256u : 512u) * 1024u;
-        storage->nvme_qd = safe ? 1u : 8u;
+        storage->nvme_qd = safe ? 1u :
+                           (qd16 && channel != LOW_SPEED_CHANNEL_ID ? 16u : 8u);
         storage->max_active_slots = safe || !cross_slot ? 1u :
                                     (channel == LOW_SPEED_CHANNEL_ID ? 1u : 4u);
-        storage->cq_batch = safe ? 1u : 8u;
+        storage->cq_batch = safe ? 1u : storage->nvme_qd;
         storage->writer_realtime = false;
         storage->writer_priority = 0u;
         storage->producer_realtime = false;
@@ -414,6 +424,8 @@ const char *storage_config_profile_name(StorageProfile profile)
     case STORAGE_PROFILE_PERF_QD8: return "PERF_QD8";
     case STORAGE_PROFILE_CROSS_SLOT_EXPERIMENTAL:
         return "CROSS_SLOT_EXPERIMENTAL";
+    case STORAGE_PROFILE_CROSS_SLOT_QD16_EXPERIMENTAL:
+        return "CROSS_SLOT_QD16_EXPERIMENTAL";
     default: return "UNKNOWN";
     }
 }
