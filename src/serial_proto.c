@@ -29,6 +29,14 @@ static int proto_hex_enabled(void)
     return cached != 0;
 }
 
+static void dump_console_line(const char *line)
+{
+    if (!line) {
+        return;
+    }
+    debug_uart_write(line, strlen(line));
+}
+
 static int get_len(uint8_t cmd)
 {
     switch(cmd) {
@@ -45,59 +53,95 @@ static int get_len(uint8_t cmd)
 
 static void dump_hex_line(const char *tag, const uint8_t *data, int len)
 {
+    char line[512];
     int i;
+    size_t used;
 
-    printf("[RXHEX] %s len=%d:", tag, len);
+    used = (size_t)snprintf(line, sizeof(line), "[RXHEX] %s len=%d:", tag, len);
     for (i = 0; i < len; ++i) {
-        printf(" %02X", (unsigned)data[i]);
+        if (used >= sizeof(line)) {
+            break;
+        }
+        used += (size_t)snprintf(line + used, sizeof(line) - used,
+                                 " %02X", (unsigned)data[i]);
     }
-    printf("\n");
-    fflush(stdout);
+    if (used < sizeof(line) - 1u) {
+        line[used++] = '\n';
+        line[used] = '\0';
+    }
+    dump_console_line(line);
 }
 
 static void dump_rx_line(const char *tag, const uint8_t *data, int len)
 {
+    char task_id[12] = {0};
+    char line[128];
+    uint8_t cmd;
+
+    if (!data || len <= 0) {
+        return;
+    }
     if (proto_hex_enabled()) {
         dump_hex_line(tag, data, len);
         return;
     }
-    if (!dbg_category_enabled("PROTO")) {
-        return;
+    cmd = len > 2 ? data[2] : 0u;
+    if ((cmd == CMD_TASK_INFO || cmd == CMD_FILE_OP) && len >= 14) {
+        memcpy(task_id, data + 3, sizeof(task_id) - 1u);
+        (void)snprintf(line, sizeof(line),
+                       "[UART RX] %s cmd=0x%02X task_no=%s len=%d\n",
+                       tag, (unsigned)cmd, task_id, len);
+    } else if (len > 3) {
+        (void)snprintf(line, sizeof(line),
+                       "[UART RX] %s cmd=0x%02X arg=0x%02X len=%d\n",
+                       tag, (unsigned)cmd, (unsigned)data[3], len);
+    } else {
+        (void)snprintf(line, sizeof(line),
+                       "[UART RX] %s cmd=0x%02X len=%d\n",
+                       tag, (unsigned)cmd, len);
     }
-    printf("[RX] %s cmd=0x%02X len=%d\n",
-           tag,
-           (len > 2) ? (unsigned)data[2] : 0u,
-           len);
-    fflush(stdout);
+    dump_console_line(line);
 }
 
 static void dump_tx_hex_line(const char *tag, const uint8_t *data, int len)
 {
+    char line[512];
     int i;
+    size_t used;
 
-    printf("[TXHEX] %s len=%d:", tag, len);
+    used = (size_t)snprintf(line, sizeof(line), "[TXHEX] %s len=%d:", tag, len);
     for (i = 0; i < len; ++i) {
-        printf(" %02X", (unsigned)data[i]);
+        if (used >= sizeof(line)) {
+            break;
+        }
+        used += (size_t)snprintf(line + used, sizeof(line) - used,
+                                 " %02X", (unsigned)data[i]);
     }
-    printf("\n");
-    fflush(stdout);
+    if (used < sizeof(line) - 1u) {
+        line[used++] = '\n';
+        line[used] = '\0';
+    }
+    dump_console_line(line);
 }
 
 static void dump_tx_line(const char *tag, const uint8_t *data, int len)
 {
+    char line[128];
+
+    if (!data || len <= 0) {
+        return;
+    }
     if (proto_hex_enabled()) {
         dump_tx_hex_line(tag, data, len);
         return;
     }
-    if (!dbg_category_enabled("PROTO")) {
-        return;
-    }
-    printf("[TX] %s cmd=0x%02X result=0x%02X len=%d\n",
-           tag,
-           (len > 2) ? (unsigned)data[2] : 0u,
-           (len > 3) ? (unsigned)data[3] : 0u,
-           len);
-    fflush(stdout);
+    (void)snprintf(line, sizeof(line),
+                   "[UART TX] %s cmd=0x%02X result=0x%02X len=%d\n",
+                   tag,
+                   (len > 2) ? (unsigned)data[2] : 0u,
+                   (len > 3) ? (unsigned)data[3] : 0u,
+                   len);
+    dump_console_line(line);
 }
 
 static void store_be32(uint8_t out[4], uint32_t value)

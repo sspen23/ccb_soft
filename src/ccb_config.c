@@ -41,7 +41,8 @@ const ChannelConfig kChannels[NUM_CHANNELS] = {
         .dma_base = 0xa0060000ull,
         .axis_switch_base = 0xa0070000ull,
         .nvme_base = 0xa0080000ull,
-        .pcie_bridge_base = 0xd0000000ull,
+        /* 0xd0000000 is the ch1 DDR CPU window, not PCIe bridge control. */
+        .pcie_bridge_base = 0ull,
         .desc_cpu_base = 0x30000000ull,
         .desc_dma_base = 0x10000000ull,
         .desc_cpu_size = 0x4000ull,

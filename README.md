@@ -343,6 +343,7 @@ DMA ring        512MiB
 - NVMe write走CID匹配的有界异步QD，read仍走同步CQ completion。
 - 0x71 停止网络时会通知 NVMe read 和 TCP transfer 停止。
 - 存盘停止时不是立刻杀进程，而是让 worker drain 已完成 DMA descriptor，再写 metadata。
+- 监督式存盘在 metadata、`filelist.db` 和 flash 同步处理完成后，会对本次目标通道的 AXI DMA 再执行一次完整复位，避免错误状态影响下一次任务。
 - CPU 不 mmap 完整数据 DDR，避免访问未接入地址导致 `Bus error`。
 
 整体上，当前工程的设计目标是：让 DMA/NVMe 尽量直通数据，CPU 只做控制面；用完整数据 DDR 做存盘突发缓存；同时避免 CPU 访问硬件没有接入的 DDR 区域。
@@ -411,13 +412,13 @@ Persistent database and NVMe metadata copies on the SPI1 user flash mount:
 /mnt/spi1/meta_ch2.bin
 ```
 
-On top-level `storage.elf` startup, standalone `storage-write`, standalone
-`network-send`, and `ddr-pattern-store`, the program restores this flash copy
-to the runtime `filelist.db` and restores the channel metadata files before
-opening SQLite. Internal worker subprocesses do not restore from flash, so an
-active daemon task cannot overwrite its runtime state while it is forking
-workers. Startup fails if the configured flash parent directory is not a real
-mount point; this prevents accidental writes into the root filesystem.
+On top-level daemon `storage.elf` startup, the program restores this flash
+copy to the runtime `filelist.db` and restores the channel metadata files
+before opening SQLite. Internal worker subprocesses do not restore from flash,
+so an active daemon task cannot overwrite its runtime state while it is forking
+workers. The PetaLinux init script requires the configured flash parent
+directory to be mounted before it starts the daemon; this prevents accidental
+writes into the root filesystem.
 
 The flash copies are updated together by `0x41 control=0x22` and by successful
 `ddr-pattern-store`. Keeping metadata with the database is required so the next
@@ -641,18 +642,38 @@ byte 4 = 0xFF  delete all file records and clear supported-channel metadata
 
 ```text
 0x11  ch0/ch1/ch2 NVMe disks are detected and capabilities are valid
+0x55  background health probe is still pending
 0xFF  at least one ch0/ch1/ch2 NVMe disk detection failed
 ```
 
 The check reuses the standalone self-test style logic: open the channel runtime,
 run `nvme_probe()`, then validate `block_size`, `max_dts_bytes`, and `max_lba`.
-ch0, ch1, and ch2 are checked.
+ch0, ch1, and ch2 are checked. If an idle status check reports a PCIe-link or
+NVMe-probe initialization failure, the service first sends that check's
+`0xFF` response. It then stops the background probe, pulses the active-low SSD
+reset GPIO at `0x40010000` low for 100 ms, waits 1000 ms after release, and
+restarts background probing without sending another response. The next `0x61`
+reports the post-reset state. No GPIO write is performed when the check passes
+or while a storage/transfer task is active.
+
+The background health probe runs every 5 seconds while the service is idle. A
+PCIe-link or NVMe-probe failure queues the same reset flow without a UART
+response; the main loop performs it only after storage, transfer, and
+maintenance work are all idle.
 
 Optional timeout override:
 
 ```sh
 export SRC_REAL_STATUS_TIMEOUT_US=5000000
 ```
+
+The built-in production defaults use `/dev/ttyUL1`, the
+`CROSS_SLOT_QD16_EXPERIMENTAL` profile, compatibility mode off, performance
+file logging off, a 1000 ms performance interval, and structured logging off.
+In this mode `logs.db` is not initialized and routine debug-UART output,
+including the textual status capability dump, is suppressed; the binary
+protocol ACK is unaffected. Setting `CCB_LOG_LEVEL` explicitly re-enables
+logging, and environment variables can still override the other defaults.
 
 `0x71` stop network send:
 
@@ -946,10 +967,6 @@ export SRC_REAL_NVME_BUSY_POLL_US=0
 export SRC_REAL_NVME_POLL_SLEEP_US=10
 export SRC_REAL_NVME_CROSS_SLOT_QD=0
 export SRC_REAL_NVME_CROSS_SLOT_BATCH=8
-export SRC_REAL_PCIE_BRIDGE_BASE_CH0=0xb0000000
-export SRC_REAL_PCIE_BRIDGE_BASE_CH1=0xd0000000
-# export SRC_REAL_PCIE_BRIDGE_BASE_CH2=0x...
-
 export SRC_REAL_NETWORK_DRY_RUN=1
 export SRC_REAL_NETWORK_SKIP_LINK_CHECK=1
 export SRC_REAL_NETWORK_TIMEOUT_US=5000000
@@ -958,8 +975,10 @@ export SRC_REAL_NETWORK_LIMIT_MB_S=0
 export SRC_REAL_NETWORK_VERIFY_DDR_READ=1
 ```
 
-Regular `[DBG]` and UART RX/TX banner output is off by default. Enable only the
-categories needed for the current test:
+Regular `[DBG]` output is off by default. Normal operation always prints one
+compact UART RX line and one UART TX reply line; normal data-transfer details
+remain quiet, while failure lines are retained. Enable debug categories only
+when needed for a test:
 
 ```text
 SRC_REAL_DEBUG=write,nvme
@@ -1017,26 +1036,6 @@ SRC_REAL_ECHO_WORKER_OUTPUT=1
   Echoes all worker stdout/stderr to the parent stdout. Default `0` still
   drains worker pipes but only echoes warning/error/final lines, avoiding pipe
   backpressure and UART overhead.
-
-PCIe bridge link status:
-  The helper reads the Xilinx/AMD AXI Bridge for PCIe Gen3 PHY Status/Control
-  register at `pcie_bridge_base + 0x144` and prints one line per
-  channel/reason during runtime open and after NVMe probe:
-
-  ```text
-  pcie_link_status channel=0 reason=startup bridge_base=0xb0000000 phy_reg=0x0000.... link_up=1 speed=Gen3_8GT width=x4 ltssm=0x..
-  ```
-
-  The bridge control base must be the CPU-visible AXI Bridge for PCIe Gen3
-  AXI-Lite control base, not the NVMe Host Core base such as `0x44a00000`.
-  The current defaults are ch0=`0xb0000000`, ch1=`0xd0000000`, and ch2 unset.
-  Override them per channel with `SRC_REAL_PCIE_BRIDGE_BASE_CH0`,
-  `SRC_REAL_PCIE_BRIDGE_BASE_CH1`, or `SRC_REAL_PCIE_BRIDGE_BASE_CH2`.
-  If no base is available the line contains `error=no_bridge_base`; if the
-  optional MMIO read cannot be performed it contains `error=read_failed`.
-
-  Speed decode: `down`, `Gen1_2p5GT`, `Gen2_5GT`, or `Gen3_8GT`.
-  Width decode: `x1`, `x2`, `x4`, `x8`, or `x16`.
 
 Recommended throughput-test configuration:
 

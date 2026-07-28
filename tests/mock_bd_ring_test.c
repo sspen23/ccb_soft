@@ -2,6 +2,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 
 #include "ccb_hw.h"
 
@@ -10,6 +11,18 @@
 #define TEST_S2MM_CURDESC 0x38u
 #define TEST_S2MM_TAILDESC 0x40u
 #define TEST_DESC_CMPLT (1u << 31)
+
+static uint64_t test_monotonic_us(void)
+{
+    struct timespec ts;
+#ifdef CLOCK_MONOTONIC_RAW
+    assert(clock_gettime(CLOCK_MONOTONIC_RAW, &ts) == 0);
+#else
+    assert(clock_gettime(CLOCK_MONOTONIC, &ts) == 0);
+#endif
+    return (uint64_t)ts.tv_sec * 1000000ull +
+           (uint64_t)ts.tv_nsec / 1000ull;
+}
 
 static void init_runtime(ChannelRuntime *rt,
                          ChannelConfig *cfg,
@@ -90,6 +103,13 @@ int main(void)
     assert(nvme_default_qd_for_channel(HIGH_I_CHANNEL_ID) == 8u);
     assert(nvme_default_qd_for_channel(HIGH_Q_CHANNEL_ID) == 8u);
     assert(nvme_default_qd_for_channel(LOW_SPEED_CHANNEL_ID) == 4u);
+
+    init_runtime(&rt, &cfg, desc, dma_regs);
+    rt.gopt.dry_run = true;
+    assert(dma_reset_after_storage_task(&rt) == 0);
+    rt.gopt.dry_run = false;
+    rt.dma.valid = false;
+    assert(dma_reset_after_storage_task(&rt) != 0);
 
     init_runtime(&rt, &cfg, desc, dma_regs);
     memset(state, STORAGE_SLOT_DMA_WRITABLE, sizeof(state));
@@ -175,6 +195,34 @@ int main(void)
     assert(dma_harvest_completed_batch(&rt, harvested, 4u, &harvested_count) == 0);
     assert(harvested_count == 0u);
 
+    /* Normal harvest retains descriptor status until NVMe completion.  STOP
+     * harvest must use the ownership ledger rather than re-harvesting those
+     * stale completion words after next_harvest_bd wraps. */
+    init_runtime(&rt, &cfg, desc, dma_regs);
+    desc[0].status = desc[1].status = desc[2].status = desc[3].status =
+        TEST_DESC_CMPLT | 512u;
+    assert(dma_harvest_batch(&rt, harvested, 4u, 0u, &harvested_count) == 0);
+    assert(harvested_count == 4u && rt.next_harvest_bd == 0u &&
+           rt.dma_hw_desc_count == 0u);
+    dma_regs[TEST_S2MM_DMASR / 4u] = 1u;
+    assert(dma_harvest_completed_batch(&rt, harvested, 4u,
+                                       &harvested_count) == 0);
+    assert(harvested_count == 0u && rt.next_harvest_bd == 0u);
+
+    /* TAILDESC may advance only through the contiguous ring frontier.  A
+     * later completion cannot skip a harvested-but-unreturned descriptor. */
+    init_runtime(&rt, &cfg, desc, dma_regs);
+    desc[0].status = desc[1].status = TEST_DESC_CMPLT | 512u;
+    assert(dma_harvest_batch(&rt, harvested, 2u, 0u, &harvested_count) == 0);
+    assert(harvested_count == 2u);
+    assert(dma_requeue_one(&rt, 1u) == -3);
+    assert(dma_regs[TEST_S2MM_TAILDESC / 4u] ==
+           (uint32_t)(cfg.desc_dma_base + 3u * sizeof(DmaSgDesc)));
+    assert(desc[1].status == (TEST_DESC_CMPLT | 512u));
+    assert(dma_requeue_one(&rt, 0u) == 0);
+    assert(dma_requeue_one(&rt, 1u) == 0);
+    assert(rt.next_requeue_bd == 2u && rt.dma_hw_desc_count == 4u);
+
     /* STOP harvesting must not treat the first empty observation as final:
      * a descriptor can become visible on a later scan after S2MM quiesces. */
     init_runtime(&rt, &cfg, desc, dma_regs);
@@ -199,20 +247,50 @@ int main(void)
     assert(dma_requeue_one(&rt, 0u) == -2);
     assert(dma_requeue_after_stop_count(&rt) == 1u);
 
-    /* A completed descriptor no longer blocks reset eligibility.  This mock
-     * MMIO bank cannot self-clear RESET, so the synthetic reset itself times
-     * out after the ownership audit has accepted the completion. */
+    /* An immediately expired timeout has not observed a stable idle window,
+     * so it must not reset even when the packet counters are balanced. */
     init_runtime(&rt, &cfg, desc, dma_regs);
     dma_latch_stop(&rt);
-    desc[0].status = TEST_DESC_CMPLT | 512u;
     dma_regs[TEST_S2MM_DMASR / 4u] = 0u;
     memset(state, STORAGE_SLOT_DMA_WRITABLE, sizeof(state));
     memset(&stop_report, 0, sizeof(stop_report));
     assert(dma_quiesce_s2mm_with_state(&rt, 1u, state, &stop_report) ==
            DMA_STOP_FAILED);
-    assert(stop_report.completed_unharvested == 1u);
+    assert(!stop_report.reset_attempted);
+    assert(strcmp(stop_report.reason, "dma_stop_state_unstable") == 0);
+
+    /* A full ring means all descriptors are available to DMA, not that four
+     * transfers are active.  Balanced packet counters plus a stable idle
+     * window allow recovery; the host mock reset itself still times out. */
+    init_runtime(&rt, &cfg, desc, dma_regs);
+    dma_latch_stop(&rt);
+    rt.dma_rxsof_count = 49u;
+    rt.dma_rxeof_count = 49u;
+    memset(state, STORAGE_SLOT_DMA_WRITABLE, sizeof(state));
+    dma_regs[TEST_S2MM_DMASR / 4u] = 0u;
+    memset(&stop_report, 0, sizeof(stop_report));
+    assert(dma_quiesce_s2mm_with_state(
+               &rt, test_monotonic_us() + 2000u, state, &stop_report) ==
+           DMA_STOP_FAILED);
     assert(stop_report.reset_attempted);
+    assert(stop_report.idle_state_stable);
+    assert(stop_report.idle_stable_us >= 1000u);
     assert(strcmp(stop_report.reason, "dma_reset_failed") == 0);
+
+    /* SOF/EOF disagreement cannot be promoted to an idle-safe reset even if
+     * the software packet-open flag was stale or incorrectly cleared. */
+    init_runtime(&rt, &cfg, desc, dma_regs);
+    dma_latch_stop(&rt);
+    rt.dma_rxsof_count = 1u;
+    rt.dma_rxeof_count = 0u;
+    rt.dma_rx_packet_open = false;
+    dma_regs[TEST_S2MM_DMASR / 4u] = 0u;
+    memset(state, STORAGE_SLOT_DMA_WRITABLE, sizeof(state));
+    memset(&stop_report, 0, sizeof(stop_report));
+    assert(dma_quiesce_s2mm_with_state(&rt, 1u, state, &stop_report) ==
+           DMA_STOP_FAILED);
+    assert(!stop_report.reset_attempted);
+    assert(strcmp(stop_report.reason, "packet_boundary_unconfirmed") == 0);
 
     /* A halted path must apply the same ownership audit before the final
      * reset; it must not discard a completion that the producer did not

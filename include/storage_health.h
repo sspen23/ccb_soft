@@ -36,6 +36,8 @@ int storage_health_start(StorageHealthProbeFn probe, void *ctx,
 void storage_health_stop(void);
 void storage_health_set_busy(bool busy);
 void storage_health_request_refresh(void);
+/* End the current multi-channel refresh after its in-flight probe returns. */
+void storage_health_abort_refresh(void);
 StorageHealthResult storage_health_query(uint64_t max_age_us,
                                          StorageHealthSnapshot snapshots[3]);
 

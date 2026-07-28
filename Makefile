@@ -47,6 +47,7 @@ SRCS := \
 	src/storage_health.c \
 	src/storage_queue.c \
 	src/storage_process.c \
+	src/ssd_reset.c \
 	src/storage_stop.c \
 	src/storage_worker.c \
 	src/storage_writer.c \
@@ -81,6 +82,9 @@ storage-host-tests:
 	$(CC) $(CFLAGS) -Wformat=2 -Iinclude tests/mock_storage_health_test.c \
 		$(STORAGE_HEALTH_SRC) -lpthread -o /tmp/mock_storage_health_test
 	/tmp/mock_storage_health_test
+	$(CC) $(CFLAGS) -Wformat=2 -Iinclude tests/mock_ssd_reset_test.c \
+		src/ssd_reset.c -o /tmp/mock_ssd_reset_test
+	/tmp/mock_ssd_reset_test
 	$(CC) $(CFLAGS) -Wformat=2 -Iinclude tests/mock_storage_queue_test.c \
 		$(STORAGE_QUEUE_SRC) -lpthread -o /tmp/mock_storage_queue_test
 	/tmp/mock_storage_queue_test

@@ -8,6 +8,7 @@
 #include "logger.h"
 #include "log_config.h"
 #include "storage_config.h"
+#include "debug_uart.h"
 
 /* Global state. */
 static sqlite3 *db = NULL;
@@ -166,8 +167,13 @@ static void cleanup_async_queue(void)
 /* Initialize the logging system. */
 int logger_init(const char *db_path)
 {
+    const AppConfig *config = storage_config_get();
     int busy_timeout_ms;
 
+    if (!config || !config->log_enabled) {
+        db = NULL;
+        return 0;
+    }
     if (sqlite3_open(db_path, &db) != SQLITE_OK) {
         fprintf(stderr, "Cannot open database: %s\n", sqlite3_errmsg(db));
         return -1;
@@ -206,16 +212,35 @@ void logger_close(void)
 /* Write one log entry. */
 int logger_write(LogLevel level, const char *module, const char *format, ...)
 {
-    if (level < CURRENT_LOG_LEVEL || !db) {
-        return 0;
-    }
-    
-    /* Format the message. */
     char buffer[LOG_BUFFER_SIZE];
     va_list args;
+
+    if (level < CURRENT_LOG_LEVEL || !format) {
+        return 0;
+    }
+
     va_start(args, format);
     vsnprintf(buffer, sizeof(buffer), format, args);
     va_end(args);
+
+    /* Error visibility must not depend on the optional SQLite log database.
+     * The service redirects stdout to a file at boot, so use the debug UART. */
+    if (level == LOG_ERROR) {
+        char line[LOG_BUFFER_SIZE + LOG_MODULE_MAX_LEN + 16u];
+        int n = snprintf(line, sizeof(line), "[ERROR][%s] %s\n",
+                         module ? module : "SYSTEM", buffer);
+        if (n > 0) {
+            size_t len = (size_t)n;
+            if (len >= sizeof(line)) {
+                len = sizeof(line) - 1u;
+            }
+            debug_uart_write(line, len);
+        }
+    }
+
+    if (!db) {
+        return 0;
+    }
 
     if (logger_should_drop_message(level, buffer)) {
         return 0;

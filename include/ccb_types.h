@@ -239,6 +239,14 @@ typedef struct {
     uint64_t pcie_bridge_base_effective;
 
     uint32_t next_harvest_bd;
+    /* AXI DMA TAILDESC exposes a contiguous descriptor prefix.  Track the
+     * next descriptor that may legally extend that prefix, independently of
+     * unordered NVMe completion. */
+    uint32_t next_requeue_bd;
+    /* One byte per hardware descriptor records software ownership for the
+     * current ring generation.  A set entry must not be harvested again
+     * until its descriptor is returned to DMA. */
+    uint8_t dma_bd_harvested[DMA_DESC_COUNT_MAX];
     uint16_t next_cmd_id;
     uint32_t nvme_block_size;
     uint32_t nvme_max_dts_raw;

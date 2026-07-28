@@ -28,8 +28,6 @@ int nvme_clamp_command_bytes(uint32_t requested_bytes,
 uint32_t nvme_poll_backoff_us(uint32_t busy_poll_us,
                               uint32_t base_sleep_us,
                               uint32_t waited_us);
-void storage_print_pcie_link_status(ChannelRuntime *rt, const char *reason);
-
 /* Configure data path source and probe NVMe host capabilities. */
 void axis_switch_select(ChannelRuntime *rt, SourceMode src);
 int nvme_probe(ChannelRuntime *rt);
@@ -205,6 +203,8 @@ typedef struct {
     bool reset_attempted;
     DmaStopResult result;
     bool safe_reset_confirmed;
+    bool idle_state_stable;
+    uint64_t idle_stable_us;
     uint32_t completed_unharvested;
     char reason[64];
 } DmaStopReport;
@@ -244,5 +244,7 @@ DmaStopResult dma_finalize_stop_s2mm_with_state(ChannelRuntime *rt,
                                                 const uint8_t *software_slot_state,
                                                 DmaStopReport *report);
 DmaStopResult dma_stop_s2mm(ChannelRuntime *rt, DmaStopReport *report);
+/* Reset both AXI DMA channel banks after storage metadata/database commit. */
+int dma_reset_after_storage_task(ChannelRuntime *rt);
 
 #endif

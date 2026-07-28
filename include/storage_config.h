@@ -69,6 +69,7 @@ typedef struct {
 
 typedef struct {
     char uart_device[STORAGE_CONFIG_UART_PATH_MAX];
+    bool log_enabled;
     CcbLogLevel log_level;
     bool perf_enabled;
     uint32_t perf_interval_ms;

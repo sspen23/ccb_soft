@@ -19,7 +19,9 @@ int main(void)
            out[1].submission_sequence == 1u);
 
     memset(desc, 0, sizeof(desc));
-    rt.next_harvest_bd = 0u; rt.dma_hw_desc_count = 4u; count = 0u;
+    rt.next_harvest_bd = 0u; rt.next_requeue_bd = 0u;
+    rt.dma_hw_desc_count = 4u; count = 0u;
+    memset(rt.dma_bd_harvested, 0, sizeof(rt.dma_bd_harvested));
     desc[0].status = CMPLT | 512u;
     desc[1].status = CMPLT | 1024u;
     desc[2].status = CMPLT | DESC_ERROR;

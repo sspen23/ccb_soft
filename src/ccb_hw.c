@@ -81,10 +81,6 @@ static void nvme_set_last_error(ChannelRuntime *rt, const char *reason);
 #define AXIS_SWITCH_MI0_MUX_OFFSET 0x0040u
 #define AXIS_SWITCH_REG_UPDATE (1u << 1)
 
-/* Xilinx/AMD AXI Bridge for PCIe Gen3 PG194 PHY Status/Control register. */
-#define PCIE_BRIDGE_PHY_STATUS_CONTROL 0x144u
-#define PCIE_BRIDGE_MMAP_BYTES 0x1000u
-
 /* NVMe host register offsets/bits */
 #define GENERIC_REG_OFFSET 0x00u
 #define GENERIC_NVM_STATUS 0x14u
@@ -116,6 +112,7 @@ static void nvme_set_last_error(ChannelRuntime *rt, const char *reason);
 #define PERF_CALC_OVERFLOW (1u << 31)
 #define NVME_PERF_CLOCK_PERIOD_NS_DEFAULT 4u
 #define NVME_SUBMIT_STALL_US 1000u
+#define DMA_STOP_RESET_STABLE_US 1000u
 
 #define NVM_WRITE 0x01u
 #define NVM_READ 0x02u
@@ -231,127 +228,6 @@ static int hw_env_flag_enabled(const char *name) {
         return 0;
     }
     return 1;
-}
-
-static int env_u64_exact(const char *name, uint64_t *out) {
-    const char *v = storage_config_compat_getenv(name);
-    char *end = NULL;
-    unsigned long long parsed;
-
-    if (!v || v[0] == '\0') {
-        return 0;
-    }
-    errno = 0;
-    parsed = strtoull(v, &end, 0);
-    if (errno != 0 || end == v || *end != '\0') {
-        fprintf(stderr, "warning: invalid %s=%s; ignoring PCIe bridge override\n", name, v);
-        return -1;
-    }
-    *out = (uint64_t)parsed;
-    return 1;
-}
-
-static uint64_t pcie_bridge_base_for_channel(const ChannelConfig *cfg) {
-    char name[64];
-    uint64_t base = 0u;
-    int rc;
-
-    if (!cfg) {
-        return 0u;
-    }
-    snprintf(name, sizeof(name), "SRC_REAL_PCIE_BRIDGE_BASE_CH%d", cfg->id);
-    rc = env_u64_exact(name, &base);
-    if (rc > 0) {
-        return base;
-    }
-    return cfg->pcie_bridge_base;
-}
-
-static const char *pcie_link_speed_name(uint32_t phy_reg) {
-    bool link_up = (phy_reg & (1u << 11u)) != 0u;
-    bool gen3 = (phy_reg & (1u << 12u)) != 0u;
-    bool gen2 = (phy_reg & (1u << 0u)) != 0u;
-
-    if (!link_up) {
-        return "down";
-    }
-    if (gen3) {
-        return "Gen3_8GT";
-    }
-    if (gen2) {
-        return "Gen2_5GT";
-    }
-    return "Gen1_2p5GT";
-}
-
-static const char *pcie_link_width_name(uint32_t phy_reg) {
-    uint32_t width_code;
-
-    if ((phy_reg & (1u << 13u)) != 0u) {
-        return "x16";
-    }
-    width_code = (phy_reg >> 1u) & 0x3u;
-    switch (width_code) {
-    case 0u:
-        return "x1";
-    case 1u:
-        return "x2";
-    case 2u:
-        return "x4";
-    case 3u:
-        return "x8";
-    default:
-        return "unknown";
-    }
-}
-
-void storage_print_pcie_link_status(ChannelRuntime *rt, const char *reason) {
-    uint64_t base;
-    uint32_t phy_reg;
-    uint32_t link_up;
-    uint32_t ltssm;
-
-    if (!rt || !rt->cfg) {
-        return;
-    }
-    if (!reason || reason[0] == '\0') {
-        reason = "unknown";
-    }
-    if (!hw_storage_log_at_least_debug()) {
-        return;
-    }
-    base = rt->pcie_bridge_base_effective;
-    if (base == 0u) {
-        printf("pcie_link_status channel=%d reason=%s error=no_bridge_base\n",
-               rt->cfg->id,
-               reason);
-        fflush(stdout);
-        return;
-    }
-    if (!rt->pcie_bridge.valid) {
-        printf("pcie_link_status channel=%d reason=%s bridge_base=0x%08" PRIx64
-               " error=read_failed\n",
-               rt->cfg->id,
-               reason,
-               base);
-        fflush(stdout);
-        return;
-    }
-
-    phy_reg = reg_read32(&rt->pcie_bridge, PCIE_BRIDGE_PHY_STATUS_CONTROL);
-    link_up = (phy_reg >> 11u) & 0x1u;
-    ltssm = (phy_reg >> 3u) & 0x3fu;
-    printf("pcie_link_status channel=%d reason=%s bridge_base=0x%08" PRIx64
-           " phy_reg=0x%08x link_up=%u speed=%s width=%s ltssm=0x%02x\n",
-           rt->cfg->id,
-           reason,
-           base,
-           phy_reg,
-           link_up,
-           pcie_link_speed_name(phy_reg),
-           pcie_link_width_name(phy_reg),
-           ltssm);
-    fflush(stdout);
 }
 
 static bool nvme_cmd_kib_allowed(uint32_t kib) {
@@ -635,7 +511,7 @@ static int nvme_configure_runtime(ChannelRuntime *rt) {
         rt->nvme_cmd_sectors = 0u;
         return -1;
     }
-    if (effective_bytes < requested_bytes) {
+    if (effective_bytes < requested_bytes && hw_storage_log_at_least_debug()) {
         fprintf(stderr,
                 "warning: SRC_REAL_NVME_CMD_KIB=%u exceeds NVMe safe limit=%" PRIu64
                 " bytes (max_dts=%u); effective=%u bytes\n",
@@ -1014,10 +890,6 @@ static int MAYBE_UNUSED map_region_common(int fd,
 
 static int MAYBE_UNUSED map_region(int fd, uint64_t phys, size_t size, MappedRegion *out) {
     return map_region_common(fd, phys, size, out, true);
-}
-
-static int map_region_optional(int fd, uint64_t phys, size_t size, MappedRegion *out) {
-    return map_region_common(fd, phys, size, out, false);
 }
 
 static void unmap_region(MappedRegion *r) {
@@ -3615,6 +3487,7 @@ int channel_runtime_open(ChannelRuntime *rt, const ChannelConfig *cfg, GlobalOpt
     rt->gopt = gopt;
     rt->next_cmd_id = 1u;
     rt->next_harvest_bd = 0u;
+    rt->next_requeue_bd = 0u;
     rt->nvme_block_size = 512u;
     rt->nvme_max_dts_raw = 0u;
     rt->nvme_max_dts_blocks = 0u;
@@ -3628,11 +3501,8 @@ int channel_runtime_open(ChannelRuntime *rt, const ChannelConfig *cfg, GlobalOpt
     rt->dma_desc_count = (uint32_t)(rt->dma_ring_bytes / cfg->dma_desc_bytes_default);
     rt->dma_hw_desc_count = 0u;
     rt->dma_harvest_sequence = 0u;
-    rt->pcie_bridge_base_effective = pcie_bridge_base_for_channel(cfg);
-
     if (gopt.dry_run) {
         /* Dry-run skips all /dev/mem and MMIO setup. */
-        storage_print_pcie_link_status(rt, "startup");
         return 0;
     }
 #if !HAVE_POSIX_MMAP
@@ -3683,16 +3553,7 @@ int channel_runtime_open(ChannelRuntime *rt, const ChannelConfig *cfg, GlobalOpt
         rt->nvme.fd = fd;
         rt->desc.fd = fd;
         rt->ddr.fd = fd;
-        if (rt->pcie_bridge_base_effective != 0u) {
-            if (map_region_optional(fd,
-                                    rt->pcie_bridge_base_effective,
-                                    PCIE_BRIDGE_MMAP_BYTES,
-                                    &rt->pcie_bridge) == 0) {
-                rt->pcie_bridge.fd = fd;
-            }
-        }
     }
-    storage_print_pcie_link_status(rt, "startup");
     return 0;
 #endif
 }
@@ -3713,7 +3574,6 @@ void channel_runtime_close(ChannelRuntime *rt) {
     unmap_region(&rt->ddr);
     unmap_region(&rt->desc);
     unmap_region(&rt->nvme);
-    unmap_region(&rt->pcie_bridge);
     unmap_region(&rt->axis_switch);
     unmap_region(&rt->dma);
     if (fd >= 0) {
@@ -3802,12 +3662,14 @@ static int nvme_read_capability(ChannelRuntime *rt, const char *tag) {
         return -1;
     }
 
-    printf("nvme_capability channel=%d max_transfer_raw=%u"
-           " max_transfer_blocks=%u max_transfer_bytes=%u"
-           " logical_block_bytes=%u\n",
-           rt->cfg->id, max_dts_raw, max_dts_blocks,
-           rt->nvme_max_dts_bytes, rt->nvme_block_size);
-    fflush(stdout);
+    if (hw_storage_log_at_least_debug()) {
+        printf("nvme_capability channel=%d max_transfer_raw=%u"
+               " max_transfer_blocks=%u max_transfer_bytes=%u"
+               " logical_block_bytes=%u\n",
+               rt->cfg->id, max_dts_raw, max_dts_blocks,
+               rt->nvme_max_dts_bytes, rt->nvme_block_size);
+        fflush(stdout);
+    }
 
     dbg_verbose_printf("[DBG][NVME] probe %s ch=%d status=0x%08x block=%u max_dts=%u max_lba=0x%08" PRIx64
                        " tx_status=0x%08x int=0x%08x\n",
@@ -3830,7 +3692,6 @@ int nvme_probe(ChannelRuntime *rt) {
         rt->nvme_max_dts_bytes = NVME_CMD_KIB_MAX * 1024u;
         rt->nvme_max_lba = 1024ull * 1024ull * 1024ull;
         if (nvme_configure_runtime(rt) != 0) return -1;
-        storage_print_pcie_link_status(rt, "after_nvme_probe");
         return 0;
     }
 
@@ -3844,8 +3705,6 @@ int nvme_probe(ChannelRuntime *rt) {
         return -1;
     }
     if (nvme_configure_runtime(rt) != 0) return -1;
-    storage_print_pcie_link_status(rt, "after_nvme_probe");
-
     return 0;
 }
 
@@ -4068,9 +3927,30 @@ static int dma_reset_full(ChannelRuntime *rt, const char *tag) {
     return 0;
 }
 
+int dma_reset_after_storage_task(ChannelRuntime *rt)
+{
+    if (!rt || !rt->cfg) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (rt->gopt.dry_run) return 0;
+    if (!rt->dma.valid) {
+        errno = ENODEV;
+        return -1;
+    }
+    return dma_reset_full(rt, "post_storage_commit");
+}
+
 int dma_prepare_s2mm_ring(ChannelRuntime *rt, uint32_t dma_desc_bytes) {
-    uint32_t desc_count = (uint32_t)(rt->dma_ring_bytes / (uint64_t)dma_desc_bytes);
-    uint32_t desc_capacity = (uint32_t)(rt->cfg->desc_cpu_size / sizeof(DmaSgDesc));
+    uint32_t desc_count;
+    uint32_t desc_capacity;
+
+    if (!rt || !rt->cfg || dma_desc_bytes == 0u) {
+        errno = EINVAL;
+        return -1;
+    }
+    desc_count = (uint32_t)(rt->dma_ring_bytes / (uint64_t)dma_desc_bytes);
+    desc_capacity = (uint32_t)(rt->cfg->desc_cpu_size / sizeof(DmaSgDesc));
     /*
      * Descriptor count is constrained by:
      * - channel total hardware DDR coverage
@@ -4078,7 +3958,8 @@ int dma_prepare_s2mm_ring(ChannelRuntime *rt, uint32_t dma_desc_bytes) {
      */
     if (rt->dma_ring_bytes == 0u ||
         (rt->dma_ring_bytes % (uint64_t)dma_desc_bytes) != 0u ||
-        desc_count == 0u || desc_capacity == 0u || desc_count > desc_capacity) {
+        desc_count == 0u || desc_capacity == 0u || desc_count > desc_capacity ||
+        desc_count > DMA_DESC_COUNT_MAX) {
         fprintf(stderr,
                 "Invalid dma_desc_bytes=%u for channel %d: ring=%" PRIu64 " bytes, desc_count=%u (max descriptors=%u)\n",
                 (unsigned)dma_desc_bytes,
@@ -4090,6 +3971,9 @@ int dma_prepare_s2mm_ring(ChannelRuntime *rt, uint32_t dma_desc_bytes) {
     }
     rt->dma_desc_bytes = dma_desc_bytes;
     rt->dma_desc_count = desc_count;
+    rt->next_harvest_bd = 0u;
+    rt->next_requeue_bd = 0u;
+    memset(rt->dma_bd_harvested, 0, sizeof(rt->dma_bd_harvested));
     rt->dma_rx_packet_open = false;
     rt->dma_last_completed_bd = UINT32_MAX;
     rt->dma_last_completed_status = 0u;
@@ -4204,6 +4088,8 @@ int dma_start_s2mm_ring(ChannelRuntime *rt)
     }
     __atomic_store_n(&rt->dma_hw_desc_count, rt->dma_desc_count, __ATOMIC_RELEASE);
     rt->next_harvest_bd = 0u;
+    rt->next_requeue_bd = 0u;
+    memset(rt->dma_bd_harvested, 0, sizeof(rt->dma_bd_harvested));
     rt->dma_harvest_sequence = 0u;
     rt->dma_stop_latched = false;
     rt->dma_requeue_enabled = true;
@@ -4222,16 +4108,26 @@ static int dma_harvest_batch_impl(ChannelRuntime *rt, DmaHarvestItem *items,
 {
     uint32_t count = 0u;
     uint64_t start_us = 0u;
-    if (!rt || !items || !out_count || max_items == 0u) return -1;
+    if (!rt || !items || !out_count || max_items == 0u ||
+        rt->dma_desc_count == 0u || rt->dma_desc_count > DMA_DESC_COUNT_MAX) {
+        errno = EINVAL;
+        return -1;
+    }
     *out_count = 0u;
     if (budget_us != 0u) start_us = wall_time_us();
     if (rt->gopt.dry_run) {
         for (; count < max_items; ++count) {
-            items[count].slot = rt->next_harvest_bd;
+            uint32_t idx = rt->next_harvest_bd;
+            if (__atomic_load_n(&rt->dma_bd_harvested[idx],
+                                __ATOMIC_ACQUIRE) != 0u)
+                break;
+            __atomic_store_n(&rt->dma_bd_harvested[idx], 1u,
+                             __ATOMIC_RELEASE);
+            items[count].slot = idx;
             items[count].actual_bytes = rt->dma_desc_bytes;
             items[count].descriptor_status = 0u;
             items[count].submission_sequence = rt->dma_harvest_sequence++;
-            rt->next_harvest_bd = (rt->next_harvest_bd + 1u) % rt->dma_desc_count;
+            rt->next_harvest_bd = (idx + 1u) % rt->dma_desc_count;
         }
         *out_count = count;
         return 0;
@@ -4247,17 +4143,40 @@ static int dma_harvest_batch_impl(ChannelRuntime *rt, DmaHarvestItem *items,
         dsr = reg_read32(&rt->dma, S2MM_DMASR);
         if ((dsr & DMA_ERROR_MASK_S2MM) != 0u ||
             (!allow_halted && (dsr & DMA_SR_HALT_BIT) != 0u)) {
-            *out_count = count; return -1;
+            errno = (dsr & DMA_ERROR_MASK_S2MM) != 0u ? EIO : EPIPE;
+            *out_count = count;
+            return -1;
         }
         desc = (volatile DmaSgDesc *)(void *)rt->desc.virt;
-        idx = rt->next_harvest_bd; st = desc[idx].status;
+        idx = rt->next_harvest_bd;
+        if (__atomic_load_n(&rt->dma_bd_harvested[idx],
+                            __ATOMIC_ACQUIRE) != 0u) {
+            /* The status belongs to a descriptor already owned by software.
+             * In particular, a stopped ring may wrap onto stale completion
+             * status left by the normal harvester. */
+            if (allow_halted) break;
+            fprintf(stderr,
+                    "DMA harvest ownership conflict channel=%d slot=%u hw_owned=%u\n",
+                    rt->cfg ? rt->cfg->id : -1, (unsigned)idx,
+                    (unsigned)hw_owned);
+            errno = EPROTO;
+            *out_count = count;
+            return -1;
+        }
+        st = desc[idx].status;
         if ((st & DESC_STS_CMPLT) == 0u) break;
         rt->dma_last_completed_bd = idx; rt->dma_last_completed_status = st;
-        if ((st & DESC_STS_ERROR_MASK) != 0u) { *out_count = count; return -1; }
+        if ((st & DESC_STS_ERROR_MASK) != 0u) {
+            errno = EIO;
+            *out_count = count;
+            return -1;
+        }
         items[count].slot = idx;
         items[count].actual_bytes = st & DESC_STS_LEN_MASK;
         items[count].descriptor_status = st;
         items[count].submission_sequence = rt->dma_harvest_sequence++;
+        __atomic_store_n(&rt->dma_bd_harvested[idx], 1u,
+                         __ATOMIC_RELEASE);
         if ((st & DESC_STS_RXSOF) != 0u) { ++rt->dma_rxsof_count; rt->dma_rx_packet_open = true; }
         if ((st & DESC_STS_RXEOF) != 0u) { ++rt->dma_rxeof_count; rt->dma_rx_packet_open = false; }
         if (allow_halted) {
@@ -4313,7 +4232,10 @@ uint64_t dma_requeue_after_stop_count(const ChannelRuntime *rt)
 }
 
 int dma_requeue_one(ChannelRuntime *rt, uint32_t slot) {
-    if (!rt) return -1;
+    if (!rt) {
+        errno = EINVAL;
+        return -1;
+    }
     if (__atomic_load_n(&rt->dma_stop_latched, __ATOMIC_ACQUIRE) ||
         !__atomic_load_n(&rt->dma_requeue_enabled, __ATOMIC_ACQUIRE)) {
         (void)__atomic_add_fetch(&rt->dma_requeue_after_stop_count, 1u, __ATOMIC_RELAXED);
@@ -4322,8 +4244,32 @@ int dma_requeue_one(ChannelRuntime *rt, uint32_t slot) {
                 rt->cfg ? rt->cfg->id : -1, (unsigned)slot);
         return -2;
     }
-    if (!rt || rt->gopt.dry_run || slot >= rt->dma_desc_count) {
-        return (rt && rt->gopt.dry_run && slot < rt->dma_desc_count) ? 0 : -1;
+    if (slot >= rt->dma_desc_count || rt->dma_desc_count == 0u ||
+        rt->dma_desc_count > DMA_DESC_COUNT_MAX) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (slot != rt->next_requeue_bd) {
+        errno = EPROTO;
+        fprintf(stderr,
+                "DMA requeue order violation channel=%d slot=%u expected=%u\n",
+                rt->cfg ? rt->cfg->id : -1, (unsigned)slot,
+                (unsigned)rt->next_requeue_bd);
+        return -3;
+    }
+    if (__atomic_load_n(&rt->dma_bd_harvested[slot],
+                        __ATOMIC_ACQUIRE) == 0u) {
+        errno = EPROTO;
+        fprintf(stderr,
+                "DMA requeue ownership violation channel=%d slot=%u reason=not_harvested\n",
+                rt->cfg ? rt->cfg->id : -1, (unsigned)slot);
+        return -3;
+    }
+    if (rt->gopt.dry_run) {
+        __atomic_store_n(&rt->dma_bd_harvested[slot], 0u,
+                         __ATOMIC_RELEASE);
+        rt->next_requeue_bd = (slot + 1u) % rt->dma_desc_count;
+        return 0;
     }
 
     {
@@ -4346,14 +4292,21 @@ int dma_requeue_one(ChannelRuntime *rt, uint32_t slot) {
             uint32_t cr = reg_read32(&rt->dma, S2MM_DMACR);
             if ((sr & (DMA_ERROR_MASK_S2MM | DMA_SR_HALT_BIT)) != 0u ||
                 (cr & DMA_CR_RS_BIT) == 0u) {
+                errno = EIO;
                 fprintf(stderr,
                         "DMA requeue failed channel=%d slot=%u dmacr=0x%08x dmasr=0x%08x\n",
                         rt->cfg->id, (unsigned)slot, cr, sr);
                 return -1;
             }
         }
+        /* Publish software ownership release before increasing the hardware
+         * ownership count observed by the producer. */
+        __atomic_store_n(&rt->dma_bd_harvested[slot], 0u,
+                         __ATOMIC_RELEASE);
+        rt->next_requeue_bd = (slot + 1u) % rt->dma_desc_count;
         hw_owned = __atomic_add_fetch(&rt->dma_hw_desc_count, 1u, __ATOMIC_ACQ_REL);
         if (hw_owned > rt->dma_desc_count) {
+            errno = EOVERFLOW;
             fprintf(stderr,
                     "DMA descriptor ownership overflow on channel %d: hw_owned=%u total=%u\n",
                     rt->cfg->id,
@@ -4517,6 +4470,13 @@ static bool dma_stop_reset_safe(const ChannelRuntime *rt,
         if (report) (void)snprintf(report->reason, sizeof(report->reason), "tail_descriptor_incomplete");
         return false;
     }
+    if (rt->dma_rxsof_count != rt->dma_rxeof_count) {
+        if (report) {
+            (void)snprintf(report->reason, sizeof(report->reason),
+                           "packet_boundary_unconfirmed");
+        }
+        return false;
+    }
     if (dma_get_bd_snapshot((ChannelRuntime *)rt, software_slot_state, &snapshot) != 0) {
         if (report) (void)snprintf(report->reason, sizeof(report->reason), "slot_ownership_invariant_failed");
         return false;
@@ -4536,7 +4496,9 @@ static void dma_emit_quiesce_result(const ChannelRuntime *rt, const DmaStopRepor
            " CR=0x%08x SR=0x%08x CURDESC=0x%016" PRIx64
            " TAILDESC=0x%016" PRIx64
            " next_bd=%u next_bd_status=0x%08x hw_owned=%u"
-           " completed_unharvested=%u rx_packet_open=%u reset_attempted=%u\n",
+           " completed_unharvested=%u rx_packet_open=%u"
+           " idle_state_stable=%u idle_stable_us=%" PRIu64
+           " reset_attempted=%u\n",
            rt->cfg ? rt->cfg->id : -1,
            (int)report->result,
            report->reason[0] != '\0' ? report->reason : "unknown",
@@ -4548,6 +4510,8 @@ static void dma_emit_quiesce_result(const ChannelRuntime *rt, const DmaStopRepor
            report->next_bd_status, (unsigned)report->hw_owned,
            (unsigned)report->completed_unharvested,
            report->rx_packet_open ? 1u : 0u,
+           report->idle_state_stable ? 1u : 0u,
+           report->idle_stable_us,
            report->reset_attempted ? 1u : 0u);
     fflush(stdout);
 }
@@ -4560,6 +4524,10 @@ DmaStopResult dma_quiesce_s2mm_with_state(ChannelRuntime *rt, uint64_t deadline_
     uint32_t control;
     uint32_t next_status = 0u;
     uint32_t hw_owned;
+    uint64_t last_curdesc_addr;
+    uint64_t last_taildesc_addr;
+    uint32_t last_next_status;
+    uint64_t idle_stable_since_us;
 
     if (!rt || rt->gopt.dry_run) {
         if (report) {
@@ -4622,10 +4590,44 @@ DmaStopResult dma_quiesce_s2mm_with_state(ChannelRuntime *rt, uint64_t deadline_
         fflush(stdout);
     }
 
+    last_curdesc_addr = (uint64_t)reg_read32(&rt->dma, S2MM_CURDESC) |
+                        ((uint64_t)reg_read32(&rt->dma, S2MM_CURDESC_MSB) << 32u);
+    last_taildesc_addr = (uint64_t)reg_read32(&rt->dma, S2MM_TAILDESC) |
+                         ((uint64_t)reg_read32(&rt->dma, S2MM_TAILDESC_MSB) << 32u);
+    last_next_status = next_status;
+    idle_stable_since_us = wall_time_us();
     reg_write32(&rt->dma, S2MM_DMACR, control & ~DMA_CR_RS_BIT);
     __sync_synchronize();
     for (;;) {
         uint32_t status = reg_read32(&rt->dma, S2MM_DMASR);
+        uint64_t now_us = wall_time_us();
+        uint64_t curdesc_addr;
+        uint64_t taildesc_addr;
+        uint32_t observed_next_status = 0u;
+
+        curdesc_addr = (uint64_t)reg_read32(&rt->dma, S2MM_CURDESC) |
+                       ((uint64_t)reg_read32(&rt->dma, S2MM_CURDESC_MSB) << 32u);
+        taildesc_addr = (uint64_t)reg_read32(&rt->dma, S2MM_TAILDESC) |
+                        ((uint64_t)reg_read32(&rt->dma, S2MM_TAILDESC_MSB) << 32u);
+        if (desc && rt->next_harvest_bd < rt->dma_desc_count)
+            observed_next_status = desc[rt->next_harvest_bd].status;
+        if (curdesc_addr != last_curdesc_addr ||
+            taildesc_addr != last_taildesc_addr ||
+            observed_next_status != last_next_status) {
+            last_curdesc_addr = curdesc_addr;
+            last_taildesc_addr = taildesc_addr;
+            last_next_status = observed_next_status;
+            idle_stable_since_us = now_us;
+        }
+        if (report) {
+            report->curdesc_addr = curdesc_addr;
+            report->taildesc_addr = taildesc_addr;
+            report->next_bd_status = observed_next_status;
+            report->idle_stable_us = now_us >= idle_stable_since_us
+                                         ? now_us - idle_stable_since_us : 0u;
+            report->idle_state_stable =
+                report->idle_stable_us >= DMA_STOP_RESET_STABLE_US;
+        }
 
         if ((status & DMA_ERROR_MASK_S2MM) != 0u) {
             errno = EIO;
@@ -4634,13 +4636,25 @@ DmaStopResult dma_quiesce_s2mm_with_state(ChannelRuntime *rt, uint64_t deadline_
             return DMA_STOP_FAILED;
         }
         if ((status & DMA_SR_HALT_BIT) != 0u) break;
-        if (deadline_us != 0u && wall_time_us() >= deadline_us) {
+        if (deadline_us != 0u && now_us >= deadline_us) {
             errno = ETIMEDOUT;
-            /* A halted bit is not guaranteed when no frame has arrived.  A
-             * reset is allowed only after the complete ownership audit. */
+            /* dma_hw_desc_count is the number of descriptors available to
+             * hardware, not the number of active transfers.  A full idle
+             * ring is therefore eligible after packet-boundary validation. */
             if (!software_slot_state || !dma_stop_reset_safe(rt, software_slot_state, report))
             {
                 if (report) { report->s2mm_sr_after = status; dma_emit_quiesce_result(rt, report); }
+                return DMA_STOP_FAILED;
+            }
+            if (now_us < idle_stable_since_us ||
+                now_us - idle_stable_since_us < DMA_STOP_RESET_STABLE_US) {
+                if (report) {
+                    report->idle_state_stable = false;
+                    (void)snprintf(report->reason, sizeof(report->reason),
+                                   "dma_stop_state_unstable");
+                    report->s2mm_sr_after = status;
+                    dma_emit_quiesce_result(rt, report);
+                }
                 return DMA_STOP_FAILED;
             }
             if (report) report->reset_attempted = true;

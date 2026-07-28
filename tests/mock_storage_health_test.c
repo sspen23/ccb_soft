@@ -1,4 +1,5 @@
 #include <assert.h>
+#include <stdbool.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <time.h>
@@ -6,6 +7,7 @@
 #include "storage_health.h"
 
 static atomic_uint g_calls;
+static atomic_uint g_abort_calls;
 
 static StorageErrorCode fake_probe(uint32_t channel, void *ctx,
                                    StorageHealthSnapshot *snapshot)
@@ -24,6 +26,16 @@ static StorageErrorCode fake_probe(uint32_t channel, void *ctx,
     snapshot->effective_command_bytes = snapshot->max_transfer_bytes;
     snapshot->nvme_qd = 8u;
     return channel == 1u ? STORAGE_ERR_NVME_PROBE : STORAGE_ERR_NONE;
+}
+
+static StorageErrorCode fake_aborting_probe(uint32_t channel, void *ctx,
+                                             StorageHealthSnapshot *snapshot)
+{
+    (void)ctx;
+    atomic_fetch_add(&g_abort_calls, 1u);
+    snapshot->channel = channel;
+    storage_health_abort_refresh();
+    return STORAGE_ERR_NVME_PROBE;
 }
 
 int main(void)
@@ -61,6 +73,16 @@ int main(void)
     assert(snapshots[0].requested_command_bytes == 512u * 1024u);
     assert(snapshots[0].effective_command_bytes == 256u * 1024u);
     storage_health_stop();
+
+    atomic_store(&g_abort_calls, 0u);
+    assert(storage_health_start(fake_aborting_probe, NULL, 1000u) == 0);
+    for (attempts = 0u; attempts < 1000u && atomic_load(&g_abort_calls) == 0u;
+         ++attempts)
+        (void)nanosleep(&pause, NULL);
+    (void)nanosleep(&(struct timespec){0, 10000000L}, NULL);
+    assert(atomic_load(&g_abort_calls) == 1u);
+    storage_health_stop();
+
     puts("mock_storage_health_test: ok");
     return 0;
 }

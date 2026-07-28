@@ -184,14 +184,13 @@ static int parse_legacy_us(const char *name, const char *value, uint32_t *out,
 
 static int parse_log_level(const char *value, CcbLogLevel *out)
 {
-    if (!value || value[0] == '\0' || strcmp(value, "info") == 0 ||
-        strcmp(value, "summary") == 0) {
-        *out = CCB_LOG_INFO;
+    if (!value || value[0] == '\0' || strcmp(value, "error") == 0 ||
+        strcmp(value, "critical") == 0 || strcmp(value, "quiet") == 0) {
+        *out = CCB_LOG_ERROR;
         return 0;
     }
-    if (strcmp(value, "error") == 0 || strcmp(value, "critical") == 0 ||
-        strcmp(value, "quiet") == 0) {
-        *out = CCB_LOG_ERROR;
+    if (strcmp(value, "info") == 0 || strcmp(value, "summary") == 0) {
+        *out = CCB_LOG_INFO;
         return 0;
     }
     if (strcmp(value, "perf") == 0) {
@@ -207,8 +206,11 @@ static int parse_log_level(const char *value, CcbLogLevel *out)
 
 static int parse_profile(const char *value, StorageProfile *out)
 {
-    if (!value || value[0] == '\0' ||
-        strcmp(value, "LEGACY_FAST_BASELINE") == 0 ||
+    if (!value || value[0] == '\0') {
+        *out = STORAGE_PROFILE_CROSS_SLOT_QD16_EXPERIMENTAL;
+        return 0;
+    }
+    if (strcmp(value, "LEGACY_FAST_BASELINE") == 0 ||
         strcmp(value, "legacy_fast_baseline") == 0 ||
         strcmp(value, "legacy") == 0) {
         *out = STORAGE_PROFILE_LEGACY_FAST_BASELINE;
@@ -319,6 +321,7 @@ int storage_config_load(AppConfig *out, char *error, size_t error_size)
              value && value[0] != '\0' ? value : DEFAULT_UART_DEVICE);
 
     value = read_primary_or_legacy("CCB_LOG_LEVEL", "SRC_REAL_LOG_LEVEL");
+    out->log_enabled = value && value[0] != '\0';
     if (parse_log_level(value, &out->log_level) != 0) {
         if (error && error_size != 0u)
             snprintf(error, error_size, "invalid CCB_LOG_LEVEL=%s", value);

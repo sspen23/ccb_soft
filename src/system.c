@@ -47,6 +47,7 @@
 #include "storage_health.h"
 #include "storage_controller.h"
 #include "storage_process.h"
+#include "ssd_reset.h"
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
@@ -92,6 +93,9 @@
 #define NETWORK_SEND_ARG "network-send"
 #define STORAGE_TASK_COUNT NUM_CHANNELS
 #define NETWORK_DDR_OFFSET_BYTES (4u * 1024u)
+#define STORAGE_HEALTH_REFRESH_MS 5000u
+#define STORAGE_HEALTH_MAX_AGE_US 15000000ull
+#define STORAGE_HEALTH_RESET_COOLDOWN_US 30000000ull
 
 #ifndef FILE_LIST_READ
 #define FILE_LIST_READ 0x11
@@ -186,10 +190,13 @@ static void storage_finish_worker_exit(Task *task, int exit_code, int signal_num
 static void storage_handle_worker_exit(Task *task, int status);
 static int storage_commit_supervised_results(const char *task_id,
                                              TaskStatus final_status);
+static int storage_post_commit_reset_dma(const char *task_id,
+                                         uint32_t target_mask);
 static bool storage_result_fully_drained(const WriteResult *result);
 static void storage_service_pending_stop(void);
 static void storage_service_pending_start(void);
 static void system_emit_line(StorageLogSeverity severity, const char *fmt, ...);
+static bool storage_any_live_worker(void);
 
 static void storage_supervisor_emit_aggregate(void)
 {
@@ -218,13 +225,14 @@ static void storage_supervisor_emit_aggregate(void)
             task_id = storage_tasks[i].task_id;
         }
     }
-    if (status == STORAGE_TASK_SUCCESS &&
-        storage_commit_supervised_results(task_id, TASK_COMPLETED) != 0) {
-        storage_supervisor_protocol_fail(&g_storage_supervisor, NUM_CHANNELS,
-                                         g_storage_commit_state.reason);
-        status = STORAGE_TASK_FAILED;
-        capture_task_fail(&g_capture_task, STORAGE_ERR_COMMIT);
-    } else if (status == STORAGE_TASK_FAILED && task_id[0] != '\0') {
+    if (status == STORAGE_TASK_SUCCESS) {
+        if (storage_commit_supervised_results(task_id, TASK_COMPLETED) != 0) {
+            storage_supervisor_protocol_fail(&g_storage_supervisor, NUM_CHANNELS,
+                                             g_storage_commit_state.reason);
+            status = STORAGE_TASK_FAILED;
+            capture_task_fail(&g_capture_task, STORAGE_ERR_COMMIT);
+        }
+    } else if (task_id[0] != '\0') {
         int partial_commit_rc = storage_commit_supervised_results(
             task_id, TASK_FAILED);
 
@@ -239,8 +247,22 @@ static void storage_supervisor_emit_aggregate(void)
             g_storage_supervisor.primary_error != STORAGE_ERR_NONE
                 ? g_storage_supervisor.primary_error
                 : STORAGE_ERR_INTEGRITY);
-    } else if (status == STORAGE_TASK_SUCCESS &&
-               g_capture_task.state == CAPTURE_COMMITTING) {
+    }
+    if (g_storage_supervisor.target_channel_mask != 0u &&
+        storage_post_commit_reset_dma(
+            task_id, g_storage_supervisor.target_channel_mask) != 0) {
+        if (status == STORAGE_TASK_SUCCESS) {
+            storage_supervisor_protocol_fail(
+                &g_storage_supervisor, NUM_CHANNELS,
+                "post_commit_dma_reset_failed");
+            status = STORAGE_TASK_FAILED;
+            if (task_id[0] != '\0')
+                (void)task_update_status(task_id, TASK_FAILED);
+            capture_task_fail(&g_capture_task, STORAGE_ERR_DMA_STOP);
+        }
+    }
+    if (status == STORAGE_TASK_SUCCESS &&
+        g_capture_task.state == CAPTURE_COMMITTING) {
         (void)capture_task_transition(&g_capture_task, CAPTURE_COMMITTING,
                                       CAPTURE_DONE);
     }
@@ -331,6 +353,48 @@ static const char *get_flash_filelist_db_path(void)
 
 static int copy_file_path(const char *src_path, const char *dst_path);
 static int sync_metadata_files_to_flash(const char *flash_path);
+static int flash_parent_dir(const char *flash_path, char *out, size_t out_size);
+
+static int flash_fsync_file(const char *path)
+{
+    int fd;
+    int rc;
+    int saved_errno;
+
+    fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return -1;
+    rc = fsync(fd);
+    saved_errno = errno;
+    (void)close(fd);
+    if (rc != 0) {
+        errno = saved_errno;
+        return -1;
+    }
+    return 0;
+}
+
+static int flash_fsync_parent_dir(const char *path)
+{
+    char parent[PATH_MAX];
+    int fd;
+    int rc;
+    int saved_errno;
+
+    if (flash_parent_dir(path, parent, sizeof(parent)) != 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    fd = open(parent, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0) return -1;
+    rc = fsync(fd);
+    saved_errno = errno;
+    (void)close(fd);
+    if (rc != 0) {
+        errno = saved_errno;
+        return -1;
+    }
+    return 0;
+}
 
 static int flash_parent_dir(const char *flash_path, char *out, size_t out_size)
 {
@@ -511,6 +575,11 @@ static uint8_t sync_filelist_db_to_flash(void)
         (void)unlink(tmp_path);
         return ACK_FAILED;
     }
+    if (flash_fsync_file(tmp_path) != 0) {
+        LOG_ERROR("FILE_LIST", "Flash DB fsync failed: %s errno=%d", tmp_path, errno);
+        (void)unlink(tmp_path);
+        return ACK_FAILED;
+    }
     if (sync_metadata_files_to_flash(flash_path) != 0) {
         LOG_ERROR("FILE_LIST", "Flash metadata sync failed: %s", flash_path);
         (void)unlink(tmp_path);
@@ -524,8 +593,12 @@ static uint8_t sync_filelist_db_to_flash(void)
         (void)unlink(tmp_path);
         return ACK_FAILED;
     }
-    sync();
-
+    if (flash_fsync_file(flash_path) != 0 ||
+        flash_fsync_parent_dir(flash_path) != 0) {
+        LOG_ERROR("FILE_LIST", "Flash DB durable commit failed: %s errno=%d",
+                  flash_path, errno);
+        return ACK_FAILED;
+    }
     LOG_INFO("FILE_LIST", "Flash DB sync complete: %s", flash_path);
     dbg_printf("[DBG][FLASH] filelist DB synced runtime=%s flash=%s\n",
                FILELIST_DB_PATH, flash_path);
@@ -627,6 +700,115 @@ out:
         close(src_fd);
     }
     return rc;
+}
+
+/* The SPI1 copy is the persisted source of truth at daemon startup.  Restore
+ * it before SQLite opens the runtime database, so SQLite never sees a file
+ * replaced underneath an active connection. */
+static int restore_filelist_db_from_flash(void)
+{
+    const char *flash_path = get_flash_filelist_db_path();
+    char tmp_path[PATH_MAX];
+    struct stat st;
+
+    if (!flash_storage_is_mounted(flash_path)) {
+        LOG_WARN("FILE_LIST", "Flash storage is not mounted; skip file-list restore: %s",
+                 flash_path);
+        return 0;
+    }
+    if (strcmp(flash_path, FILELIST_DB_PATH) == 0) {
+        return 0;
+    }
+    if (stat(flash_path, &st) != 0) {
+        if (errno == ENOENT) {
+            LOG_INFO("FILE_LIST", "No persisted file-list database on flash: %s", flash_path);
+            return 0;
+        }
+        LOG_ERROR("FILE_LIST", "Cannot stat persisted file-list database: %s errno=%d",
+                  flash_path, errno);
+        return -1;
+    }
+    if (!S_ISREG(st.st_mode) ||
+        snprintf(tmp_path, sizeof(tmp_path), "%s.restore.tmp", FILELIST_DB_PATH) >=
+            (int)sizeof(tmp_path)) {
+        LOG_ERROR("FILE_LIST", "Invalid persisted file-list database path: %s", flash_path);
+        return -1;
+    }
+
+    (void)unlink(tmp_path);
+    if (copy_file_path(flash_path, tmp_path) != 0 ||
+        rename(tmp_path, FILELIST_DB_PATH) != 0) {
+        LOG_ERROR("FILE_LIST", "File-list restore failed: %s -> %s errno=%d",
+                  flash_path, FILELIST_DB_PATH, errno);
+        (void)unlink(tmp_path);
+        return -1;
+    }
+
+    /* The flash backup is a standalone SQLite database.  Old local WAL files
+     * must not be replayed onto the restored database. */
+    if (snprintf(tmp_path, sizeof(tmp_path), "%s-wal", FILELIST_DB_PATH) <
+        (int)sizeof(tmp_path)) {
+        (void)unlink(tmp_path);
+    }
+    if (snprintf(tmp_path, sizeof(tmp_path), "%s-shm", FILELIST_DB_PATH) <
+        (int)sizeof(tmp_path)) {
+        (void)unlink(tmp_path);
+    }
+    LOG_INFO("FILE_LIST", "Restored file-list database from flash: %s", flash_path);
+    dbg_printf("[DBG][FLASH] filelist DB restored flash=%s runtime=%s\n",
+               flash_path, FILELIST_DB_PATH);
+    return 0;
+}
+
+static int restore_metadata_files_from_flash(void)
+{
+    const char *flash_path = get_flash_filelist_db_path();
+    char flash_dir[PATH_MAX];
+    size_t i;
+
+    if (!flash_storage_is_mounted(flash_path)) {
+        return 0;
+    }
+    if (flash_parent_dir(flash_path, flash_dir, sizeof(flash_dir)) != 0 ||
+        (mkdir(get_storage_meta_dir(), 0775) != 0 && errno != EEXIST)) {
+        LOG_ERROR("FILE_LIST", "Cannot prepare metadata restore directory: %s",
+                  get_storage_meta_dir());
+        return -1;
+    }
+
+    for (i = 0u; i < NUM_CHANNELS; ++i) {
+        char src_path[PATH_MAX];
+        char dst_path[PATH_MAX];
+        char tmp_path[PATH_MAX];
+        struct stat st;
+
+        if (build_metadata_path(src_path, sizeof(src_path), flash_dir, kChannels[i].id, "") != 0 ||
+            build_metadata_path(dst_path, sizeof(dst_path), get_storage_meta_dir(), kChannels[i].id, "") != 0 ||
+            build_metadata_path(tmp_path, sizeof(tmp_path), get_storage_meta_dir(), kChannels[i].id, ".restore.tmp") != 0) {
+            return -1;
+        }
+        if (stat(src_path, &st) != 0) {
+            if (errno == ENOENT) {
+                (void)unlink(dst_path);
+                continue;
+            }
+            LOG_ERROR("FILE_LIST", "Cannot stat persisted metadata: %s errno=%d",
+                      src_path, errno);
+            return -1;
+        }
+        if (!S_ISREG(st.st_mode)) {
+            LOG_ERROR("FILE_LIST", "Persisted metadata is not a regular file: %s", src_path);
+            return -1;
+        }
+        (void)unlink(tmp_path);
+        if (copy_file_path(src_path, tmp_path) != 0 || rename(tmp_path, dst_path) != 0) {
+            LOG_ERROR("FILE_LIST", "Metadata restore failed: %s -> %s errno=%d",
+                      src_path, dst_path, errno);
+            (void)unlink(tmp_path);
+            return -1;
+        }
+    }
+    return 0;
 }
 
 static int sync_metadata_files_to_flash(const char *flash_path)
@@ -991,7 +1173,9 @@ void start_task(Task *task, const char *prog, const char *arg)
 {
     if (task->state == RUNNING) {
         LOG_WARN(task->name, "%s task is busy", task->name);
-        printf("%s busy\n", task->name);
+        if (storage_log_severity_enabled(STORAGE_LOG_SUMMARY)) {
+            printf("%s busy\n", task->name);
+        }
         return;
     }
 
@@ -1000,7 +1184,9 @@ void start_task(Task *task, const char *prog, const char *arg)
     task->state = RUNNING;
 
     LOG_INFO(task->name, "Task started: %s (PID=%d)", prog, task->pid);
-    printf("%s start pid=%d\n", task->name, task->pid);
+    if (storage_log_severity_enabled(STORAGE_LOG_SUMMARY)) {
+        printf("%s start pid=%d\n", task->name, task->pid);
+    }
 }
 
 void stop_task(Task *task)
@@ -1010,7 +1196,9 @@ void stop_task(Task *task)
         task->state = IDLE;
         storage_task_close_fds(task);
         LOG_INFO(task->name, "Task stopped");
-        printf("%s stopped\n", task->name);
+        if (storage_log_severity_enabled(STORAGE_LOG_SUMMARY)) {
+            printf("%s stopped\n", task->name);
+        }
     }
 }
 
@@ -1041,7 +1229,9 @@ static void storage_finish_worker_exit(Task *task, int exit_code, int signal_num
     } else if (exit_code == 0) {
         task->state = IDLE;
         LOG_INFO(task->name, "Task finished successfully");
-        printf("%s finished OK\n", task->name);
+        if (storage_log_severity_enabled(STORAGE_LOG_SUMMARY)) {
+            printf("%s finished OK\n", task->name);
+        }
     } else {
         task->state = ERROR;
         LOG_ERROR(task->name, "Task failed with status %d", exit_code);
@@ -1577,7 +1767,19 @@ static int storage_commit_db_rollback(void *ctx)
 
 static int storage_commit_flash_sync(void *ctx)
 {
+    const char *flash_path;
+
     (void)ctx;
+    flash_path = get_flash_filelist_db_path();
+    /* SPI1 is a persistence replica, not a prerequisite for capture.  A
+     * missing or unhealthy mount must not turn an otherwise durable NVMe
+     * capture into a failed task.  The explicit 0x41/0x22 flash-sync command
+     * still reports its own failure to the caller. */
+    if (!flash_storage_is_mounted(flash_path)) {
+        LOG_WARN("FILE_LIST", "Flash storage unavailable; skip automatic sync: %s",
+                 flash_path);
+        return 0;
+    }
     return sync_filelist_db_to_flash() == ACK_SUCCESS ? 0 : -1;
 }
 
@@ -1591,6 +1793,73 @@ static int storage_commit_sync_mark_complete(void *ctx, const char *task_id)
 {
     (void)ctx;
     return storage_sync_outbox_mark_complete(storage_sync_outbox_dir(), task_id);
+}
+
+static int storage_post_commit_reset_dma(const char *task_id,
+                                         uint32_t target_mask)
+{
+    const AppConfig *config = storage_config_get();
+    GlobalOptions gopt;
+    uint32_t channel;
+    int failed = 0;
+
+    memset(&gopt, 0, sizeof(gopt));
+    gopt.timeout_us = config &&
+                              config->status_timeout_ms <= UINT32_MAX / 1000u
+                          ? config->status_timeout_ms * 1000u
+                          : DEFAULT_TIMEOUT_US;
+    storage_health_set_busy(true);
+    for (channel = 0u; channel < NUM_CHANNELS; ++channel) {
+        const ChannelConfig *cfg;
+        ChannelRuntime rt;
+        int reset_rc;
+        int saved_errno;
+
+        if ((target_mask & (1u << channel)) == 0u) continue;
+        cfg = find_channel((int)channel);
+        if (!cfg) {
+            failed = -1;
+            system_emit_line(
+                STORAGE_LOG_ALWAYS_CRITICAL,
+                "storage_post_commit_dma_reset task=%s channel=%u"
+                " phase=after_filelist_commit result=failed reason=invalid_channel",
+                task_id && task_id[0] != '\0' ? task_id : "unknown",
+                channel);
+            continue;
+        }
+        memset(&rt, 0, sizeof(rt));
+        if (channel_runtime_open(&rt, cfg, gopt) != 0) {
+            failed = -1;
+            system_emit_line(
+                STORAGE_LOG_ALWAYS_CRITICAL,
+                "storage_post_commit_dma_reset task=%s channel=%u"
+                " phase=after_filelist_commit result=failed reason=runtime_open_failed",
+                task_id && task_id[0] != '\0' ? task_id : "unknown",
+                channel);
+            continue;
+        }
+        reset_rc = dma_reset_after_storage_task(&rt);
+        saved_errno = errno;
+        channel_runtime_close(&rt);
+        if (reset_rc != 0) {
+            failed = -1;
+            system_emit_line(
+                STORAGE_LOG_ALWAYS_CRITICAL,
+                "storage_post_commit_dma_reset task=%s channel=%u"
+                " phase=after_filelist_commit result=failed"
+                " reason=dma_reset_failed errno=%d",
+                task_id && task_id[0] != '\0' ? task_id : "unknown",
+                channel, saved_errno);
+            continue;
+        }
+        system_emit_line(
+            STORAGE_LOG_SUMMARY,
+            "storage_post_commit_dma_reset task=%s channel=%u"
+            " phase=after_filelist_commit result=success reason=reset_complete",
+            task_id && task_id[0] != '\0' ? task_id : "unknown",
+            channel);
+    }
+    return failed;
 }
 
 static int storage_commit_supervised_results(const char *task_id,
@@ -1712,14 +1981,38 @@ static void append_task_output(Task *task, const char *buf, size_t len)
     task->output[task->output_used] = '\0';
 }
 
+static bool system_line_is_failure(const char *line)
+{
+    if (!line) {
+        return false;
+    }
+    return strstr(line, "failed") != NULL ||
+           strstr(line, "failure") != NULL ||
+           strstr(line, "error") != NULL ||
+           strstr(line, "ERROR") != NULL ||
+           strstr(line, "[ERR]") != NULL ||
+           strstr(line, "fatal") != NULL ||
+           strstr(line, "timeout") != NULL ||
+           strstr(line, "unresolved") != NULL ||
+           strstr(line, "integrity_ok=0") != NULL ||
+           strstr(line, "storage_invalid_") != NULL ||
+           strstr(line, "dma_requeue_") != NULL ||
+           strstr(line, "reason=dma_error") != NULL;
+}
+
 static void system_emit_line(StorageLogSeverity severity, const char *fmt, ...)
 {
     char line[1024];
     va_list ap;
     int n;
     size_t len;
+    bool enabled;
 
-    if (!fmt || !storage_log_severity_enabled(severity)) {
+    if (!fmt) {
+        return;
+    }
+    enabled = storage_log_severity_enabled(severity);
+    if (!enabled && severity != STORAGE_LOG_ALWAYS_CRITICAL) {
         return;
     }
     va_start(ap, fmt);
@@ -1736,6 +2029,15 @@ static void system_emit_line(StorageLogSeverity severity, const char *fmt, ...)
         line[len++] = '\n';
     }
     line[len] = '\0';
+    if (!enabled && severity != STORAGE_LOG_ALWAYS_CRITICAL &&
+        !system_line_is_failure(line)) {
+        return;
+    }
+    if ((severity == STORAGE_LOG_ALWAYS_CRITICAL ||
+         system_line_is_failure(line)) &&
+        !isatty(STDOUT_FILENO)) {
+        debug_uart_write(line, len);
+    }
     {
         ssize_t written = write(STDOUT_FILENO, line, len);
         (void)written;
@@ -1757,6 +2059,12 @@ static void system_write_stdout_line(const char *line)
         written = write(STDOUT_FILENO, "\n", 1u);
         (void)written;
     }
+    if (system_line_is_failure(line) && !isatty(STDOUT_FILENO)) {
+        debug_uart_write(line, len);
+        if (len == 0u || line[len - 1u] != '\n') {
+            debug_uart_write("\n", 1u);
+        }
+    }
 }
 
 /* Worker stdout is line-oriented and has no severity field.  The worker has
@@ -1773,12 +2081,9 @@ static bool worker_output_is_quiet_critical(const char *text)
     if (config && config->log_level != CCB_LOG_ERROR) {
         return true;
     }
-    return strstr(text, "storage_ddr_full") != NULL ||
-           strstr(text, "storage_receive_failed") != NULL ||
-           strstr(text, "storage_first_dma_timeout") != NULL ||
-           strstr(text, "storage_ring_config_error") != NULL ||
-           strstr(text, "dma_bd_exhausted") != NULL ||
-           (strstr(text, "storage_result") != NULL && strstr(text, "status=failed") != NULL);
+    return system_line_is_failure(text) ||
+           strstr(text, "storage_ddr_full") != NULL ||
+           strstr(text, "dma_bd_exhausted") != NULL;
 }
 
 static void echo_worker_line(Task *task, const char *line)
@@ -1982,7 +2287,6 @@ static void drain_storage_events(Task *task, bool report_eof)
 static void poll_storage_events(Task *task)
 {
     drain_storage_events(task, true);
-    storage_try_send_pending_stops();
     storage_supervisor_emit_aggregate();
 }
 
@@ -4176,6 +4480,46 @@ static uint8_t start_network_from_command(const CmdFileOp *op)
     return ACK_SUCCESS;
 }
 
+typedef struct {
+    bool pending;
+    uint32_t trigger_channel;
+    StorageErrorCode trigger_error;
+} BackgroundHealthResetRequest;
+
+static pthread_mutex_t g_background_health_reset_lock = PTHREAD_MUTEX_INITIALIZER;
+static BackgroundHealthResetRequest g_background_health_reset;
+static uint64_t g_background_health_reset_next_allowed_us;
+
+static StorageErrorCode request_background_ssd_reset(
+    uint32_t channel, StorageErrorCode error)
+{
+    uint64_t now_us;
+    bool scheduled = false;
+
+    if (error != STORAGE_ERR_PCIE_LINK && error != STORAGE_ERR_NVME_PROBE) {
+        return error;
+    }
+
+    now_us = storage_ipc_monotonic_us();
+    pthread_mutex_lock(&g_background_health_reset_lock);
+    if (!g_background_health_reset.pending &&
+        (g_background_health_reset_next_allowed_us == 0u ||
+         now_us >= g_background_health_reset_next_allowed_us)) {
+        g_background_health_reset.pending = true;
+        g_background_health_reset.trigger_channel = channel;
+        g_background_health_reset.trigger_error = error;
+        g_background_health_reset_next_allowed_us =
+            now_us + STORAGE_HEALTH_RESET_COOLDOWN_US;
+        scheduled = true;
+    }
+    pthread_mutex_unlock(&g_background_health_reset_lock);
+    if (scheduled) {
+        /* Do not begin probing another channel once a reset has been requested. */
+        storage_health_abort_refresh();
+    }
+    return error;
+}
+
 static StorageErrorCode probe_one_storage_channel(
     uint32_t channel, void *ctx, StorageHealthSnapshot *snapshot)
 {
@@ -4199,12 +4543,12 @@ static StorageErrorCode probe_one_storage_channel(
 
     memset(&rt, 0, sizeof(rt));
     if (channel_runtime_open(&rt, cfg, gopt) != 0)
-        return STORAGE_ERR_PCIE_LINK;
+        return request_background_ssd_reset(channel, STORAGE_ERR_PCIE_LINK);
     snapshot->pcie_link = true;
 
     if (nvme_probe(&rt) != 0) {
         channel_runtime_close(&rt);
-        return STORAGE_ERR_NVME_PROBE;
+        return request_background_ssd_reset(channel, STORAGE_ERR_NVME_PROBE);
     }
     snapshot->nvme_ready = true;
     snapshot->logical_block_bytes = rt.nvme_block_size;
@@ -4218,21 +4562,17 @@ static StorageErrorCode probe_one_storage_channel(
         rt.nvme_max_dts_bytes < rt.nvme_block_size ||
         rt.nvme_max_lba == 0u) {
         channel_runtime_close(&rt);
-        return STORAGE_ERR_NVME_PROBE;
+        return request_background_ssd_reset(channel, STORAGE_ERR_NVME_PROBE);
     }
     snapshot->capacity_valid = true;
     channel_runtime_close(&rt);
     return STORAGE_ERR_NONE;
 }
 
-static uint8_t get_status_query_result(void)
+static void emit_storage_status_snapshots(
+    const StorageHealthSnapshot snapshots[NUM_CHANNELS])
 {
-    StorageHealthSnapshot snapshots[NUM_CHANNELS];
-    StorageHealthResult result;
     uint32_t channel;
-
-    memset(snapshots, 0, sizeof(snapshots));
-    result = storage_health_query(15000000ull, snapshots);
 
     for (channel = 0u; channel < NUM_CHANNELS; ++channel) {
         const StorageHealthSnapshot *snapshot = &snapshots[channel];
@@ -4254,13 +4594,161 @@ static uint8_t get_status_query_result(void)
             snapshot->nvme_qd,
             storage_error_string(snapshot->error));
     }
+}
+
+static bool storage_status_needs_ssd_reset(
+    const StorageHealthSnapshot snapshots[NUM_CHANNELS],
+    uint32_t *trigger_channel, StorageErrorCode *trigger_error)
+{
+    uint32_t channel;
+
+    for (channel = 0u; channel < NUM_CHANNELS; ++channel) {
+        StorageErrorCode error = snapshots[channel].error;
+
+        if (error == STORAGE_ERR_PCIE_LINK || error == STORAGE_ERR_NVME_PROBE) {
+            if (trigger_channel) *trigger_channel = channel;
+            if (trigger_error) *trigger_error = error;
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool storage_status_ssd_reset_safe(void)
+{
+    return !storage_any_running() && !storage_any_live_worker() &&
+           transfer_task.state != RUNNING && !g_maintenance_job.active &&
+           !g_pending_storage_start.active && !g_pending_storage_stop.active &&
+           !g_pending_network_stop.active;
+}
+
+typedef struct {
+    bool needed;
+    uint32_t trigger_channel;
+    StorageErrorCode trigger_error;
+} StorageStatusResetRequest;
+
+static uint8_t get_status_query_result(StorageStatusResetRequest *reset_request)
+{
+    StorageHealthSnapshot snapshots[NUM_CHANNELS];
+    StorageHealthResult result;
+
+    if (reset_request) memset(reset_request, 0, sizeof(*reset_request));
+    memset(snapshots, 0, sizeof(snapshots));
+    result = storage_health_query(STORAGE_HEALTH_MAX_AGE_US, snapshots);
+    emit_storage_status_snapshots(snapshots);
 
     if (result == STORAGE_HEALTH_OK) return ACK_SUCCESS;
     if (result == STORAGE_HEALTH_RETRYING) {
         storage_health_request_refresh();
         return ACK_RETRYING;
     }
+
+    if (reset_request) {
+        reset_request->needed = storage_status_needs_ssd_reset(
+            snapshots, &reset_request->trigger_channel,
+            &reset_request->trigger_error);
+    }
     return ACK_FAILED;
+}
+
+static void recover_ssd_after_failed_status(
+    const StorageStatusResetRequest *reset_request)
+{
+    SsdResetError reset_error;
+    int health_start_rc;
+
+    if (!reset_request || !reset_request->needed) return;
+    if (!storage_status_ssd_reset_safe()) {
+        system_emit_line(
+            STORAGE_LOG_SUMMARY,
+            "storage_status_ssd_reset phase=skipped result=not_attempted reason=busy"
+            " trigger_channel=%u trigger_error=%s",
+            reset_request->trigger_channel,
+            storage_error_string(reset_request->trigger_error));
+        return;
+    }
+
+    system_emit_line(
+        STORAGE_LOG_SUMMARY,
+        "storage_status_ssd_reset phase=start base=0x%08" PRIx64
+        " bit=%u hold_ms=%u settle_ms=%u trigger_channel=%u trigger_error=%s",
+        (uint64_t)SSD_RESET_GPIO_BASE, SSD_RESET_GPIO_BIT,
+        SSD_RESET_DEFAULT_HOLD_MS, SSD_RESET_DEFAULT_SETTLE_MS,
+        reset_request->trigger_channel,
+        storage_error_string(reset_request->trigger_error));
+
+    /* Stop the background probe first so no NVMe MMIO is active during PERST#. */
+    system_emit_line(
+        STORAGE_LOG_ALWAYS_CRITICAL,
+        "storage_status_ssd_reset phase=health_probe_stop_begin"
+        " trigger_channel=%u trigger_error=%s",
+        reset_request->trigger_channel,
+        storage_error_string(reset_request->trigger_error));
+    storage_health_stop();
+    system_emit_line(STORAGE_LOG_ALWAYS_CRITICAL,
+                     "storage_status_ssd_reset phase=health_probe_stopped");
+    system_emit_line(STORAGE_LOG_ALWAYS_CRITICAL,
+                     "storage_status_ssd_reset phase=gpio_pulse_begin");
+    reset_error = ssd_reset_gpio_pulse(SSD_RESET_DEFAULT_HOLD_MS,
+                                       SSD_RESET_DEFAULT_SETTLE_MS);
+    system_emit_line(STORAGE_LOG_ALWAYS_CRITICAL,
+                     "storage_status_ssd_reset phase=gpio_pulse_complete result=%s",
+                     reset_error == SSD_RESET_OK ? "success" : "failed");
+    health_start_rc = storage_health_start(probe_one_storage_channel, NULL,
+                                           STORAGE_HEALTH_REFRESH_MS);
+    if (health_start_rc != 0) {
+        system_emit_line(
+            STORAGE_LOG_ALWAYS_CRITICAL,
+            "storage_status_ssd_reset phase=complete result=failed"
+            " reason=health_service_restart_failed reset_error=%s",
+            ssd_reset_error_string(reset_error));
+        return;
+    }
+    if (reset_error != SSD_RESET_OK) {
+        system_emit_line(
+            STORAGE_LOG_ALWAYS_CRITICAL,
+            "storage_status_ssd_reset phase=complete result=failed reason=%s",
+            ssd_reset_error_string(reset_error));
+        return;
+    }
+
+    system_emit_line(
+        STORAGE_LOG_SUMMARY,
+        "storage_status_ssd_reset phase=complete result=success"
+        " reason=reset_released_health_probe_started");
+}
+
+static void service_pending_background_health_reset(void)
+{
+    StorageStatusResetRequest reset_request;
+
+    if (!storage_status_ssd_reset_safe()) {
+        return;
+    }
+
+    memset(&reset_request, 0, sizeof(reset_request));
+    pthread_mutex_lock(&g_background_health_reset_lock);
+    if (g_background_health_reset.pending) {
+        reset_request.needed = true;
+        reset_request.trigger_channel = g_background_health_reset.trigger_channel;
+        reset_request.trigger_error = g_background_health_reset.trigger_error;
+        g_background_health_reset.pending = false;
+    }
+    pthread_mutex_unlock(&g_background_health_reset_lock);
+
+    if (!reset_request.needed) {
+        return;
+    }
+
+    system_emit_line(
+        STORAGE_LOG_ALWAYS_CRITICAL,
+        "storage_health_ssd_reset phase=queued result=probe_failed"
+        " trigger_channel=%u trigger_error=%s cooldown_ms=%u",
+        reset_request.trigger_channel,
+        storage_error_string(reset_request.trigger_error),
+        (unsigned)(STORAGE_HEALTH_RESET_COOLDOWN_US / 1000ull));
+    recover_ssd_after_failed_status(&reset_request);
 }
 
 void handle_frame(uint8_t *f)
@@ -4610,10 +5098,22 @@ void handle_frame(uint8_t *f)
 
     case CMD_STATUS:
     {
-        uint8_t disk_result = get_status_query_result();
+        StorageStatusResetRequest reset_request;
+        uint8_t disk_result = get_status_query_result(&reset_request);
+
         dbg_printf("[DBG][PROTO] RX 0x61 disk_check result=0x%02X storage_state=%d transfer_state=%d\n",
                    disk_result, storage_state_summary(), transfer_task.state);
         proto_send_ack(cmd, disk_result);
+        if (disk_result == ACK_FAILED && reset_request.needed) {
+            /* Ensure the original self-check ACK leaves the UART before PERST#. */
+            if (tcdrain(serial_fd) != 0) {
+                system_emit_line(
+                    STORAGE_LOG_SUMMARY,
+                    "storage_status_ssd_reset ack_drain_failed errno=%d",
+                    errno);
+            }
+            recover_ssd_after_failed_status(&reset_request);
+        }
         break;
     }
 
@@ -5281,6 +5781,15 @@ int main(int argc, char **argv)
         }
     }
 
+    if (restore_filelist_db_from_flash() != 0 ||
+        restore_metadata_files_from_flash() != 0) {
+        /* SPI1 is a best-effort persistence replica.  Do not prevent UART
+         * service or NVMe capture from starting when its filesystem or saved
+         * replica is damaged; the runtime database remains authoritative for
+         * this boot. */
+        LOG_WARN("SYSTEM", "SPI1 persisted storage state restore failed; continuing without flash restore");
+    }
+
     if (file_list_init(FILELIST_DB_PATH) != 0) {
         char cwd[PATH_MAX];
         LOG_ERROR("SYSTEM", "Failed to initialize file list database");
@@ -5349,7 +5858,8 @@ int main(int argc, char **argv)
                      storage->empty_sleep_us);
         }
     }
-    if (storage_health_start(probe_one_storage_channel, NULL, 5000u) != 0)
+    if (storage_health_start(probe_one_storage_channel, NULL,
+                             STORAGE_HEALTH_REFRESH_MS) != 0)
         LOG_ERROR("SYSTEM", "Failed to start background storage health service");
     dbg_printf("[DBG][MAIN] uart1=%s log_db=%s file_db=%s meta_dir=%s\n",
                serial_dev, LOG_DB_PATH, FILELIST_DB_PATH, get_storage_meta_dir());
@@ -5402,9 +5912,10 @@ int main(int argc, char **argv)
         check_task(&transfer_task);
         service_pending_network_stop();
         service_maintenance_job();
-        storage_health_set_busy(storage_any_live_worker() ||
+        storage_health_set_busy(storage_any_running() ||
                                 transfer_task.state == RUNNING ||
                                 g_maintenance_job.active);
+        service_pending_background_health_reset();
     }
 
     /* Unreachable for current daemon-style loop. */

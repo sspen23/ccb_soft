@@ -185,17 +185,6 @@ typedef struct {
     DmaStopReport *report;
 } StorageDmaQuiesceCall;
 
-typedef struct {
-    ChannelRuntime *rt;
-    uint32_t slot;
-} StorageDmaRequeueCall;
-
-static int storage_dma_requeue_action(void *opaque)
-{
-    StorageDmaRequeueCall *call = opaque;
-    return call ? dma_requeue_one(call->rt, call->slot) : -1;
-}
-
 static void storage_dma_latch_stop_action(void *opaque)
 {
     dma_latch_stop((ChannelRuntime *)opaque);
@@ -824,7 +813,7 @@ static bool storage_control_drain_requested(void)
     return g_storage_control_drain_latched;
 }
 
-static void storage_emit_line_impl(const char *fmt, ...)
+static void storage_emit_line_impl(bool mirror_console, const char *fmt, ...)
 {
     char line[2048];
     va_list ap;
@@ -848,6 +837,11 @@ static void storage_emit_line_impl(const char *fmt, ...)
         line[len++] = '\n';
     }
     line[len] = '\0';
+    /* When storage.elf is run interactively stdout is already the serial
+     * console.  Mirroring would print each critical line twice. */
+    if (mirror_console && !isatty(STDOUT_FILENO)) {
+        debug_uart_write(line, len);
+    }
     {
         ssize_t written = write(STDOUT_FILENO, line, len);
         (void)written;
@@ -857,7 +851,8 @@ static void storage_emit_line_impl(const char *fmt, ...)
 #define storage_emit_line(severity, fmt, ...) \
     do { \
         if (storage_log_enabled((severity))) \
-            storage_emit_line_impl((fmt), ##__VA_ARGS__); \
+            storage_emit_line_impl((severity) == STORAGE_LOG_ALWAYS_CRITICAL, \
+                                   (fmt), ##__VA_ARGS__); \
     } while (0)
 
 static uint32_t storage_idle_notice_ms(void) {
@@ -2113,6 +2108,24 @@ static bool storage_queue_latch_stop(StorageWriteQueue *q)
     (void)storage_requeue_gate_latch_stop(
         &q->requeue_gate, g_storage_stop_epoch,
         storage_dma_latch_stop_action, q->rt);
+
+    /* A cross-slot NVMe completion can be out of order.  Any completion that
+     * was waiting behind the DMA recycle frontier must be released now: DMA
+     * is latched and no further descriptor requeue is legal during STOP. */
+    pthread_mutex_lock(&q->lock);
+    for (uint32_t slot = 0u; slot < q->capacity; ++slot) {
+        if (storage_slot_state(&q->slots, slot) == STORAGE_SLOT_REQUEUE_PENDING &&
+            storage_local_slot_transition_locked(q, slot,
+                                                 STORAGE_SLOT_REQUEUE_PENDING,
+                                                 STORAGE_SLOT_FREE) != 0) {
+            storage_queue_fail_locked(q);
+            first = false;
+            break;
+        }
+    }
+    pthread_cond_broadcast(&q->not_full);
+    pthread_cond_broadcast(&q->not_empty);
+    pthread_mutex_unlock(&q->lock);
     return first;
 }
 
@@ -2858,10 +2871,96 @@ static void storage_stats_print_periodic(StorageProducerStats *stats,
     stats->next_log_us = now_us + (uint64_t)stats->interval_ms * 1000ull;
 }
 
+static int storage_requeue_ready_prefix(StorageWriteQueue *q)
+{
+    int rc = 0;
+
+    if (!q || !q->rt) return -1;
+
+    /* The AXI DMA tail pointer grants a contiguous descriptor prefix, not an
+     * arbitrary completed descriptor.  NVMe CQs may complete slots out of
+     * order, so serialize completion handling here and only requeue the slot
+     * at next_requeue_bd when it has reached REQUEUE_PENDING. */
+    pthread_mutex_lock(&q->requeue_gate.lock);
+    if (!q->requeue_gate.enabled) {
+        pthread_mutex_unlock(&q->requeue_gate.lock);
+        return 0;
+    }
+
+    while (1) {
+        uint32_t slot;
+        int requeue_errno;
+
+        pthread_mutex_lock(&q->lock);
+        if (!storage_worker_can_requeue(q->worker_state) || q->error ||
+            q->rt->dma_desc_count == 0u ||
+            q->rt->next_requeue_bd >= q->rt->dma_desc_count) {
+            pthread_mutex_unlock(&q->lock);
+            break;
+        }
+        slot = q->rt->next_requeue_bd;
+        if (storage_slot_state(&q->slots, slot) != STORAGE_SLOT_REQUEUE_PENDING) {
+            pthread_mutex_unlock(&q->lock);
+            break;
+        }
+        if (q->recycled_slot_count == UINT64_MAX) {
+            storage_queue_fail_locked(q);
+            pthread_mutex_unlock(&q->lock);
+            rc = -1;
+            break;
+        }
+        pthread_mutex_unlock(&q->lock);
+
+        errno = 0;
+        rc = dma_requeue_one(q->rt, slot);
+        requeue_errno = errno;
+
+        pthread_mutex_lock(&q->lock);
+        if (rc != 0) {
+            DmaBdSnapshot snapshot;
+            int snapshot_rc;
+
+            memset(&snapshot, 0, sizeof(snapshot));
+            snapshot_rc = dma_get_bd_snapshot_o1(q->rt, &q->slots.counts, &snapshot);
+            storage_emit_line(STORAGE_LOG_ALWAYS_CRITICAL,
+                              "storage_dma_requeue_error channel=%d task=%s file_index=%u"
+                              " slot=%u result=%d errno=%d snapshot_rc=%d"
+                              " s2mm_dmacr=0x%08x s2mm_dmasr=0x%08x"
+                              " curdesc=%u taildesc=%u dma_writable=%u"
+                              " completed_unharvested=%u ready_slots=%u"
+                              " nvme_busy_slots=%u requeue_pending=%u",
+                              q->rt->cfg ? q->rt->cfg->id : -1,
+                              q->task_no ? q->task_no : "unknown", q->file_index,
+                              slot, rc, requeue_errno, snapshot_rc,
+                              snapshot.s2mm_dmacr, snapshot.s2mm_dmasr,
+                              snapshot.curdesc_index, snapshot.taildesc_index,
+                              snapshot.dma_writable, snapshot.completed_unharvested,
+                              snapshot.ready_slots, snapshot.nvme_busy_slots,
+                              snapshot.requeue_pending);
+            storage_queue_fail_locked(q);
+            pthread_cond_broadcast(&q->not_full);
+            pthread_cond_broadcast(&q->not_empty);
+            pthread_mutex_unlock(&q->lock);
+            break;
+        }
+        if (storage_local_slot_transition_locked(q, slot, STORAGE_SLOT_REQUEUE_PENDING,
+                                                 STORAGE_SLOT_DMA_WRITABLE) != 0) {
+            storage_queue_fail_locked(q);
+            pthread_mutex_unlock(&q->lock);
+            rc = -1;
+            break;
+        }
+        ++q->recycled_slot_count;
+        pthread_cond_broadcast(&q->not_full);
+        pthread_mutex_unlock(&q->lock);
+    }
+
+    pthread_mutex_unlock(&q->requeue_gate.lock);
+    return rc;
+}
+
 static int storage_complete_slot(StorageWriteQueue *q, const PendingDdrSlot *item) {
     bool should_requeue;
-    StorageRequeueResult requeue_result;
-    StorageDmaRequeueCall requeue_call;
 
     if (!q || !item || item->slot >= q->capacity) {
         return -1;
@@ -2894,54 +2993,20 @@ static int storage_complete_slot(StorageWriteQueue *q, const PendingDdrSlot *ite
         q->buffered_bytes = 0u;
     }
     should_requeue = storage_worker_can_requeue(q->worker_state);
-    if (should_requeue && q->recycled_slot_count == UINT64_MAX) {
-        q->error = true;
-        pthread_mutex_unlock(&q->lock);
-        return -1;
-    }
     if (storage_local_slot_transition_locked(q, item->slot, STORAGE_SLOT_NVME_BUSY,
                                              should_requeue ? STORAGE_SLOT_REQUEUE_PENDING : STORAGE_SLOT_FREE) != 0) {
         pthread_mutex_unlock(&q->lock); return -1;
     }
     pthread_mutex_unlock(&q->lock);
 
-    if (should_requeue) {
-        requeue_call.rt = q->rt;
-        requeue_call.slot = item->slot;
-        /* No queue lock is held while the gate executes descriptor MMIO. */
-        requeue_result = storage_requeue_gate_run(
-            &q->requeue_gate, storage_dma_requeue_action, &requeue_call);
-
+    if (should_requeue && storage_requeue_ready_prefix(q) != 0) {
         pthread_mutex_lock(&q->lock);
-        if (requeue_result == STORAGE_REQUEUE_EXECUTED) {
-            if (storage_local_slot_transition_locked(
-                    q, item->slot, STORAGE_SLOT_REQUEUE_PENDING,
-                    STORAGE_SLOT_DMA_WRITABLE) != 0) {
-                pthread_mutex_unlock(&q->lock);
-                storage_fail_fatal(q);
-                return -1;
-            }
-            ++q->recycled_slot_count;
-        } else if (requeue_result == STORAGE_REQUEUE_STOPPED) {
-            if (storage_local_slot_transition_locked(
-                    q, item->slot, STORAGE_SLOT_REQUEUE_PENDING,
-                    STORAGE_SLOT_FREE) != 0) {
-                pthread_mutex_unlock(&q->lock);
-                storage_fail_fatal(q);
-                return -1;
-            }
-        } else {
-            storage_queue_fail_locked(q);
-            if (q->error_reason[0] == '\0')
-                (void)snprintf(q->error_reason, sizeof(q->error_reason),
-                               "%s", "dma_requeue_failed");
-            pthread_cond_broadcast(&q->not_full);
-            pthread_cond_broadcast(&q->not_empty);
-            pthread_mutex_unlock(&q->lock);
-            storage_fail_fatal(q);
-            return -1;
-        }
+        if (q->error_reason[0] == '\0')
+            (void)snprintf(q->error_reason, sizeof(q->error_reason),
+                           "%s", "dma_requeue_failed");
         pthread_mutex_unlock(&q->lock);
+        storage_fail_fatal(q);
+        return -1;
     }
     if (!should_requeue && q->rt && dma_requeue_after_stop_count(q->rt) != 0u) {
         storage_set_writer_error_reason(q, "requeue_after_stop_latched");
@@ -4764,6 +4829,15 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
             harvest_fatal = harvest_rc != 0;
             h = harvest_count != 0u ? 1 : (harvest_fatal ? -1 : 0);
             if (h < 0) {
+                DmaBdSnapshot harvest_snapshot;
+                int harvest_errno = errno;
+                int snapshot_rc;
+
+                memset(&harvest_snapshot, 0, sizeof(harvest_snapshot));
+                pthread_mutex_lock(&write_queue.lock);
+                snapshot_rc = dma_get_bd_snapshot_o1(&rt, &write_queue.slots.counts,
+                                                      &harvest_snapshot);
+                pthread_mutex_unlock(&write_queue.lock);
                 if ((rt.dma_last_completed_status & 0x70000000u) != 0u) {
                     ++producer_stats.descriptor_error_count;
                     storage_ring_event(&write_queue.producer_event_ring,
@@ -4783,6 +4857,27 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                                   cfg->id, args->task_no, (unsigned)effective_file_index,
                                   producer_stats.receive_integrity_risk,
                                   dma_received_bytes, rt.dma_last_completed_status);
+                storage_emit_line(STORAGE_LOG_ALWAYS_CRITICAL,
+                                  "storage_dma_harvest_error channel=%d task=%s file_index=%u"
+                                  " harvest_rc=%d errno=%d harvested_now=%u"
+                                  " last_bd=%u descriptor_status=0x%08x hw_owned=%u"
+                                  " snapshot_rc=%d s2mm_dmacr=0x%08x s2mm_dmasr=0x%08x"
+                                  " curdesc=%u taildesc=%u dma_writable=%u"
+                                  " completed_unharvested=%u ready_slots=%u"
+                                  " nvme_busy_slots=%u requeue_pending=%u",
+                                  cfg->id, args->task_no, (unsigned)effective_file_index,
+                                  harvest_rc, harvest_errno, harvest_count,
+                                  rt.dma_last_completed_bd, rt.dma_last_completed_status,
+                                  __atomic_load_n(&rt.dma_hw_desc_count, __ATOMIC_ACQUIRE),
+                                  snapshot_rc, harvest_snapshot.s2mm_dmacr,
+                                  harvest_snapshot.s2mm_dmasr,
+                                  harvest_snapshot.curdesc_index,
+                                  harvest_snapshot.taildesc_index,
+                                  harvest_snapshot.dma_writable,
+                                  harvest_snapshot.completed_unharvested,
+                                  harvest_snapshot.ready_slots,
+                                  harvest_snapshot.nvme_busy_slots,
+                                  harvest_snapshot.requeue_pending);
                 storage_emit_event(STORAGE_WORKER_FATAL, &rt,
                                    STORAGE_ERR_DMA_DESCRIPTOR, dma_received_bytes,
                                    producer_stats.receive_integrity_risk);
