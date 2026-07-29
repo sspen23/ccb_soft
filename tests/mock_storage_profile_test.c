@@ -31,17 +31,16 @@ static void test_quiet_qd16_defaults(void)
     clear_primary_config();
     assert(storage_config_load(&config, error, sizeof(error)) == 0);
     assert(strcmp(config.uart_device, "/dev/ttyUL1") == 0);
-    assert(config.storage_profile ==
-           STORAGE_PROFILE_CROSS_SLOT_QD16_EXPERIMENTAL);
+    assert(config.storage_profile == STORAGE_PROFILE_CROSS_SLOT_EXPERIMENTAL);
     assert(!config.log_enabled);
     assert(config.log_level == CCB_LOG_ERROR);
     assert(config.status_timeout_ms == 100u);
     assert(config.first_data_timeout_ms == 5000u);
     assert(!config.perf_enabled && !config.dump_diag_on_error);
     assert(config.channels[0].writer_mode == STORAGE_WRITER_CROSS_SLOT);
-    assert(config.channels[0].nvme_qd == 16u);
+    assert(config.channels[0].nvme_qd == 8u);
     assert(config.channels[0].max_active_slots == 4u);
-    assert(config.channels[0].cq_batch == 16u);
+    assert(config.channels[0].cq_batch == 8u);
     assert(config.channels[0].descriptor_bytes == 8u * 1024u * 1024u);
     assert(config.channels[0].command_bytes == 512u * 1024u);
     assert(!config.channels[0].writer_realtime);

@@ -12,6 +12,8 @@
 #define TCP_DDR_CPU_BASE_DEFAULT        0x10000000ull
 #define TCP_DDR_DMA_BASE_DEFAULT        0x00000000ull
 #define TCP_MAX_BYTES_PER_DESC          (16u * 1024u * 1024u)
+/* ch0/ch1 fill one TCP buffer with two independent 8 MiB SSD reads. */
+#define SSD_READ_BYTES_PER_CHUNK_HIGH   (8u * 1024u * 1024u)
 
 /* Static channel configuration table defined in src/ccb_config.c. */
 extern const ChannelConfig kChannels[NUM_CHANNELS];

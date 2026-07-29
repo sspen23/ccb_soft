@@ -46,6 +46,7 @@ static void nvme_set_last_error(ChannelRuntime *rt, const char *reason);
 #define NVME_CMD_KIB_DEFAULT 256u
 #define NVME_CMD_KIB_HIGH_DEFAULT 1024u
 #define NVME_CMD_KIB_MAX 4096u
+#define NVME_READ_CMD_KIB 4u
 #define NVME_QD_DEFAULT 4u
 #define NVME_QD_HIGH_DEFAULT 8u
 #define NVME_QD_SAFETY_MAX 32u
@@ -230,6 +231,11 @@ static int hw_env_flag_enabled(const char *name) {
     return 1;
 }
 
+static bool nvme_read_trace_enabled(const ChannelRuntime *rt)
+{
+    return rt && rt->cfg && hw_env_flag_enabled("SRC_REAL_NVME_READ_TRACE") != 0;
+}
+
 static bool nvme_cmd_kib_allowed(uint32_t kib) {
     return kib == 256u || kib == 512u || kib == 1024u || kib == 2048u || kib == 4096u;
 }
@@ -249,6 +255,12 @@ uint32_t nvme_default_qd_for_channel(int channel_id) {
         return NVME_QD_HIGH_DEFAULT;
     }
     return NVME_QD_DEFAULT;
+}
+
+uint32_t nvme_read_command_sectors(const ChannelRuntime *rt)
+{
+    (void)rt;
+    return NVME_READ_CMD_KIB * 1024u / NVME_SECTOR_BYTES;
 }
 
 static uint32_t channel_default_nvme_qd(const ChannelRuntime *rt) {
@@ -1091,6 +1103,9 @@ int nvme_submit_command_async(ChannelRuntime *rt,
                               uint64_t hw_addr) {
     uint64_t submit_start_us;
     uint64_t pending_start_us;
+    uint32_t tx_status_before;
+    uint32_t ctx0;
+    bool trace;
 
     if (!rt || sectors == 0u || sectors > UINT16_MAX) {
         return NVME_SUBMIT_NOT_ACCEPTED;
@@ -1101,12 +1116,15 @@ int nvme_submit_command_async(ChannelRuntime *rt,
     if (nvme_stop_requested()) {
         return NVME_SUBMIT_STOPPED_BEFORE_DOORBELL;
     }
-    if ((reg_read32(&rt->nvme, QUEUE_REG_OFFSET + QUEUE_TX_STATUS) & QUEUE_SQ_FIFO_FULL) != 0u) {
+    tx_status_before = reg_read32(&rt->nvme, QUEUE_REG_OFFSET + QUEUE_TX_STATUS);
+    if ((tx_status_before & QUEUE_SQ_FIFO_FULL) != 0u) {
         rt->nvme_submit_sq_full_count++;
         return NVME_SUBMIT_RETRY_SQ_FULL;
     }
 
     submit_start_us = wall_time_us();
+    ctx0 = ((uint32_t)(sectors - 1u) << 16u) | opcode;
+    trace = opcode == NVM_READ && nvme_read_trace_enabled(rt);
     rt->nvme_submit_calls++;
     dbg_verbose_printf("[DBG][NVME] async submit ch=%d cid=%u op=%s lba=0x%08" PRIx64
                        " sectors=%u hw=0x%08" PRIx64 "\n",
@@ -1116,9 +1134,32 @@ int nvme_submit_command_async(ChannelRuntime *rt,
                        lba,
                        (unsigned)sectors,
                        hw_addr);
-    reg_write32(&rt->nvme,
-                QUEUE_REG_OFFSET + QUEUE_CTX0,
-                ((uint32_t)(sectors - 1u) << 16u) | opcode);
+    if (trace) {
+        printf("nvme_read_trace event=submit channel=%d ts_us=%" PRIu64
+               " cid=%u opcode=0x%02x slba=0x%08" PRIx64
+               " sectors=%u bytes=%" PRIu64 " prp1=0x%08" PRIx64
+               " ddr_end=0x%08" PRIx64 " ctx0=0x%08x ctx1=0x%08x"
+               " prp1_l=0x%08x prp1_h=0x%08x lba_l=0x%08x lba_h=0x%08x"
+               " tx_status_before=0x%08x\n",
+               rt->cfg->id,
+               submit_start_us,
+               (unsigned)cid,
+               (unsigned)opcode,
+               lba,
+               (unsigned)sectors,
+               (uint64_t)sectors * NVME_SECTOR_BYTES,
+               hw_addr,
+               hw_addr + (uint64_t)sectors * NVME_SECTOR_BYTES,
+               ctx0,
+               (unsigned)cid,
+               (uint32_t)(hw_addr & 0xffffffffull),
+               (uint32_t)(hw_addr >> 32u),
+               (uint32_t)(lba & 0xffffffffull),
+               (uint32_t)(lba >> 32u),
+               tx_status_before);
+        fflush(stdout);
+    }
+    reg_write32(&rt->nvme, QUEUE_REG_OFFSET + QUEUE_CTX0, ctx0);
     reg_write32(&rt->nvme, QUEUE_REG_OFFSET + QUEUE_CTX1, cid);
     reg_write32(&rt->nvme, QUEUE_REG_OFFSET + QUEUE_PRP1_L, (uint32_t)(hw_addr & 0xFFFFFFFFull));
     reg_write32(&rt->nvme, QUEUE_REG_OFFSET + QUEUE_PRP1_H, (uint32_t)(hw_addr >> 32u));
@@ -1164,6 +1205,16 @@ int nvme_submit_command_async(ChannelRuntime *rt,
         rt->nvme_submit_pending_wait_us += elapsed_us_since(pending_start_us);
         rt->nvme_submit_total_us += submit_us;
         nvme_record_submit_stall(rt, submit_us);
+    }
+    if (trace) {
+        printf("nvme_read_trace event=accepted channel=%d ts_us=%" PRIu64
+               " cid=%u tx_status_after=0x%08x int_status=0x%08x\n",
+               rt->cfg->id,
+               wall_time_us(),
+               (unsigned)cid,
+               reg_read32(&rt->nvme, QUEUE_REG_OFFSET + QUEUE_TX_STATUS),
+               reg_read32(&rt->nvme, QUEUE_REG_OFFSET + QUEUE_INT_STATUS));
+        fflush(stdout);
     }
     {
         uint64_t zero = 0u;
@@ -3511,35 +3562,23 @@ int channel_runtime_open(ChannelRuntime *rt, const ChannelConfig *cfg, GlobalOpt
 #else
     {
         int fd = open("/dev/mem", O_RDWR | O_SYNC);
+        bool legacy_cpu_ddr_map = hw_env_flag_enabled("SRC_REAL_LEGACY_CPU_DDR_MAP") != 0;
+        uint64_t ddr_mmap_bytes = 0u;
+
         if (fd < 0) {
             fprintf(stderr, "Failed to open /dev/mem, errno=%d (%s)\n", errno, strerror(errno));
             return -1;
         }
         /*
-         * Map all per-channel regions:
-         * DMA, switch, NVMe host, descriptor BRAM, DDR data window.
+         * The live data DDR is not CPU-accessible on this platform.  Normal
+         * storage/download operation maps only control MMIO and descriptor
+         * BRAM; the legacy CPU-DDR mapping is explicitly opt-in for older
+         * hardware only and is never needed by the network diagnostics.
          */
-        uint64_t ddr_mmap_bytes = channel_ddr_mmap_bytes(cfg);
-        if (ddr_mmap_bytes > (uint64_t)SIZE_MAX) {
-            fprintf(stderr,
-                    "DDR mmap size too large for userspace: channel=%d size=%" PRIu64 "\n",
-                    cfg->id,
-                    ddr_mmap_bytes);
-            close(fd);
-            return -1;
-        }
-        if (ddr_mmap_bytes < cfg->ddr_cpu_size) {
-            dbg_verbose_printf("[DBG][HW] DDR mmap capped ch=%d map=%" PRIu64
-                               " total=%" PRIu64 "\n",
-                               cfg->id,
-                               ddr_mmap_bytes,
-                               cfg->ddr_cpu_size);
-        }
         if (map_region(fd, cfg->dma_base, 0x10000u, &rt->dma) != 0 ||
             map_region(fd, cfg->axis_switch_base, 0x10000u, &rt->axis_switch) != 0 ||
             map_region(fd, cfg->nvme_base, 0x10000u, &rt->nvme) != 0 ||
-            map_region(fd, cfg->desc_cpu_base, (size_t)cfg->desc_cpu_size, &rt->desc) != 0 ||
-            map_region(fd, cfg->ddr_cpu_base, (size_t)ddr_mmap_bytes, &rt->ddr) != 0) {
+            map_region(fd, cfg->desc_cpu_base, (size_t)cfg->desc_cpu_size, &rt->desc) != 0) {
             unmap_region(&rt->ddr);
             unmap_region(&rt->desc);
             unmap_region(&rt->nvme);
@@ -3548,11 +3587,26 @@ int channel_runtime_open(ChannelRuntime *rt, const ChannelConfig *cfg, GlobalOpt
             close(fd);
             return -1;
         }
+        if (legacy_cpu_ddr_map) {
+            ddr_mmap_bytes = channel_ddr_mmap_bytes(cfg);
+            if (ddr_mmap_bytes > (uint64_t)SIZE_MAX ||
+                map_region(fd, cfg->ddr_cpu_base, (size_t)ddr_mmap_bytes, &rt->ddr) != 0) {
+                unmap_region(&rt->ddr);
+                unmap_region(&rt->desc);
+                unmap_region(&rt->nvme);
+                unmap_region(&rt->axis_switch);
+                unmap_region(&rt->dma);
+                close(fd);
+                return -1;
+            }
+        }
         rt->dma.fd = fd;
         rt->axis_switch.fd = fd;
         rt->nvme.fd = fd;
         rt->desc.fd = fd;
-        rt->ddr.fd = fd;
+        if (rt->ddr.valid) {
+            rt->ddr.fd = fd;
+        }
     }
     return 0;
 #endif
@@ -3789,20 +3843,41 @@ static int nvme_issue_one_sync(ChannelRuntime *rt,
                 (unsigned)completion.status_code);
         return -1;
     }
+    if (opcode == NVM_READ && nvme_read_trace_enabled(rt)) {
+        printf("nvme_read_trace event=completion channel=%d ts_us=%" PRIu64
+               " cid=%u cq_raw=0x%08x cq_status=0x%04x cq_status_code=0x%02x"
+               " tx_status=0x%08x int_status=0x%08x\n",
+               rt->cfg->id,
+               wall_time_us(),
+               (unsigned)cid,
+               completion.raw,
+               (unsigned)completion.status,
+               (unsigned)completion.status_code,
+               reg_read32(&rt->nvme, QUEUE_REG_OFFSET + QUEUE_TX_STATUS),
+               reg_read32(&rt->nvme, QUEUE_REG_OFFSET + QUEUE_INT_STATUS));
+        fflush(stdout);
+    }
     return 0;
 }
 
 int nvme_rw(ChannelRuntime *rt, bool is_write, uint64_t lba, uint64_t sectors, uint64_t hw_addr) {
-    uint64_t max_sectors = rt->nvme_cmd_sectors;
+    uint64_t max_sectors = is_write ? rt->nvme_cmd_sectors
+                                    : nvme_read_command_sectors(rt);
     uint64_t submitted = 0u;
     uint64_t cur_lba = lba;
     uint64_t cur_hw = hw_addr;
+    uint64_t command_index = 0u;
+    bool trace;
 
     if (max_sectors == 0u) {
         max_sectors = NVME_CMD_KIB_DEFAULT * 1024u / NVME_SECTOR_BYTES;
     }
-    /* Preserve the legacy environment variable as an optional reducing cap. */
-    max_sectors = env_u64_limit("CCB_NVME_MAX_SECTORS", max_sectors, max_sectors);
+    /* The legacy cap belongs to the write scheduler.  Reads are deliberately
+     * fixed at 4 KiB so a read-only diagnostic does not alter write commands. */
+    if (is_write) {
+        max_sectors = env_u64_limit("CCB_NVME_MAX_SECTORS", max_sectors, max_sectors);
+    }
+    trace = !is_write && nvme_read_trace_enabled(rt);
     dbg_verbose_printf("[DBG][NVME] rw start ch=%d op=%s lba=0x%08" PRIx64
                        " sectors=%" PRIu64 " hw=0x%08" PRIx64
                        " max_sectors=%" PRIu64 " max_dts=%u block=%u\n",
@@ -3833,6 +3908,22 @@ int nvme_rw(ChannelRuntime *rt, bool is_write, uint64_t lba, uint64_t sectors, u
             return -2;
         }
 
+        if (trace) {
+            printf("nvme_read_trace event=command channel=%d command_index=%" PRIu64
+                   " slba=0x%08" PRIx64 " sectors=%u bytes=%" PRIu64
+                   " prp1=0x%08" PRIx64 " next_slba=0x%08" PRIx64
+                   " next_prp1=0x%08" PRIx64 "\n",
+                   rt->cfg->id,
+                   command_index,
+                   cur_lba,
+                   (unsigned)this_sectors,
+                   (uint64_t)this_sectors * NVME_SECTOR_BYTES,
+                   cur_hw,
+                   cur_lba + this_sectors,
+                   cur_hw + (uint64_t)this_sectors * NVME_SECTOR_BYTES);
+            fflush(stdout);
+        }
+
         issue_rc = nvme_issue_one_sync(rt, NVM_READ, cur_lba, this_sectors, cur_hw);
         if (issue_rc != 0) {
             if (issue_rc == NVME_SUBMIT_STOPPED_BEFORE_DOORBELL) {
@@ -3852,6 +3943,7 @@ int nvme_rw(ChannelRuntime *rt, bool is_write, uint64_t lba, uint64_t sectors, u
         submitted += this_sectors;
         cur_lba += this_sectors;
         cur_hw += this_sectors * (uint64_t)NVME_SECTOR_BYTES;
+        ++command_index;
     }
     dbg_verbose_printf("[DBG][NVME] rw done ch=%d op=%s lba=0x%08" PRIx64
                        " sectors=%" PRIu64 " hw=0x%08" PRIx64 "\n",

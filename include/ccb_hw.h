@@ -37,6 +37,8 @@ int nvme_stop_requested(void);
 
 /* Submit segmented NVMe read/write covering the requested sector range. */
 int nvme_rw(ChannelRuntime *rt, bool is_write, uint64_t lba, uint64_t sectors, uint64_t hw_addr);
+/* Read commands intentionally use a smaller diagnostic transfer size than writes. */
+uint32_t nvme_read_command_sectors(const ChannelRuntime *rt);
 /* The return value follows NvmeSubmitResult.  Once the doorbell is written,
  * STOP and timeout are acceptance-unknown, never ordinary cancellation. */
 int nvme_submit_command_async(ChannelRuntime *rt, uint8_t opcode,

@@ -47,7 +47,6 @@
 #include "storage_health.h"
 #include "storage_controller.h"
 #include "storage_process.h"
-#include "ssd_reset.h"
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
@@ -93,9 +92,6 @@
 #define NETWORK_SEND_ARG "network-send"
 #define STORAGE_TASK_COUNT NUM_CHANNELS
 #define NETWORK_DDR_OFFSET_BYTES (4u * 1024u)
-#define STORAGE_HEALTH_REFRESH_MS 5000u
-#define STORAGE_HEALTH_MAX_AGE_US 15000000ull
-#define STORAGE_HEALTH_RESET_COOLDOWN_US 30000000ull
 
 #ifndef FILE_LIST_READ
 #define FILE_LIST_READ 0x11
@@ -1808,7 +1804,6 @@ static int storage_post_commit_reset_dma(const char *task_id,
                               config->status_timeout_ms <= UINT32_MAX / 1000u
                           ? config->status_timeout_ms * 1000u
                           : DEFAULT_TIMEOUT_US;
-    storage_health_set_busy(true);
     for (channel = 0u; channel < NUM_CHANNELS; ++channel) {
         const ChannelConfig *cfg;
         ChannelRuntime rt;
@@ -3158,6 +3153,87 @@ static void network_pipeline_set_error(NetworkPipelineCtx *ctx, int rc)
     pthread_mutex_unlock(&ctx->lock);
 }
 
+static int network_read_ssd_chunk(ChannelRuntime *rt,
+                                  const ChannelConfig *cfg,
+                                  uint64_t start_lba,
+                                  uint64_t read_bytes,
+                                  uint64_t ddr_hw,
+                                  uint32_t send_chunk_index)
+{
+    uint64_t remaining_bytes = read_bytes;
+    uint64_t cur_lba = start_lba;
+    uint64_t ddr_offset = 0u;
+    uint64_t read_chunk_bytes = TCP_MAX_BYTES_PER_DESC;
+    uint32_t read_index = 0u;
+
+    if (!rt || !cfg || read_bytes == 0u || (read_bytes % SECTOR_SIZE) != 0u) {
+        return -1;
+    }
+    if (cfg->id == HIGH_I_CHANNEL_ID || cfg->id == HIGH_Q_CHANNEL_ID) {
+        read_chunk_bytes = SSD_READ_BYTES_PER_CHUNK_HIGH;
+    }
+
+    while (remaining_bytes > 0u) {
+        uint64_t this_bytes = remaining_bytes > read_chunk_bytes
+                                  ? read_chunk_bytes : remaining_bytes;
+        uint64_t this_sectors = bytes_to_sectors(this_bytes);
+        int read_rc;
+
+        if (this_sectors == 0u || this_sectors > UINT32_MAX ||
+            ddr_offset > UINT64_MAX - ddr_hw) {
+            return -1;
+        }
+        if (env_flag_enabled("SRC_REAL_NETWORK_ADDR_TRACE")) {
+            printf("network_addr_trace event=ssd_read_part channel=%d send_chunk=%u"
+                   " read_part=%u slba=0x%08" PRIx64 " sectors=%" PRIu64
+                   " bytes=%" PRIu64 " ddr=0x%08" PRIx64
+                   " next_slba=0x%08" PRIx64 " next_ddr=0x%08" PRIx64 "\n",
+                   cfg->id,
+                   (unsigned)send_chunk_index,
+                   (unsigned)read_index,
+                   cur_lba,
+                   this_sectors,
+                   this_bytes,
+                   ddr_hw + ddr_offset,
+                   cur_lba + this_sectors,
+                   ddr_hw + ddr_offset + this_bytes);
+            fflush(stdout);
+        }
+        dbg_printf("[DBG][NET] ssd read chunk=%u part=%u lba=0x%08" PRIx64
+                   " ddr=0x%08" PRIx64 " bytes=%" PRIu64 " sectors=%" PRIu64 "\n",
+                   (unsigned)send_chunk_index,
+                   (unsigned)read_index,
+                   cur_lba,
+                   ddr_hw + ddr_offset,
+                   this_bytes,
+                   this_sectors);
+        read_rc = nvme_rw(rt, false, cur_lba, this_sectors, ddr_hw + ddr_offset);
+        if (read_rc != 0) {
+            return read_rc;
+        }
+        cur_lba += this_sectors;
+        ddr_offset += this_bytes;
+        remaining_bytes -= this_bytes;
+        ++read_index;
+    }
+    if (env_flag_enabled("SRC_REAL_NETWORK_ADDR_TRACE")) {
+        printf("network_addr_trace event=ssd_read_group_complete channel=%d send_chunk=%u"
+               " start_slba=0x%08" PRIx64 " end_slba=0x%08" PRIx64
+               " ddr_start=0x%08" PRIx64 " ddr_end=0x%08" PRIx64
+               " bytes=%" PRIu64 " parts=%u\n",
+               cfg->id,
+               (unsigned)send_chunk_index,
+               start_lba,
+               cur_lba,
+               ddr_hw,
+               ddr_hw + read_bytes,
+               read_bytes,
+               (unsigned)read_index);
+        fflush(stdout);
+    }
+    return 0;
+}
+
 static void *network_read_thread(void *arg)
 {
     NetworkPipelineCtx *ctx = (NetworkPipelineCtx *)arg;
@@ -3173,7 +3249,8 @@ static void *network_read_thread(void *arg)
         uint64_t send_bytes = chunk_bytes;
         uint64_t file_offset = (uint64_t)chunk_index * ctx->max_payload_bytes;
         uint64_t sectors_before = file_offset / (uint64_t)SECTOR_SIZE;
-        uint64_t read_cmd_sectors = ctx->read_cmd_sectors ? ctx->read_cmd_sectors : 512u;
+        uint64_t read_cmd_sectors = ctx->read_cmd_sectors ? ctx->read_cmd_sectors :
+                                                   nvme_read_command_sectors(ctx->rt);
         uint64_t cmd_first = sectors_before / read_cmd_sectors;
         uint64_t cmd_count = (read_sectors + read_cmd_sectors - 1u) / read_cmd_sectors;
         uint64_t cmd_last = cmd_first + (cmd_count ? cmd_count - 1u : 0u);
@@ -3280,7 +3357,8 @@ static void *network_read_thread(void *arg)
         }
 #endif
 
-        read_rc = nvme_rw(ctx->rt, false, cur_lba, read_sectors, network_ddr_hw);
+        read_rc = network_read_ssd_chunk(ctx->rt, ctx->cfg, cur_lba, read_bytes,
+                                          network_ddr_hw, chunk_index);
         if (read_rc == -2) {
             dbg_printf("[DBG][NET] nvme read stopped task=%s idx=%u chunk=%u lba=0x%08" PRIx64 "\n",
                        ctx->task_no,
@@ -3368,6 +3446,18 @@ static void *network_send_thread(void *arg)
             return NULL;
         }
         tcp_cfg.ddr_dma_base = slot_copy.ddr_hw;
+        if (env_flag_enabled("SRC_REAL_NETWORK_ADDR_TRACE")) {
+            printf("network_addr_trace event=tcp_send channel=%d send_chunk=%u"
+                   " ddr=0x%08" PRIx64 " bytes=%" PRIu64
+                   " desc_cpu=0x%08" PRIx64 " desc_dma=0x%08" PRIx64 "\n",
+                   ctx->cfg->id,
+                   (unsigned)slot_copy.chunk_index,
+                   tcp_cfg.ddr_dma_base,
+                   tcp_cfg.transfer_bytes,
+                   tcp_cfg.desc_cpu_base,
+                   tcp_cfg.desc_dma_base);
+            fflush(stdout);
+        }
         chunk_start_us = system_wall_time_us();
         dbg_verbose_printf("[DBG][NET] tcp route chunk=%u slot=%u ch=%d dma=0x%08" PRIx64
                            " switch=0x%08" PRIx64 " input=%u desc_cpu=0x%08" PRIx64
@@ -3459,7 +3549,7 @@ static int network_send_serial(const ParsedArgs *args,
     }
     remaining_bytes = rec->file_size;
     cur_lba = (uint64_t)rec->start_sector;
-    read_cmd_sectors = rt->nvme_cmd_sectors ? rt->nvme_cmd_sectors : 512u;
+    read_cmd_sectors = nvme_read_command_sectors(rt);
     total_chunks = (uint32_t)((rec->file_size + max_payload_bytes - 1u) / max_payload_bytes);
 
     while (remaining_bytes > 0u) {
@@ -3589,7 +3679,8 @@ static int network_send_serial(const ParsedArgs *args,
         }
 #endif
 
-        read_rc = nvme_rw(rt, false, cur_lba, read_sectors, network_ddr_hw);
+        read_rc = network_read_ssd_chunk(rt, cfg, cur_lba, read_bytes,
+                                         network_ddr_hw, chunk_index);
         if (read_rc == -2) {
             dbg_printf("[DBG][NET] nvme read stopped task=%s idx=%u chunk=%u lba=0x%08" PRIx64 "\n",
                        args->task_no,
@@ -3625,6 +3716,18 @@ static int network_send_serial(const ParsedArgs *args,
             break;
         }
         tcp_cfg.ddr_dma_base = network_ddr_hw;
+        if (env_flag_enabled("SRC_REAL_NETWORK_ADDR_TRACE")) {
+            printf("network_addr_trace event=tcp_send channel=%d send_chunk=%u"
+                   " ddr=0x%08" PRIx64 " bytes=%" PRIu64
+                   " desc_cpu=0x%08" PRIx64 " desc_dma=0x%08" PRIx64 "\n",
+                   cfg->id,
+                   (unsigned)chunk_index,
+                   tcp_cfg.ddr_dma_base,
+                   tcp_cfg.transfer_bytes,
+                   tcp_cfg.desc_cpu_base,
+                   tcp_cfg.desc_dma_base);
+            fflush(stdout);
+        }
 
         send_rc = tcp_transfer_send(&tcp_cfg);
         if (send_rc == -2) {
@@ -3685,6 +3788,155 @@ static int network_send_serial(const ParsedArgs *args,
     return rc;
 }
 
+static int network_diag_read(ChannelRuntime *rt,
+                             const ChannelConfig *cfg,
+                             uint64_t lba,
+                             uint64_t ddr_hw,
+                             uint64_t bytes,
+                             const char *label)
+{
+    uint64_t sectors = bytes_to_sectors(bytes);
+
+    if (!rt || !cfg || bytes == 0u || (bytes % SECTOR_SIZE) != 0u ||
+        !nvme_lba_range_valid(rt, lba, sectors)) {
+        return -1;
+    }
+    printf("network_diag event=read label=%s channel=%d slba=0x%08" PRIx64
+           " sectors=%" PRIu64 " bytes=%" PRIu64 " ddr=0x%08" PRIx64 "\n",
+           label ? label : "unknown",
+           cfg->id,
+           lba,
+           sectors,
+           bytes,
+           ddr_hw);
+    fflush(stdout);
+    return nvme_rw(rt, false, lba, sectors, ddr_hw);
+}
+
+static int network_diag_send(const ChannelConfig *cfg,
+                             GlobalOptions gopt,
+                             uint64_t ddr_hw,
+                             uint64_t bytes,
+                             const char *label)
+{
+    TcpTransferConfig tcp_cfg;
+
+    if (!cfg || bytes == 0u || bytes > TCP_MAX_BYTES_PER_DESC) {
+        return -1;
+    }
+    tcp_transfer_default_config(&tcp_cfg, bytes, gopt);
+    if (configure_tcp_for_channel(cfg, &tcp_cfg) != 0) {
+        return -1;
+    }
+    tcp_cfg.ddr_dma_base = ddr_hw;
+    printf("network_diag event=send label=%s channel=%d ddr=0x%08" PRIx64
+           " bytes=%" PRIu64 " desc_cpu=0x%08" PRIx64 " desc_dma=0x%08" PRIx64 "\n",
+           label ? label : "unknown",
+           cfg->id,
+           ddr_hw,
+           bytes,
+           tcp_cfg.desc_cpu_base,
+           tcp_cfg.desc_dma_base);
+    fflush(stdout);
+    return tcp_transfer_send(&tcp_cfg);
+}
+
+/*
+ * Controlled read/send experiments.  All addresses are hardware-view DDR
+ * addresses; this path never maps or inspects the DDR payload from the CPU.
+ * Return 1 when no diagnostic mode is requested, 0 on a completed test, and
+ * a negative value on failure.
+ */
+static int network_run_download_diagnostic(const FileRecord *rec,
+                                           const ChannelConfig *cfg,
+                                           ChannelRuntime *rt,
+                                           GlobalOptions gopt)
+{
+    const char *mode = storage_config_compat_getenv("SRC_REAL_NETWORK_DIAG_MODE");
+    const uint64_t read_bytes = SSD_READ_BYTES_PER_CHUNK_HIGH;
+    const uint64_t send_bytes = TCP_MAX_BYTES_PER_DESC;
+    const uint64_t read_sectors = read_bytes / SECTOR_SIZE;
+    const uint64_t send_sectors = send_bytes / SECTOR_SIZE;
+    const uint64_t ddr_base = cfg ? cfg->ddr_hw_base + NETWORK_DDR_OFFSET_BYTES : 0u;
+    int rc;
+
+    if (!mode || mode[0] == '\0') {
+        return 1;
+    }
+    if (!rec || !cfg || !rt || rec->file_size < read_bytes ||
+        ddr_base > UINT64_MAX - send_bytes) {
+        return -1;
+    }
+    printf("network_diag event=start mode=%s channel=%d base_lba=0x%08" PRIx64
+           " ddr=0x%08" PRIx64 " read_bytes=%" PRIu64 " send_bytes=%" PRIu64 "\n",
+           mode,
+           cfg->id,
+           (uint64_t)rec->start_sector,
+           ddr_base,
+           read_bytes,
+           send_bytes);
+    fflush(stdout);
+
+    if (strcmp(mode, "A") == 0) {
+        if (rec->file_size < send_bytes ||
+            !nvme_lba_range_valid(rt, (uint64_t)rec->start_sector, send_sectors)) {
+            return -1;
+        }
+        rc = network_diag_read(rt, cfg, (uint64_t)rec->start_sector,
+                               ddr_base, send_bytes, "A_read_16m");
+        if (rc != 0) return rc;
+        rc = network_diag_send(cfg, gopt, ddr_base, send_bytes, "A_send_16m");
+        if (rc != 0) return rc;
+        rc = network_diag_send(cfg, gopt, ddr_base, read_bytes, "A_send_first_8m");
+        if (rc != 0) return rc;
+        return network_diag_send(cfg, gopt, ddr_base + read_bytes,
+                                 read_bytes, "A_send_second_8m");
+    }
+    if (strcmp(mode, "B") == 0) {
+        rc = network_diag_read(rt, cfg, (uint64_t)rec->start_sector,
+                               ddr_base, read_bytes, "B_read_a");
+        if (rc != 0) return rc;
+        rc = network_diag_read(rt, cfg, (uint64_t)rec->start_sector,
+                               ddr_base + read_bytes, read_bytes, "B_read_b_same_lba");
+        if (rc != 0) return rc;
+        rc = network_diag_send(cfg, gopt, ddr_base, read_bytes, "B_send_a");
+        if (rc != 0) return rc;
+        return network_diag_send(cfg, gopt, ddr_base + read_bytes,
+                                 read_bytes, "B_send_b");
+    }
+    if (strcmp(mode, "C") == 0) {
+        if (rec->file_size < send_bytes ||
+            !nvme_lba_range_valid(rt, (uint64_t)rec->start_sector + read_sectors,
+                                  read_sectors)) {
+            return -1;
+        }
+        rc = network_diag_read(rt, cfg, (uint64_t)rec->start_sector,
+                               ddr_base, read_bytes, "C_read_a");
+        if (rc != 0) return rc;
+        rc = network_diag_send(cfg, gopt, ddr_base, read_bytes, "C_send_a");
+        if (rc != 0) return rc;
+        rc = network_diag_read(rt, cfg, (uint64_t)rec->start_sector + read_sectors,
+                               ddr_base, read_bytes, "C_read_b_same_ddr");
+        if (rc != 0) return rc;
+        return network_diag_send(cfg, gopt, ddr_base, read_bytes, "C_send_b");
+    }
+    if (strcmp(mode, "D") == 0) {
+        if (rec->file_size < send_bytes ||
+            !nvme_lba_range_valid(rt, (uint64_t)rec->start_sector, send_sectors)) {
+            return -1;
+        }
+        printf("network_diag event=mode_d note=nvme_reads_fixed_at_4k\n");
+        fflush(stdout);
+        rc = network_diag_read(rt, cfg, (uint64_t)rec->start_sector,
+                               ddr_base, send_bytes, "D_read_16m");
+        if (rc != 0) return rc;
+        return network_diag_send(cfg, gopt, ddr_base, send_bytes, "D_send_16m");
+    }
+
+    fprintf(stderr, "Unsupported SRC_REAL_NETWORK_DIAG_MODE=%s; use A, B, C, or D\n", mode);
+    return -1;
+}
+
 static int network_send_existing_file(const ParsedArgs *args, GlobalOptions gopt)
 {
     FileRecord rec;
@@ -3700,6 +3952,7 @@ static int network_send_existing_file(const ParsedArgs *args, GlobalOptions gopt
     uint32_t requested_pipeline_slots;
     uint32_t available_pipeline_slots;
     uint32_t chunk_index = 0u;
+    int diagnostic_rc;
     int rc = -1;
 
     if (!args || !args->has_task_no || !args->has_file_index || !args->has_proto_file_type) {
@@ -3769,16 +4022,15 @@ static int network_send_existing_file(const ParsedArgs *args, GlobalOptions gopt
         return -1;
     }
     /*
-     * Keep one TCP MM2S transaction equal to one source frame.  The downstream
-     * TCP path sees TLAST from the DMA EOF bit, so batching multiple 16 MiB
-     * frames into one 64 MiB DMA transaction would only produce one TLAST.
+     * Keep one TCP MM2S transaction equal to one 16 MiB download packet.  On
+     * ch0/ch1 the packet is filled by two 8 MiB SSD reads before it is sent.
      */
     max_payload_bytes = TCP_MAX_BYTES_PER_DESC;
     /*
-     * The download pipeline only needs a few low-address DDR slots for
-     * double/triple buffering.  Keep the default window inside the CPU-visible
-     * DDR aperture because ch2 high DDR addresses have shown wrap/repeat-like
-     * behavior in the TCP/NVMe download path.
+     * The download pipeline only needs a few low-address hardware DDR slots
+     * for double/triple buffering.  ddr_cpu_size is historical configuration
+     * metadata used here as the default low-address window; the data DDR is
+     * not CPU-accessible on this platform.
      */
     network_ring_bytes = cfg->ddr_cpu_size;
     if (network_ring_bytes == 0u || network_ring_bytes > cfg->dma_ring_bytes) {
@@ -3834,6 +4086,11 @@ static int network_send_existing_file(const ParsedArgs *args, GlobalOptions gopt
     if (rt.nvme_max_lba == 0u) {
         fprintf(stderr, "NVMe capacity unavailable before network send: channel=%d\n", cfg->id);
         dbg_printf("[DBG][NET] nvme max_lba unavailable ch=%d, refuse network send\n", cfg->id);
+        goto out;
+    }
+    diagnostic_rc = network_run_download_diagnostic(&rec, cfg, &rt, gopt);
+    if (diagnostic_rc != 1) {
+        rc = diagnostic_rc;
         goto out;
     }
 
@@ -3901,7 +4158,7 @@ static int network_send_existing_file(const ParsedArgs *args, GlobalOptions gopt
         pipe_ctx.network_ring_bytes = network_ring_bytes;
         pipe_ctx.total_file_bytes = total_file_bytes;
         pipe_ctx.start_lba = cur_lba;
-        pipe_ctx.read_cmd_sectors = rt.nvme_cmd_sectors ? rt.nvme_cmd_sectors : 512u;
+        pipe_ctx.read_cmd_sectors = nvme_read_command_sectors(&rt);
         pipe_ctx.proto_file_type = (uint32_t)rec.proto_file_type_code;
 #ifdef CCB_BUILD_DIAG
         pipe_ctx.verify_ddr_read = env_flag_enabled("SRC_REAL_NETWORK_VERIFY_DDR_READ");
@@ -4480,46 +4737,6 @@ static uint8_t start_network_from_command(const CmdFileOp *op)
     return ACK_SUCCESS;
 }
 
-typedef struct {
-    bool pending;
-    uint32_t trigger_channel;
-    StorageErrorCode trigger_error;
-} BackgroundHealthResetRequest;
-
-static pthread_mutex_t g_background_health_reset_lock = PTHREAD_MUTEX_INITIALIZER;
-static BackgroundHealthResetRequest g_background_health_reset;
-static uint64_t g_background_health_reset_next_allowed_us;
-
-static StorageErrorCode request_background_ssd_reset(
-    uint32_t channel, StorageErrorCode error)
-{
-    uint64_t now_us;
-    bool scheduled = false;
-
-    if (error != STORAGE_ERR_PCIE_LINK && error != STORAGE_ERR_NVME_PROBE) {
-        return error;
-    }
-
-    now_us = storage_ipc_monotonic_us();
-    pthread_mutex_lock(&g_background_health_reset_lock);
-    if (!g_background_health_reset.pending &&
-        (g_background_health_reset_next_allowed_us == 0u ||
-         now_us >= g_background_health_reset_next_allowed_us)) {
-        g_background_health_reset.pending = true;
-        g_background_health_reset.trigger_channel = channel;
-        g_background_health_reset.trigger_error = error;
-        g_background_health_reset_next_allowed_us =
-            now_us + STORAGE_HEALTH_RESET_COOLDOWN_US;
-        scheduled = true;
-    }
-    pthread_mutex_unlock(&g_background_health_reset_lock);
-    if (scheduled) {
-        /* Do not begin probing another channel once a reset has been requested. */
-        storage_health_abort_refresh();
-    }
-    return error;
-}
-
 static StorageErrorCode probe_one_storage_channel(
     uint32_t channel, void *ctx, StorageHealthSnapshot *snapshot)
 {
@@ -4543,12 +4760,12 @@ static StorageErrorCode probe_one_storage_channel(
 
     memset(&rt, 0, sizeof(rt));
     if (channel_runtime_open(&rt, cfg, gopt) != 0)
-        return request_background_ssd_reset(channel, STORAGE_ERR_PCIE_LINK);
+        return STORAGE_ERR_PCIE_LINK;
     snapshot->pcie_link = true;
 
     if (nvme_probe(&rt) != 0) {
         channel_runtime_close(&rt);
-        return request_background_ssd_reset(channel, STORAGE_ERR_NVME_PROBE);
+        return STORAGE_ERR_NVME_PROBE;
     }
     snapshot->nvme_ready = true;
     snapshot->logical_block_bytes = rt.nvme_block_size;
@@ -4562,7 +4779,7 @@ static StorageErrorCode probe_one_storage_channel(
         rt.nvme_max_dts_bytes < rt.nvme_block_size ||
         rt.nvme_max_lba == 0u) {
         channel_runtime_close(&rt);
-        return request_background_ssd_reset(channel, STORAGE_ERR_NVME_PROBE);
+        return STORAGE_ERR_NVME_PROBE;
     }
     snapshot->capacity_valid = true;
     channel_runtime_close(&rt);
@@ -4596,159 +4813,26 @@ static void emit_storage_status_snapshots(
     }
 }
 
-static bool storage_status_needs_ssd_reset(
-    const StorageHealthSnapshot snapshots[NUM_CHANNELS],
-    uint32_t *trigger_channel, StorageErrorCode *trigger_error)
-{
-    uint32_t channel;
-
-    for (channel = 0u; channel < NUM_CHANNELS; ++channel) {
-        StorageErrorCode error = snapshots[channel].error;
-
-        if (error == STORAGE_ERR_PCIE_LINK || error == STORAGE_ERR_NVME_PROBE) {
-            if (trigger_channel) *trigger_channel = channel;
-            if (trigger_error) *trigger_error = error;
-            return true;
-        }
-    }
-    return false;
-}
-
-static bool storage_status_ssd_reset_safe(void)
-{
-    return !storage_any_running() && !storage_any_live_worker() &&
-           transfer_task.state != RUNNING && !g_maintenance_job.active &&
-           !g_pending_storage_start.active && !g_pending_storage_stop.active &&
-           !g_pending_network_stop.active;
-}
-
-typedef struct {
-    bool needed;
-    uint32_t trigger_channel;
-    StorageErrorCode trigger_error;
-} StorageStatusResetRequest;
-
-static uint8_t get_status_query_result(StorageStatusResetRequest *reset_request)
+static uint8_t get_status_query_result(void)
 {
     StorageHealthSnapshot snapshots[NUM_CHANNELS];
-    StorageHealthResult result;
+    uint32_t channel;
+    bool failed = false;
 
-    if (reset_request) memset(reset_request, 0, sizeof(*reset_request));
     memset(snapshots, 0, sizeof(snapshots));
-    result = storage_health_query(STORAGE_HEALTH_MAX_AGE_US, snapshots);
+    for (channel = 0u; channel < NUM_CHANNELS; ++channel) {
+        snapshots[channel].channel = channel;
+        snapshots[channel].error = probe_one_storage_channel(
+            channel, NULL, &snapshots[channel]);
+        if (snapshots[channel].error != STORAGE_ERR_NONE ||
+            !snapshots[channel].pcie_link ||
+            !snapshots[channel].nvme_ready ||
+            !snapshots[channel].capacity_valid) {
+            failed = true;
+        }
+    }
     emit_storage_status_snapshots(snapshots);
-
-    if (result == STORAGE_HEALTH_OK) return ACK_SUCCESS;
-    if (result == STORAGE_HEALTH_RETRYING) {
-        storage_health_request_refresh();
-        return ACK_RETRYING;
-    }
-
-    if (reset_request) {
-        reset_request->needed = storage_status_needs_ssd_reset(
-            snapshots, &reset_request->trigger_channel,
-            &reset_request->trigger_error);
-    }
-    return ACK_FAILED;
-}
-
-static void recover_ssd_after_failed_status(
-    const StorageStatusResetRequest *reset_request)
-{
-    SsdResetError reset_error;
-    int health_start_rc;
-
-    if (!reset_request || !reset_request->needed) return;
-    if (!storage_status_ssd_reset_safe()) {
-        system_emit_line(
-            STORAGE_LOG_SUMMARY,
-            "storage_status_ssd_reset phase=skipped result=not_attempted reason=busy"
-            " trigger_channel=%u trigger_error=%s",
-            reset_request->trigger_channel,
-            storage_error_string(reset_request->trigger_error));
-        return;
-    }
-
-    system_emit_line(
-        STORAGE_LOG_SUMMARY,
-        "storage_status_ssd_reset phase=start base=0x%08" PRIx64
-        " bit=%u hold_ms=%u settle_ms=%u trigger_channel=%u trigger_error=%s",
-        (uint64_t)SSD_RESET_GPIO_BASE, SSD_RESET_GPIO_BIT,
-        SSD_RESET_DEFAULT_HOLD_MS, SSD_RESET_DEFAULT_SETTLE_MS,
-        reset_request->trigger_channel,
-        storage_error_string(reset_request->trigger_error));
-
-    /* Stop the background probe first so no NVMe MMIO is active during PERST#. */
-    system_emit_line(
-        STORAGE_LOG_ALWAYS_CRITICAL,
-        "storage_status_ssd_reset phase=health_probe_stop_begin"
-        " trigger_channel=%u trigger_error=%s",
-        reset_request->trigger_channel,
-        storage_error_string(reset_request->trigger_error));
-    storage_health_stop();
-    system_emit_line(STORAGE_LOG_ALWAYS_CRITICAL,
-                     "storage_status_ssd_reset phase=health_probe_stopped");
-    system_emit_line(STORAGE_LOG_ALWAYS_CRITICAL,
-                     "storage_status_ssd_reset phase=gpio_pulse_begin");
-    reset_error = ssd_reset_gpio_pulse(SSD_RESET_DEFAULT_HOLD_MS,
-                                       SSD_RESET_DEFAULT_SETTLE_MS);
-    system_emit_line(STORAGE_LOG_ALWAYS_CRITICAL,
-                     "storage_status_ssd_reset phase=gpio_pulse_complete result=%s",
-                     reset_error == SSD_RESET_OK ? "success" : "failed");
-    health_start_rc = storage_health_start(probe_one_storage_channel, NULL,
-                                           STORAGE_HEALTH_REFRESH_MS);
-    if (health_start_rc != 0) {
-        system_emit_line(
-            STORAGE_LOG_ALWAYS_CRITICAL,
-            "storage_status_ssd_reset phase=complete result=failed"
-            " reason=health_service_restart_failed reset_error=%s",
-            ssd_reset_error_string(reset_error));
-        return;
-    }
-    if (reset_error != SSD_RESET_OK) {
-        system_emit_line(
-            STORAGE_LOG_ALWAYS_CRITICAL,
-            "storage_status_ssd_reset phase=complete result=failed reason=%s",
-            ssd_reset_error_string(reset_error));
-        return;
-    }
-
-    system_emit_line(
-        STORAGE_LOG_SUMMARY,
-        "storage_status_ssd_reset phase=complete result=success"
-        " reason=reset_released_health_probe_started");
-}
-
-static void service_pending_background_health_reset(void)
-{
-    StorageStatusResetRequest reset_request;
-
-    if (!storage_status_ssd_reset_safe()) {
-        return;
-    }
-
-    memset(&reset_request, 0, sizeof(reset_request));
-    pthread_mutex_lock(&g_background_health_reset_lock);
-    if (g_background_health_reset.pending) {
-        reset_request.needed = true;
-        reset_request.trigger_channel = g_background_health_reset.trigger_channel;
-        reset_request.trigger_error = g_background_health_reset.trigger_error;
-        g_background_health_reset.pending = false;
-    }
-    pthread_mutex_unlock(&g_background_health_reset_lock);
-
-    if (!reset_request.needed) {
-        return;
-    }
-
-    system_emit_line(
-        STORAGE_LOG_ALWAYS_CRITICAL,
-        "storage_health_ssd_reset phase=queued result=probe_failed"
-        " trigger_channel=%u trigger_error=%s cooldown_ms=%u",
-        reset_request.trigger_channel,
-        storage_error_string(reset_request.trigger_error),
-        (unsigned)(STORAGE_HEALTH_RESET_COOLDOWN_US / 1000ull));
-    recover_ssd_after_failed_status(&reset_request);
+    return failed ? ACK_FAILED : ACK_SUCCESS;
 }
 
 void handle_frame(uint8_t *f)
@@ -5098,22 +5182,20 @@ void handle_frame(uint8_t *f)
 
     case CMD_STATUS:
     {
-        StorageStatusResetRequest reset_request;
-        uint8_t disk_result = get_status_query_result(&reset_request);
+        uint8_t disk_result;
+
+        if (storage_any_running() || storage_any_live_worker() ||
+            transfer_task.state == RUNNING || g_maintenance_job.active ||
+            g_pending_storage_start.active || g_pending_storage_stop.active ||
+            g_pending_network_stop.active) {
+            disk_result = ACK_RETRYING;
+        } else {
+            disk_result = get_status_query_result();
+        }
 
         dbg_printf("[DBG][PROTO] RX 0x61 disk_check result=0x%02X storage_state=%d transfer_state=%d\n",
                    disk_result, storage_state_summary(), transfer_task.state);
         proto_send_ack(cmd, disk_result);
-        if (disk_result == ACK_FAILED && reset_request.needed) {
-            /* Ensure the original self-check ACK leaves the UART before PERST#. */
-            if (tcdrain(serial_fd) != 0) {
-                system_emit_line(
-                    STORAGE_LOG_SUMMARY,
-                    "storage_status_ssd_reset ack_drain_failed errno=%d",
-                    errno);
-            }
-            recover_ssd_after_failed_status(&reset_request);
-        }
         break;
     }
 
@@ -5858,9 +5940,6 @@ int main(int argc, char **argv)
                      storage->empty_sleep_us);
         }
     }
-    if (storage_health_start(probe_one_storage_channel, NULL,
-                             STORAGE_HEALTH_REFRESH_MS) != 0)
-        LOG_ERROR("SYSTEM", "Failed to start background storage health service");
     dbg_printf("[DBG][MAIN] uart1=%s log_db=%s file_db=%s meta_dir=%s\n",
                serial_dev, LOG_DB_PATH, FILELIST_DB_PATH, get_storage_meta_dir());
 
@@ -5912,15 +5991,10 @@ int main(int argc, char **argv)
         check_task(&transfer_task);
         service_pending_network_stop();
         service_maintenance_job();
-        storage_health_set_busy(storage_any_running() ||
-                                transfer_task.state == RUNNING ||
-                                g_maintenance_job.active);
-        service_pending_background_health_reset();
     }
 
     /* Unreachable for current daemon-style loop. */
     close(serial_fd);
-    storage_health_stop();
     file_list_close();
     logger_close();
     debug_uart_close();

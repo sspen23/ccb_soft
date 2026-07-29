@@ -255,7 +255,7 @@ SSD
   -> TCP/IP 硬件发送通路
 ```
 
-当前网络发送按 16MiB 一帧发送，不再做 64MiB 拼包，也不做 16MiB 尾部补零。这样更贴近你说的“一帧一帧，每帧有 last 信号”。
+当前网络发送每帧为 16MiB。ch0/ch1 会先从 SSD 分两次各读取 8MiB，分别写入同一 DDR 下载 slot 的前、后半区；两次读取都完成后，再用一个 16MiB TCP MM2S descriptor 发送。ch2 仍一次读取 16MiB 后发送。
 
 相关逻辑在 [system.c](system.c:1624) 附近。
 
@@ -642,24 +642,18 @@ byte 4 = 0xFF  delete all file records and clear supported-channel metadata
 
 ```text
 0x11  ch0/ch1/ch2 NVMe disks are detected and capabilities are valid
-0x55  background health probe is still pending
+0x55  storage, transfer, or maintenance work is busy
 0xFF  at least one ch0/ch1/ch2 NVMe disk detection failed
 ```
 
 The check reuses the standalone self-test style logic: open the channel runtime,
 run `nvme_probe()`, then validate `block_size`, `max_dts_bytes`, and `max_lba`.
-ch0, ch1, and ch2 are checked. If an idle status check reports a PCIe-link or
-NVMe-probe initialization failure, the service first sends that check's
-`0xFF` response. It then stops the background probe, pulses the active-low SSD
-reset GPIO at `0x40010000` low for 100 ms, waits 1000 ms after release, and
-restarts background probing without sending another response. The next `0x61`
-reports the post-reset state. No GPIO write is performed when the check passes
-or while a storage/transfer task is active.
-
-The background health probe runs every 5 seconds while the service is idle. A
-PCIe-link or NVMe-probe failure queues the same reset flow without a UART
-response; the main loop performs it only after storage, transfer, and
-maintenance work are all idle.
+ch0, ch1, and ch2 are checked synchronously when a status command is received;
+the reply is sent only after all three probes finish. There is no periodic
+background health probe. A failed status check reports its normal `0xFF`
+response only and never pulses the SSD reset GPIO automatically. If storage,
+transfer, or maintenance work is active, the command returns `0x55` without
+probing shared channel hardware.
 
 Optional timeout override:
 
@@ -668,7 +662,7 @@ export SRC_REAL_STATUS_TIMEOUT_US=5000000
 ```
 
 The built-in production defaults use `/dev/ttyUL1`, the
-`CROSS_SLOT_QD16_EXPERIMENTAL` profile, compatibility mode off, performance
+`CROSS_SLOT_EXPERIMENTAL` (QD8) profile, compatibility mode off, performance
 file logging off, a 1000 ms performance interval, and structured logging off.
 In this mode `logs.db` is not initialized and routine debug-UART output,
 including the textual status capability dump, is suppressed; the binary
@@ -836,6 +830,7 @@ ch0 HIGH_I file
   desc CPU base      0x20000000
   desc DMA base      0x10000000
   DDR DMA/NVMe addr  0x00000000
+  SSD read bytes     8 MiB x 2
   TCP desc bytes     16 MiB
 
 ch1 HIGH_Q file
@@ -845,6 +840,7 @@ ch1 HIGH_Q file
   desc CPU base      0x30000000
   desc DMA base      0x10000000
   DDR DMA/NVMe addr  0x00000000
+  SSD read bytes     8 MiB x 2
   TCP desc bytes     16 MiB
 
 ch2 LOW_SPEED/CALIB file

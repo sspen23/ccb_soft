@@ -207,7 +207,7 @@ static int parse_log_level(const char *value, CcbLogLevel *out)
 static int parse_profile(const char *value, StorageProfile *out)
 {
     if (!value || value[0] == '\0') {
-        *out = STORAGE_PROFILE_CROSS_SLOT_QD16_EXPERIMENTAL;
+        *out = STORAGE_PROFILE_CROSS_SLOT_EXPERIMENTAL;
         return 0;
     }
     if (strcmp(value, "LEGACY_FAST_BASELINE") == 0 ||
