@@ -25,7 +25,7 @@ typedef struct {
     uint64_t file_offset;
     uint64_t start_lba;
     uint64_t sectors;
-    uint64_t hw_addr;
+    uint64_t ddr_hw_addr;
 } StoragePipelineItem;
 
 typedef struct {

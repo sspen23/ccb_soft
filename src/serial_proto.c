@@ -40,13 +40,13 @@ static void dump_console_line(const char *line)
 static int get_len(uint8_t cmd)
 {
     switch(cmd) {
-        case 0x11: return 64;
-        case 0x21: return 16;
-        case 0x31: return 16;
-        case 0x41: return 16;
-        case 0x51: return 32;
-        case 0x61: return 16;
-        case 0x71: return 16;
+        case CMD_TASK_INFO: return (int)sizeof(CmdTaskInfo);
+        case CMD_ACQ_CTRL: return (int)sizeof(CmdAcqCtrl);
+        case CMD_USB_TRANSFER: return (int)sizeof(CmdUsbTransfer);
+        case CMD_FILE_LIST: return (int)sizeof(CmdFileList);
+        case CMD_FILE_OP: return (int)sizeof(CmdFileOp);
+        case CMD_STATUS: return (int)sizeof(CmdStatusQuery);
+        case CMD_STOP_TRANSFER: return (int)sizeof(CmdStopTransfer);
         default: return 0;
     }
 }
@@ -77,6 +77,8 @@ static void dump_rx_line(const char *tag, const uint8_t *data, int len)
     char task_id[12] = {0};
     char line[128];
     uint8_t cmd;
+    size_t task_offset = 0u;
+    size_t task_bytes = 0u;
 
     if (!data || len <= 0) {
         return;
@@ -86,12 +88,24 @@ static void dump_rx_line(const char *tag, const uint8_t *data, int len)
         return;
     }
     cmd = len > 2 ? data[2] : 0u;
-    if ((cmd == CMD_TASK_INFO || cmd == CMD_FILE_OP) && len >= 14) {
-        memcpy(task_id, data + 3, sizeof(task_id) - 1u);
+    if (cmd == CMD_TASK_INFO) {
+        task_offset = offsetof(CmdTaskInfo, task_id);
+        task_bytes = sizeof(((CmdTaskInfo *)0)->task_id);
+    } else if (cmd == CMD_FILE_OP) {
+        task_offset = offsetof(CmdFileOp, task_id);
+        task_bytes = sizeof(((CmdFileOp *)0)->task_id);
+    }
+    if (task_bytes > 0u &&
+        (size_t)len >= task_offset + task_bytes &&
+        task_bytes < sizeof(task_id)) {
+        memcpy(task_id, data + task_offset, task_bytes);
         (void)snprintf(line, sizeof(line),
                        "[UART RX] %s cmd=0x%02X task_no=%s len=%d\n",
                        tag, (unsigned)cmd, task_id, len);
-    } else if (len > 3) {
+    } else if ((cmd == CMD_ACQ_CTRL ||
+                cmd == CMD_USB_TRANSFER ||
+                cmd == CMD_FILE_LIST) &&
+               len > 3) {
         (void)snprintf(line, sizeof(line),
                        "[UART RX] %s cmd=0x%02X arg=0x%02X len=%d\n",
                        tag, (unsigned)cmd, (unsigned)data[3], len);

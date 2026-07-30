@@ -81,17 +81,17 @@ DMA、尚未写完 NVMe 的 DDR slot。硬件重新获取 BD 前，软件必须�
 
 你的硬件是：
 
-- CPU 每个数据通路 DDR 只接入 64MiB。
-- DMA 和 NVMe 使用硬件本地 DDR offset。
+- ch0/ch1/ch2 数据通路 DDR 对 CPU 不可见。
+- DMA、NVMe 和 TCP 使用通道本地 DDR hardware address。
 - ch0/ch1 数据通路 DDR 硬件容量是 2GiB，但当前软件强制只使用低 1GiB；
   即使 `SRC_REAL_STORAGE_RING_BYTES_CH0` / `SRC_REAL_STORAGE_RING_BYTES_CH1`
   请求更大值，也会 warning 并 clamp 回 1GiB。
 - ch2 数据通路 DDR 是 512MiB。
 
-所以软件里把两个概念分开：
+软件只保留硬件地址和可用 ring 容量：
 
 ```c
-.ddr_cpu_size = CHANNEL_CPU_DDR_BYTES,
+.ddr_hw_base = 0,
 .dma_ring_bytes = CHANNEL0_DDR_BYTES,
 .dma_ring_bytes_max = CHANNEL0_DDR_BYTES_MAX,
 ```
@@ -100,8 +100,8 @@ DMA、尚未写完 NVMe 的 DDR slot。硬件重新获取 BD 前，软件必须�
 
 含义是：
 
-- `ddr_cpu_size`：CPU 可 mmap 的窗口，只有 64MiB。
-- `dma_ring_bytes`：DMA/NVMe 默认使用的 DDR ring，ch0/ch1 1GiB，ch2 512MiB。
+- `ddr_hw_base`：DMA/NVMe/TCP看到的数据DDR起始地址。
+- `dma_ring_bytes`：默认使用的 DDR ring，ch0/ch1 1GiB，ch2 512MiB。
 - `dma_ring_bytes_max`：硬件描述仍保留最大窗口；运行时 ch0/ch1 会 clamp 到默认
   1GiB，ch2 保持 512MiB。
 
@@ -112,7 +112,8 @@ ch0/ch1 storage-write 默认: 1GiB / 8MiB = 128 slot
 ch2: 512MiB / 16MiB = 32 帧
 ```
 
-CPU 不会访问 64MiB 之外的 DDR，但 DMA/NVMe 可以用硬件地址访问完整 DDR。这样可以让 DDR 承担突发缓存作用：输入瞬时带宽高于 NVMe 写盘带宽时，数据先积累在 DDR ring 里，软件慢慢写盘。
+CPU不映射或解引用通道数据DDR。DDR只通过DMA、NVMe和TCP硬件主设备访问，
+用于吸收输入与写盘之间的瞬时带宽差。
 
 前提是平均输入带宽不能长期超过 NVMe 写盘带宽。DDR 只能吸收突发，不能无限堆积。
 
@@ -238,7 +239,7 @@ NVMe 不是走 Linux block 设备，而是直接访问自定义 NVMe host core �
 存盘时 NVMe PRP 地址使用的是 DDR 硬件地址：
 
 ```text
-hw_addr = ddr_hw_base + slot_offset
+ddr_hw_addr = ddr_hw_base + ddr_offset
 ```
 
 不是 CPU 虚拟地址，也不是 CPU mmap 地址。
@@ -259,7 +260,9 @@ SSD
 
 相关逻辑在 [system.c](system.c:1624) 附近。
 
-网络下载仍然只使用 DDR 的低 16MiB/64MiB 区域，因为它可能启用 CPU verify，CPU 只能看 64MiB。完整 DDR ring 主要用于收数存盘，不用于网络发送缓存。
+网络下载使用 `dma_ring_bytes` 定义的硬件地址 ring；每个 TCP slot 前保留
+4KiB offset，NVMe 和 TCP MM2S 共享该 slot 的 `ddr_hw_addr`。CPU verify
+已经移除，CPU不会映射或读取这些数据。
 
 **文件列表和 metadata**
 
@@ -293,10 +296,9 @@ AXIS switch     0x44a10000
 NVMe base       0x44a00000
 desc CPU base   0x20000000
 desc DMA base   0x10000000
-DDR CPU base    0x10000000
 DDR HW base     0x00000000
-CPU DDR window  64MiB
 DMA ring        1GiB runtime clamp
+PRP BRAM        0xc0000000, 32KiB, CPU/NVMe同址
 ```
 
 ch1：
@@ -307,10 +309,9 @@ AXIS switch     0xa0070000
 NVMe base       0xa0080000
 desc CPU base   0x30000000
 desc DMA base   0x10000000
-DDR CPU base    0xd0000000
 DDR HW base     0x00000000
-CPU DDR window  64MiB
 DMA ring        1GiB runtime clamp
+PRP BRAM        0xc2000000, 32KiB, CPU/NVMe同址
 ```
 
 ch2：
@@ -321,18 +322,17 @@ AXIS switch     0x00040000
 NVMe base       0x00010000
 desc CPU base   0x20004000
 desc DMA base   0x10000000
-DDR CPU base    0xc0000000
 DDR HW base     0x00000000
-CPU DDR window  64MiB
 DMA ring        512MiB
+PRP mode        Host Core auto
 ```
 
 这里有一个重要区别：
 
 - descriptor BRAM 的 CPU 访问地址是 `desc_cpu_base`。
 - AXI DMA 看到 descriptor 的地址是 `desc_dma_base`。
-- 数据 DDR 的 CPU 地址是 `ddr_cpu_base`，但 CPU 只看 64MiB。
-- 数据 DDR 的 DMA/NVMe 地址从 `ddr_hw_base = 0` 开始，覆盖完整 ring。
+- 数据DDR没有CPU地址，软件接口传递 `ddr_offset` 或 `ddr_hw_addr`。
+- 数据 DDR 的 DMA/NVMe/TCP 地址从 `ddr_hw_base = 0` 开始，覆盖可用ring。
 
 **当前稳定性策略**
 
@@ -465,13 +465,12 @@ ch0 HIGH_I
   desc CPU       0x20000000
   desc DMA       0x10000000
   desc size      0x4000
-  storage-write DMA desc bytes 0x00800000
-  storage-write DMA desc count 128 default
-  DDR CPU        0x10000000
-  DDR size       0x04000000
+  storage-write DMA desc bytes 0x01000000
+  storage-write DMA desc count 64 default
   DDR ring       0x40000000 default
   DDR ring max   0x80000000
   DDR HW offset  0x00000000
+  PRP BRAM       0xc0000000, 0x8000 bytes
 
 ch1 HIGH_Q
   NVMe host      0xa0080000
@@ -480,13 +479,12 @@ ch1 HIGH_Q
   desc CPU       0x30000000
   desc DMA       0x10000000
   desc size      0x4000
-  storage-write DMA desc bytes 0x00800000
-  storage-write DMA desc count 128 default
-  DDR CPU        0xd0000000
-  DDR size       0x04000000
+  storage-write DMA desc bytes 0x01000000
+  storage-write DMA desc count 64 default
   DDR ring       0x40000000 default
   DDR ring max   0x80000000
   DDR HW offset  0x00000000
+  PRP BRAM       0xc2000000, 0x8000 bytes
 
 ch2 LOW_SPEED/CALIB
   NVMe host      0x00010000
@@ -497,21 +495,17 @@ ch2 LOW_SPEED/CALIB
   desc size      0x4000
   DMA desc bytes 0x01000000
   DMA desc count 32
-  DDR CPU        0xc0000000
-  DDR size       0x04000000
   DDR ring       0x20000000
   DDR HW offset  0x00000000
+  PRP mode       Host Core auto
 ```
-
-The old bare-metal test code has different descriptor and DDR CPU addresses in
-some places. For `src_real`, use the device-tree values above.
 
 The descriptor CPU address comes from `system.dts`. The descriptor DMA-view
 address stays at the old hardware value `0x10000000`.
 
-The default S2MM descriptor payload size for `storage-write` is 8 MiB on
-ch0/ch1 and 16 MiB on ch2. The CPU maps only a 64 MiB window. The DMA/NVMe
-ring is ch0/ch1 1 GiB and ch2 512 MiB at runtime; larger ch0/ch1 environment
+The default S2MM descriptor payload size for `storage-write` is 16 MiB on all
+three channels. Data DDR is not CPU-mapped. The DMA/NVMe ring is ch0/ch1
+1 GiB and ch2 512 MiB at runtime; larger ch0/ch1 environment
 requests are rejected with `storage_ring_config_error` rather than silently
 running with a smaller ring.
 
@@ -758,13 +752,17 @@ On success, standalone storage performs:
 For continuous storage, `file_size` and `sector_count` are the actual amount
 stored when the stop request is handled.
 
-## DDR Pattern Store Test
+## Raw DDR Store Diagnostic
 
-Generate a 32MiB test pattern in ch2 DDR and store it to SSD without waiting
-for external DMA input:
+Channel data DDR is not CPU-accessible, so this command cannot generate or
+compare a CPU pattern. It can store data that has already been placed in DDR
+by a hardware input path:
 
 ```sh
+export SRC_REAL_DDR_RAW_STORE=1
 ./src_real_app ddr-pattern-store \
+  --channel 2 \
+  --ddr-offset 0 \
   --task-no R2509100100 \
   --file-index 1 \
   --proto-file-type 3
@@ -774,6 +772,8 @@ Optional size override:
 
 ```sh
 ./src_real_app ddr-pattern-store \
+  --channel 2 \
+  --ddr-offset 0 \
   --size 33554432 \
   --task-no R2509100100 \
   --file-index 1 \
@@ -781,12 +781,9 @@ Optional size override:
   --calibration-type 1
 ```
 
-This mode writes CPU-view DDR `0xc0000000`, which is ch2 DMA/NVMe view
-`0x00000000`. Each 32-bit word is:
-
-```text
-word[n] = ((n & 0xffff) << 16) | (n & 0xffff)
-```
+The command validates `ddr_offset + size` against the selected channel ring
+and submits `ddr_hw_base + ddr_offset` to NVMe. CPU fill/readback and
+`SRC_REAL_DDR_RAW_VERIFY` are unsupported.
 
 The command writes SSD metadata and `filelist.db`, then syncs both to flash
 when possible. It does not send TCP itself; use the existing serial file
@@ -968,7 +965,6 @@ export SRC_REAL_NETWORK_SKIP_LINK_CHECK=1
 export SRC_REAL_NETWORK_TIMEOUT_US=5000000
 export SRC_REAL_NETWORK_TASK_TIMEOUT_SECONDS=0
 export SRC_REAL_NETWORK_LIMIT_MB_S=0
-export SRC_REAL_NETWORK_VERIFY_DDR_READ=1
 ```
 
 Regular `[DBG]` output is off by default. Normal operation always prints one
@@ -1121,11 +1117,6 @@ SRC_REAL_NETWORK_TASK_TIMEOUT_SECONDS=0
 SRC_REAL_NETWORK_LIMIT_MB_S=0
   Disables TCP transfer throttling. Non-zero values add average per-chunk
   throttling; for example, 10 limits the transfer to roughly 10 MiB/s.
-
-SRC_REAL_NETWORK_VERIFY_DDR_READ=1
-  Before each network NVMe read, fills the TCP DDR window with 0xA5 and then
-  samples it after the read. If every sampled byte is still 0xA5, the program
-  stops before TCP send and reports that the SSD read did not overwrite DDR.
 
 When `SRC_REAL_DEBUG` includes `write`, `dma`, or `storage`, selected worker
 debug output can still be forwarded. For complete worker stdout/stderr echo,

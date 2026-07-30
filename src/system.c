@@ -2991,7 +2991,7 @@ typedef struct {
     uint64_t chunk_bytes;
     uint64_t read_sectors;
     uint64_t send_bytes;
-    uint64_t ddr_hw;
+    uint64_t ddr_hw_addr;
 } NetworkPipelineSlot;
 
 typedef struct {
@@ -3016,131 +3016,7 @@ typedef struct {
     uint64_t start_lba;
     uint64_t read_cmd_sectors;
     uint32_t proto_file_type;
-#ifdef CCB_BUILD_DIAG
-    int verify_ddr_read;
-    uint32_t verify_bytes;
-#endif
 } NetworkPipelineCtx;
-
-#ifdef CCB_BUILD_DIAG
-static void format_hex_prefix(const volatile uint8_t *data, uint32_t bytes, char *out, size_t out_len)
-{
-    static const char hex[] = "0123456789ABCDEF";
-    uint32_t i;
-    size_t pos = 0u;
-
-    if (!out || out_len == 0u) {
-        return;
-    }
-    out[0] = '\0';
-    if (!data) {
-        return;
-    }
-    for (i = 0u; i < bytes && (pos + 2u) < out_len; ++i) {
-        uint8_t v = data[i];
-        out[pos++] = hex[(v >> 4u) & 0x0fu];
-        out[pos++] = hex[v & 0x0fu];
-    }
-    out[pos] = '\0';
-}
-
-static const char *network_magic_hint(const volatile uint8_t *data, uint32_t bytes)
-{
-    uint32_t i;
-
-    if (!data || bytes < 4u) {
-        return "unknown";
-    }
-    for (i = 0u; i + 3u < bytes; ++i) {
-        if (data[i] == 0x18u && data[i + 1u] == 0xEFu &&
-            data[i + 2u] == 0xDCu && data[i + 3u] == 0x01u) {
-            return "ch2_18efdc01";
-        }
-        if (data[i] == 0x18u && data[i + 1u] == 0xEFu &&
-            data[i + 2u] == 0x01u && data[i + 3u] == 0xDCu) {
-            return "ch0_18ef01dc";
-        }
-    }
-    return "unknown";
-}
-
-static int network_verify_ddr_read_overwrite(NetworkPipelineCtx *ctx,
-                                             const NetworkPipelineSlot *slot,
-                                             uint64_t read_bytes)
-{
-    uint64_t ddr_offset;
-    uint32_t verify_bytes;
-    uint32_t prefix_bytes;
-    uint32_t i;
-    int all_a5 = 1;
-    volatile uint8_t *sample;
-    char prefix[129];
-
-    if (!ctx || !slot || !ctx->verify_ddr_read || ctx->gopt.dry_run) {
-        return 0;
-    }
-    if (slot->ddr_hw < ctx->cfg->ddr_hw_base) {
-        return 0;
-    }
-    ddr_offset = slot->ddr_hw - ctx->cfg->ddr_hw_base;
-    if (ddr_offset >= ctx->cfg->ddr_cpu_size || ddr_offset >= ctx->rt->ddr.size) {
-        printf("network_ddr_read_verify task=%s file_index=%u proto_file_type=%u"
-               " chunk=%u lba=0x%08" PRIx64 " sectors=%" PRIu64
-               " ddr_hw=0x%08" PRIx64 " slot=%u slot_offset=%" PRIu64
-               " result=skipped reason=outside_cpu_visible_ddr\n",
-               ctx->task_no,
-               (unsigned)ctx->file_index,
-               (unsigned)ctx->proto_file_type,
-               (unsigned)slot->chunk_index,
-               slot->lba,
-               slot->read_sectors,
-               slot->ddr_hw,
-               (unsigned)slot->ring_slot,
-               ddr_offset);
-        fflush(stdout);
-        return 0;
-    }
-    verify_bytes = ctx->verify_bytes ? ctx->verify_bytes : 4096u;
-    if (verify_bytes > read_bytes) {
-        verify_bytes = (uint32_t)read_bytes;
-    }
-    if (ddr_offset + verify_bytes > ctx->rt->ddr.size) {
-        verify_bytes = (uint32_t)(ctx->rt->ddr.size - ddr_offset);
-    }
-    if (verify_bytes == 0u) {
-        return 0;
-    }
-    sample = ctx->rt->ddr.virt + ddr_offset;
-    __sync_synchronize();
-    for (i = 0u; i < verify_bytes; ++i) {
-        if (sample[i] != 0xA5u) {
-            all_a5 = 0;
-            break;
-        }
-    }
-    prefix_bytes = verify_bytes < 64u ? verify_bytes : 64u;
-    format_hex_prefix(sample, prefix_bytes, prefix, sizeof(prefix));
-    printf("network_ddr_read_verify task=%s file_index=%u proto_file_type=%u"
-           " chunk=%u lba=0x%08" PRIx64 " sectors=%" PRIu64
-           " ddr_hw=0x%08" PRIx64 " slot=%u slot_offset=%" PRIu64
-           " sample_bytes=%u result=%s magic=%s prefix=%s\n",
-           ctx->task_no,
-           (unsigned)ctx->file_index,
-           (unsigned)ctx->proto_file_type,
-           (unsigned)slot->chunk_index,
-           slot->lba,
-           slot->read_sectors,
-           slot->ddr_hw,
-           (unsigned)slot->ring_slot,
-           ddr_offset,
-           (unsigned)verify_bytes,
-           all_a5 ? "failed_still_a5" : "ok",
-           network_magic_hint(sample, prefix_bytes),
-           prefix);
-    fflush(stdout);
-    return all_a5 ? -1 : 0;
-}
-#endif
 
 static void network_pipeline_set_error(NetworkPipelineCtx *ctx, int rc)
 {
@@ -3157,7 +3033,7 @@ static int network_read_ssd_chunk(ChannelRuntime *rt,
                                   const ChannelConfig *cfg,
                                   uint64_t start_lba,
                                   uint64_t read_bytes,
-                                  uint64_t ddr_hw,
+                                  uint64_t ddr_hw_addr,
                                   uint32_t send_chunk_index)
 {
     uint64_t remaining_bytes = read_bytes;
@@ -3180,7 +3056,7 @@ static int network_read_ssd_chunk(ChannelRuntime *rt,
         int read_rc;
 
         if (this_sectors == 0u || this_sectors > UINT32_MAX ||
-            ddr_offset > UINT64_MAX - ddr_hw) {
+            ddr_offset > UINT64_MAX - ddr_hw_addr) {
             return -1;
         }
         if (env_flag_enabled("SRC_REAL_NETWORK_ADDR_TRACE")) {
@@ -3194,9 +3070,9 @@ static int network_read_ssd_chunk(ChannelRuntime *rt,
                    cur_lba,
                    this_sectors,
                    this_bytes,
-                   ddr_hw + ddr_offset,
+                   ddr_hw_addr + ddr_offset,
                    cur_lba + this_sectors,
-                   ddr_hw + ddr_offset + this_bytes);
+                   ddr_hw_addr + ddr_offset + this_bytes);
             fflush(stdout);
         }
         dbg_printf("[DBG][NET] ssd read chunk=%u part=%u lba=0x%08" PRIx64
@@ -3204,10 +3080,11 @@ static int network_read_ssd_chunk(ChannelRuntime *rt,
                    (unsigned)send_chunk_index,
                    (unsigned)read_index,
                    cur_lba,
-                   ddr_hw + ddr_offset,
+                   ddr_hw_addr + ddr_offset,
                    this_bytes,
                    this_sectors);
-        read_rc = nvme_rw(rt, false, cur_lba, this_sectors, ddr_hw + ddr_offset);
+        read_rc = nvme_rw(rt, false, cur_lba, this_sectors,
+                          ddr_hw_addr + ddr_offset);
         if (read_rc != 0) {
             return read_rc;
         }
@@ -3225,8 +3102,8 @@ static int network_read_ssd_chunk(ChannelRuntime *rt,
                (unsigned)send_chunk_index,
                start_lba,
                cur_lba,
-               ddr_hw,
-               ddr_hw + read_bytes,
+               ddr_hw_addr,
+               ddr_hw_addr + read_bytes,
                read_bytes,
                (unsigned)read_index);
         fflush(stdout);
@@ -3256,7 +3133,8 @@ static void *network_read_thread(void *arg)
         uint64_t cmd_last = cmd_first + (cmd_count ? cmd_count - 1u : 0u);
         uint32_t ring_slot = chunk_index % ctx->slot_count;
         uint64_t slot_base = (uint64_t)ring_slot * ctx->network_ring_stride;
-        uint64_t network_ddr_hw = ctx->cfg->ddr_hw_base + slot_base + NETWORK_DDR_OFFSET_BYTES;
+        uint64_t ddr_hw_addr =
+            ctx->cfg->ddr_hw_base + slot_base + NETWORK_DDR_OFFSET_BYTES;
         NetworkPipelineSlot *slot = &ctx->slots[ring_slot];
         int read_rc;
 
@@ -3288,7 +3166,7 @@ static void *network_read_thread(void *arg)
         slot->chunk_bytes = chunk_bytes;
         slot->read_sectors = read_sectors;
         slot->send_bytes = send_bytes;
-        slot->ddr_hw = network_ddr_hw;
+        slot->ddr_hw_addr = ddr_hw_addr;
         pthread_mutex_unlock(&ctx->lock);
 
         dbg_printf("[DBG][NET] read chunk=%u slot=%u task=%s idx=%u lba=0x%08" PRIx64
@@ -3301,7 +3179,7 @@ static void *network_read_thread(void *arg)
                    ctx->task_no,
                    (unsigned)ctx->file_index,
                    cur_lba,
-                   network_ddr_hw,
+                   ddr_hw_addr,
                    chunk_bytes,
                    read_sectors,
                    send_bytes,
@@ -3332,33 +3210,11 @@ static void *network_read_thread(void *arg)
                        file_offset,
                        cur_lba,
                        (unsigned)ring_slot,
-                       network_ddr_hw);
+                       ddr_hw_addr);
         }
-
-#ifdef CCB_BUILD_DIAG
-        if (ctx->verify_ddr_read && !ctx->gopt.dry_run) {
-            uint64_t ddr_offset = network_ddr_hw - ctx->cfg->ddr_hw_base;
-            uint32_t verify_bytes = ctx->verify_bytes ? ctx->verify_bytes : 4096u;
-
-            if (network_ddr_hw >= ctx->cfg->ddr_hw_base &&
-                ddr_offset < ctx->cfg->ddr_cpu_size &&
-                ddr_offset < ctx->rt->ddr.size) {
-                if (verify_bytes > read_bytes) {
-                    verify_bytes = (uint32_t)read_bytes;
-                }
-                if (ddr_offset + verify_bytes > ctx->rt->ddr.size) {
-                    verify_bytes = (uint32_t)(ctx->rt->ddr.size - ddr_offset);
-                }
-                if (verify_bytes > 0u) {
-                    memset((void *)(ctx->rt->ddr.virt + ddr_offset), 0xA5, verify_bytes);
-                    __sync_synchronize();
-                }
-            }
-        }
-#endif
 
         read_rc = network_read_ssd_chunk(ctx->rt, ctx->cfg, cur_lba, read_bytes,
-                                          network_ddr_hw, chunk_index);
+                                         ddr_hw_addr, chunk_index);
         if (read_rc == -2) {
             dbg_printf("[DBG][NET] nvme read stopped task=%s idx=%u chunk=%u lba=0x%08" PRIx64 "\n",
                        ctx->task_no,
@@ -3374,19 +3230,6 @@ static void *network_read_thread(void *arg)
             network_pipeline_set_error(ctx, -1);
             return NULL;
         }
-#ifdef CCB_BUILD_DIAG
-        if (network_verify_ddr_read_overwrite(ctx, slot, read_bytes) != 0) {
-            fprintf(stderr,
-                    "NVMe read did not overwrite DDR sentinel: task=%s file_index=%u chunk=%u lba=0x%08" PRIx64 "\n",
-                    ctx->task_no,
-                    (unsigned)ctx->file_index,
-                    (unsigned)chunk_index,
-                    cur_lba);
-            network_pipeline_set_error(ctx, -1);
-            return NULL;
-        }
-#endif
-
         pthread_mutex_lock(&ctx->lock);
         slot->state = NETWORK_SLOT_READY;
         pthread_cond_broadcast(&ctx->ready_cond);
@@ -3445,14 +3288,14 @@ static void *network_send_thread(void *arg)
             network_pipeline_set_error(ctx, -1);
             return NULL;
         }
-        tcp_cfg.ddr_dma_base = slot_copy.ddr_hw;
+        tcp_cfg.ddr_hw_addr = slot_copy.ddr_hw_addr;
         if (env_flag_enabled("SRC_REAL_NETWORK_ADDR_TRACE")) {
             printf("network_addr_trace event=tcp_send channel=%d send_chunk=%u"
                    " ddr=0x%08" PRIx64 " bytes=%" PRIu64
                    " desc_cpu=0x%08" PRIx64 " desc_dma=0x%08" PRIx64 "\n",
                    ctx->cfg->id,
                    (unsigned)slot_copy.chunk_index,
-                   tcp_cfg.ddr_dma_base,
+                   tcp_cfg.ddr_hw_addr,
                    tcp_cfg.transfer_bytes,
                    tcp_cfg.desc_cpu_base,
                    tcp_cfg.desc_dma_base);
@@ -3461,7 +3304,8 @@ static void *network_send_thread(void *arg)
         chunk_start_us = system_wall_time_us();
         dbg_verbose_printf("[DBG][NET] tcp route chunk=%u slot=%u ch=%d dma=0x%08" PRIx64
                            " switch=0x%08" PRIx64 " input=%u desc_cpu=0x%08" PRIx64
-                           " desc_dma=0x%08" PRIx64 " ddr_dma=0x%08" PRIx64 "\n",
+                           " desc_dma=0x%08" PRIx64
+                           " ddr_hw_addr=0x%08" PRIx64 "\n",
                            (unsigned)slot_copy.chunk_index,
                            (unsigned)slot_copy.ring_slot,
                            ctx->cfg->id,
@@ -3470,7 +3314,7 @@ static void *network_send_thread(void *arg)
                            (unsigned)tcp_cfg.switch_input_select,
                            tcp_cfg.desc_cpu_base,
                            tcp_cfg.desc_dma_base,
-                           tcp_cfg.ddr_dma_base);
+                           tcp_cfg.ddr_hw_addr);
 
         send_rc = tcp_transfer_send(&tcp_cfg);
         if (send_rc == -2) {
@@ -3563,11 +3407,7 @@ static int network_send_serial(const ParsedArgs *args,
         uint64_t cmd_first = sectors_before / read_cmd_sectors;
         uint64_t cmd_count = (read_sectors + read_cmd_sectors - 1u) / read_cmd_sectors;
         uint64_t cmd_last = cmd_first + (cmd_count ? cmd_count - 1u : 0u);
-        uint64_t network_ddr_hw = cfg->ddr_hw_base + NETWORK_DDR_OFFSET_BYTES;
-#ifdef CCB_BUILD_DIAG
-        NetworkPipelineCtx verify_ctx;
-        NetworkPipelineSlot verify_slot;
-#endif
+        uint64_t ddr_hw_addr = cfg->ddr_hw_base + NETWORK_DDR_OFFSET_BYTES;
         TcpTransferConfig tcp_cfg;
         uint64_t chunk_start_us = system_wall_time_us();
         int read_rc;
@@ -3607,7 +3447,7 @@ static int network_send_serial(const ParsedArgs *args,
                    args->task_no,
                    (unsigned)args->file_index,
                    cur_lba,
-                   network_ddr_hw,
+                   ddr_hw_addr,
                    chunk_bytes,
                    read_sectors,
                    send_bytes,
@@ -3637,50 +3477,11 @@ static int network_send_serial(const ParsedArgs *args,
                        (unsigned)chunk_index,
                        file_offset,
                        cur_lba,
-                       network_ddr_hw);
+                       ddr_hw_addr);
         }
-
-#ifdef CCB_BUILD_DIAG
-        memset(&verify_ctx, 0, sizeof(verify_ctx));
-        memset(&verify_slot, 0, sizeof(verify_slot));
-        verify_ctx.task_no = args->task_no;
-        verify_ctx.file_index = args->file_index;
-        verify_ctx.cfg = cfg;
-        verify_ctx.rt = rt;
-        verify_ctx.gopt = gopt;
-        verify_ctx.proto_file_type = (uint32_t)rec->proto_file_type_code;
-        verify_ctx.verify_ddr_read = env_flag_enabled("SRC_REAL_NETWORK_VERIFY_DDR_READ");
-        verify_ctx.verify_bytes = env_u32_or_default("SRC_REAL_NETWORK_VERIFY_BYTES", 4096u);
-        if (verify_ctx.verify_bytes == 0u) {
-            verify_ctx.verify_bytes = 4096u;
-        }
-        verify_slot.chunk_index = chunk_index;
-        verify_slot.ring_slot = 0u;
-        verify_slot.lba = cur_lba;
-        verify_slot.read_sectors = read_sectors;
-        verify_slot.ddr_hw = network_ddr_hw;
-
-        if (verify_ctx.verify_ddr_read && !gopt.dry_run) {
-            uint64_t ddr_offset = network_ddr_hw - cfg->ddr_hw_base;
-            uint32_t verify_bytes = verify_ctx.verify_bytes;
-
-            if (ddr_offset < cfg->ddr_cpu_size && ddr_offset < rt->ddr.size) {
-                if (verify_bytes > read_bytes) {
-                    verify_bytes = (uint32_t)read_bytes;
-                }
-                if (ddr_offset + verify_bytes > rt->ddr.size) {
-                    verify_bytes = (uint32_t)(rt->ddr.size - ddr_offset);
-                }
-                if (verify_bytes > 0u) {
-                    memset((void *)(rt->ddr.virt + ddr_offset), 0xA5, verify_bytes);
-                    __sync_synchronize();
-                }
-            }
-        }
-#endif
 
         read_rc = network_read_ssd_chunk(rt, cfg, cur_lba, read_bytes,
-                                         network_ddr_hw, chunk_index);
+                                         ddr_hw_addr, chunk_index);
         if (read_rc == -2) {
             dbg_printf("[DBG][NET] nvme read stopped task=%s idx=%u chunk=%u lba=0x%08" PRIx64 "\n",
                        args->task_no,
@@ -3696,33 +3497,20 @@ static int network_send_serial(const ParsedArgs *args,
             rc = -1;
             break;
         }
-#ifdef CCB_BUILD_DIAG
-        if (network_verify_ddr_read_overwrite(&verify_ctx, &verify_slot, read_bytes) != 0) {
-            fprintf(stderr,
-                    "NVMe read did not overwrite DDR sentinel: task=%s file_index=%u chunk=%u lba=0x%08" PRIx64 "\n",
-                    args->task_no,
-                    (unsigned)args->file_index,
-                    (unsigned)chunk_index,
-                    cur_lba);
-            rc = -1;
-            break;
-        }
-#endif
-
         tcp_transfer_default_config(&tcp_cfg, send_bytes, gopt);
         if (configure_tcp_for_channel(cfg, &tcp_cfg) != 0) {
             fprintf(stderr, "Unsupported TCP route for channel %d\n", cfg->id);
             rc = -1;
             break;
         }
-        tcp_cfg.ddr_dma_base = network_ddr_hw;
+        tcp_cfg.ddr_hw_addr = ddr_hw_addr;
         if (env_flag_enabled("SRC_REAL_NETWORK_ADDR_TRACE")) {
             printf("network_addr_trace event=tcp_send channel=%d send_chunk=%u"
                    " ddr=0x%08" PRIx64 " bytes=%" PRIu64
                    " desc_cpu=0x%08" PRIx64 " desc_dma=0x%08" PRIx64 "\n",
                    cfg->id,
                    (unsigned)chunk_index,
-                   tcp_cfg.ddr_dma_base,
+                   tcp_cfg.ddr_hw_addr,
                    tcp_cfg.transfer_bytes,
                    tcp_cfg.desc_cpu_base,
                    tcp_cfg.desc_dma_base);
@@ -3791,7 +3579,7 @@ static int network_send_serial(const ParsedArgs *args,
 static int network_diag_read(ChannelRuntime *rt,
                              const ChannelConfig *cfg,
                              uint64_t lba,
-                             uint64_t ddr_hw,
+                             uint64_t ddr_hw_addr,
                              uint64_t bytes,
                              const char *label)
 {
@@ -3808,14 +3596,14 @@ static int network_diag_read(ChannelRuntime *rt,
            lba,
            sectors,
            bytes,
-           ddr_hw);
+           ddr_hw_addr);
     fflush(stdout);
-    return nvme_rw(rt, false, lba, sectors, ddr_hw);
+    return nvme_rw(rt, false, lba, sectors, ddr_hw_addr);
 }
 
 static int network_diag_send(const ChannelConfig *cfg,
                              GlobalOptions gopt,
-                             uint64_t ddr_hw,
+                             uint64_t ddr_hw_addr,
                              uint64_t bytes,
                              const char *label)
 {
@@ -3828,12 +3616,12 @@ static int network_diag_send(const ChannelConfig *cfg,
     if (configure_tcp_for_channel(cfg, &tcp_cfg) != 0) {
         return -1;
     }
-    tcp_cfg.ddr_dma_base = ddr_hw;
+    tcp_cfg.ddr_hw_addr = ddr_hw_addr;
     printf("network_diag event=send label=%s channel=%d ddr=0x%08" PRIx64
            " bytes=%" PRIu64 " desc_cpu=0x%08" PRIx64 " desc_dma=0x%08" PRIx64 "\n",
            label ? label : "unknown",
            cfg->id,
-           ddr_hw,
+           ddr_hw_addr,
            bytes,
            tcp_cfg.desc_cpu_base,
            tcp_cfg.desc_dma_base);
@@ -3857,14 +3645,15 @@ static int network_run_download_diagnostic(const FileRecord *rec,
     const uint64_t send_bytes = TCP_MAX_BYTES_PER_DESC;
     const uint64_t read_sectors = read_bytes / SECTOR_SIZE;
     const uint64_t send_sectors = send_bytes / SECTOR_SIZE;
-    const uint64_t ddr_base = cfg ? cfg->ddr_hw_base + NETWORK_DDR_OFFSET_BYTES : 0u;
+    const uint64_t ddr_hw_addr =
+        cfg ? cfg->ddr_hw_base + NETWORK_DDR_OFFSET_BYTES : 0u;
     int rc;
 
     if (!mode || mode[0] == '\0') {
         return 1;
     }
     if (!rec || !cfg || !rt || rec->file_size < read_bytes ||
-        ddr_base > UINT64_MAX - send_bytes) {
+        ddr_hw_addr > UINT64_MAX - send_bytes) {
         return -1;
     }
     printf("network_diag event=start mode=%s channel=%d base_lba=0x%08" PRIx64
@@ -3872,7 +3661,7 @@ static int network_run_download_diagnostic(const FileRecord *rec,
            mode,
            cfg->id,
            (uint64_t)rec->start_sector,
-           ddr_base,
+           ddr_hw_addr,
            read_bytes,
            send_bytes);
     fflush(stdout);
@@ -3883,25 +3672,28 @@ static int network_run_download_diagnostic(const FileRecord *rec,
             return -1;
         }
         rc = network_diag_read(rt, cfg, (uint64_t)rec->start_sector,
-                               ddr_base, send_bytes, "A_read_16m");
+                               ddr_hw_addr, send_bytes, "A_read_16m");
         if (rc != 0) return rc;
-        rc = network_diag_send(cfg, gopt, ddr_base, send_bytes, "A_send_16m");
+        rc = network_diag_send(cfg, gopt, ddr_hw_addr, send_bytes,
+                               "A_send_16m");
         if (rc != 0) return rc;
-        rc = network_diag_send(cfg, gopt, ddr_base, read_bytes, "A_send_first_8m");
+        rc = network_diag_send(cfg, gopt, ddr_hw_addr, read_bytes,
+                               "A_send_first_8m");
         if (rc != 0) return rc;
-        return network_diag_send(cfg, gopt, ddr_base + read_bytes,
+        return network_diag_send(cfg, gopt, ddr_hw_addr + read_bytes,
                                  read_bytes, "A_send_second_8m");
     }
     if (strcmp(mode, "B") == 0) {
         rc = network_diag_read(rt, cfg, (uint64_t)rec->start_sector,
-                               ddr_base, read_bytes, "B_read_a");
+                               ddr_hw_addr, read_bytes, "B_read_a");
         if (rc != 0) return rc;
         rc = network_diag_read(rt, cfg, (uint64_t)rec->start_sector,
-                               ddr_base + read_bytes, read_bytes, "B_read_b_same_lba");
+                               ddr_hw_addr + read_bytes, read_bytes,
+                               "B_read_b_same_lba");
         if (rc != 0) return rc;
-        rc = network_diag_send(cfg, gopt, ddr_base, read_bytes, "B_send_a");
+        rc = network_diag_send(cfg, gopt, ddr_hw_addr, read_bytes, "B_send_a");
         if (rc != 0) return rc;
-        return network_diag_send(cfg, gopt, ddr_base + read_bytes,
+        return network_diag_send(cfg, gopt, ddr_hw_addr + read_bytes,
                                  read_bytes, "B_send_b");
     }
     if (strcmp(mode, "C") == 0) {
@@ -3911,14 +3703,15 @@ static int network_run_download_diagnostic(const FileRecord *rec,
             return -1;
         }
         rc = network_diag_read(rt, cfg, (uint64_t)rec->start_sector,
-                               ddr_base, read_bytes, "C_read_a");
+                               ddr_hw_addr, read_bytes, "C_read_a");
         if (rc != 0) return rc;
-        rc = network_diag_send(cfg, gopt, ddr_base, read_bytes, "C_send_a");
+        rc = network_diag_send(cfg, gopt, ddr_hw_addr, read_bytes, "C_send_a");
         if (rc != 0) return rc;
         rc = network_diag_read(rt, cfg, (uint64_t)rec->start_sector + read_sectors,
-                               ddr_base, read_bytes, "C_read_b_same_ddr");
+                               ddr_hw_addr, read_bytes, "C_read_b_same_ddr");
         if (rc != 0) return rc;
-        return network_diag_send(cfg, gopt, ddr_base, read_bytes, "C_send_b");
+        return network_diag_send(cfg, gopt, ddr_hw_addr, read_bytes,
+                                 "C_send_b");
     }
     if (strcmp(mode, "D") == 0) {
         if (rec->file_size < send_bytes ||
@@ -3928,9 +3721,10 @@ static int network_run_download_diagnostic(const FileRecord *rec,
         printf("network_diag event=mode_d note=nvme_reads_fixed_at_4k\n");
         fflush(stdout);
         rc = network_diag_read(rt, cfg, (uint64_t)rec->start_sector,
-                               ddr_base, send_bytes, "D_read_16m");
+                               ddr_hw_addr, send_bytes, "D_read_16m");
         if (rc != 0) return rc;
-        return network_diag_send(cfg, gopt, ddr_base, send_bytes, "D_send_16m");
+        return network_diag_send(cfg, gopt, ddr_hw_addr, send_bytes,
+                                 "D_send_16m");
     }
 
     fprintf(stderr, "Unsupported SRC_REAL_NETWORK_DIAG_MODE=%s; use A, B, C, or D\n", mode);
@@ -4026,16 +3820,7 @@ static int network_send_existing_file(const ParsedArgs *args, GlobalOptions gopt
      * ch0/ch1 the packet is filled by two 8 MiB SSD reads before it is sent.
      */
     max_payload_bytes = TCP_MAX_BYTES_PER_DESC;
-    /*
-     * The download pipeline only needs a few low-address hardware DDR slots
-     * for double/triple buffering.  ddr_cpu_size is historical configuration
-     * metadata used here as the default low-address window; the data DDR is
-     * not CPU-accessible on this platform.
-     */
-    network_ring_bytes = cfg->ddr_cpu_size;
-    if (network_ring_bytes == 0u || network_ring_bytes > cfg->dma_ring_bytes) {
-        network_ring_bytes = cfg->dma_ring_bytes;
-    }
+    network_ring_bytes = cfg->dma_ring_bytes;
     if (max_payload_bytes == 0u ||
         max_payload_bytes + NETWORK_DDR_OFFSET_BYTES > network_ring_bytes) {
         fprintf(stderr, "DDR ring too small for TCP frame size\n");
@@ -4160,13 +3945,6 @@ static int network_send_existing_file(const ParsedArgs *args, GlobalOptions gopt
         pipe_ctx.start_lba = cur_lba;
         pipe_ctx.read_cmd_sectors = nvme_read_command_sectors(&rt);
         pipe_ctx.proto_file_type = (uint32_t)rec.proto_file_type_code;
-#ifdef CCB_BUILD_DIAG
-        pipe_ctx.verify_ddr_read = env_flag_enabled("SRC_REAL_NETWORK_VERIFY_DDR_READ");
-        pipe_ctx.verify_bytes = env_u32_or_default("SRC_REAL_NETWORK_VERIFY_BYTES", 4096u);
-        if (pipe_ctx.verify_bytes == 0u) {
-            pipe_ctx.verify_bytes = 4096u;
-        }
-#endif
 
         dbg_printf("[DBG][NET] pipeline start task=%s idx=%u chunks=%u slots=%u\n",
                    args->task_no,
@@ -4263,7 +4041,7 @@ static int configure_tcp_for_channel(const ChannelConfig *cfg, TcpTransferConfig
     tcp_cfg->dma_base = cfg->dma_base;
     tcp_cfg->desc_cpu_base = cfg->desc_cpu_base;
     tcp_cfg->desc_dma_base = cfg->desc_dma_base;
-    tcp_cfg->ddr_dma_base = cfg->ddr_hw_base;
+    tcp_cfg->ddr_hw_addr = cfg->ddr_hw_base;
     return 0;
 }
 

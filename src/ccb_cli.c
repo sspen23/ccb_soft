@@ -103,7 +103,8 @@ static int validate_dma_desc_bytes_for_channel(const ParsedArgs *a)
     return 0;
 }
 
-static int validate_ddr_offset_for_channel(const ParsedArgs *a)
+static int validate_ddr_offset_for_channel(const ParsedArgs *a,
+                                           uint64_t default_size)
 {
     const ChannelConfig *cfg;
     uint64_t size;
@@ -120,16 +121,16 @@ static int validate_ddr_offset_for_channel(const ParsedArgs *a)
         fprintf(stderr, "Invalid channel for --ddr-offset\n");
         return -1;
     }
-    size = a->has_size ? a->size_bytes : (32ull * 1024ull * 1024ull);
-    if (a->ddr_offset > cfg->dma_ring_bytes_max ||
-        size > (cfg->dma_ring_bytes_max - a->ddr_offset)) {
+    size = a->has_size ? a->size_bytes : default_size;
+    if (a->ddr_offset > cfg->dma_ring_bytes ||
+        size > (cfg->dma_ring_bytes - a->ddr_offset)) {
         fprintf(stderr,
                 "--ddr-offset range exceeds channel %d ring: offset=%" PRIu64
                 " size=%" PRIu64 " ring=%" PRIu64 "\n",
                 cfg->id,
                 a->ddr_offset,
                 size,
-                cfg->dma_ring_bytes_max);
+                cfg->dma_ring_bytes);
         return -1;
     }
     return 0;
@@ -152,7 +153,7 @@ void usage(void) {
             " --duration-sec N --source transfer|test\n"
             "  ccb_nvme_tool [--dry-run] [--skip-link-check] [--timeout-us N] network-send --task-no <id> --file-index <n> --proto-file-type <0|1|2|3>\n"
             "  ccb_nvme_tool [--dry-run] [--skip-link-check] [--timeout-us N] read --channel 0|1|2 "
-            "[--task-no <id> --file-index <n> | --ssd-lba 0x... --size <bytes>]\n"
+            "[--task-no <id> --file-index <n> | --ssd-lba 0x... --size <bytes>] [--ddr-offset <bytes>]\n"
             "  ccb_nvme_tool [--dry-run] [--skip-link-check] [--timeout-us N] list --channel all|0|1|2\n"
             "  ccb_nvme_tool [--dry-run] [--skip-link-check] [--timeout-us N] init-meta --channel all|0|1|2\n"
             "\n"
@@ -451,6 +452,9 @@ int validate_read_args(const ParsedArgs *a) {
         fprintf(stderr, "--size must be aligned to %u bytes\n", SECTOR_SIZE);
         return -1;
     }
+    if (validate_ddr_offset_for_channel(a, 0u) != 0) {
+        return -1;
+    }
     return 0;
 }
 
@@ -514,7 +518,7 @@ int validate_ddr_pattern_store_args(const ParsedArgs *a) {
     const ChannelConfig *cfg = a->has_channel ? find_channel(a->channel_id) : find_channel(LOW_SPEED_CHANNEL_ID);
     const char *raw_env = storage_config_compat_getenv("SRC_REAL_DDR_RAW_STORE");
     bool raw_store = raw_env && raw_env[0] != '\0' && strcmp(raw_env, "0") != 0;
-    uint64_t size_limit = raw_store && cfg ? cfg->dma_ring_bytes : CHANNEL_CPU_DDR_BYTES;
+    uint64_t size_limit = cfg ? cfg->dma_ring_bytes : 0u;
 
     if (!a->has_task_no || !a->has_file_index || !a->has_proto_file_type) {
         fprintf(stderr, "ddr-pattern-store requires --task-no --file-index --proto-file-type\n");
@@ -526,6 +530,12 @@ int validate_ddr_pattern_store_args(const ParsedArgs *a) {
     }
     if (a->has_channel && !find_channel(a->channel_id)) {
         fprintf(stderr, "Invalid channel: %d\n", a->channel_id);
+        return -1;
+    }
+    if (!raw_store) {
+        fprintf(stderr,
+                "ddr-pattern-store requires SRC_REAL_DDR_RAW_STORE=1 because"
+                " data DDR is not CPU-accessible\n");
         return -1;
     }
     if (strlen(a->task_no) > 11u) {
@@ -540,7 +550,7 @@ int validate_ddr_pattern_store_args(const ParsedArgs *a) {
         fprintf(stderr, "--size must be 1..%" PRIu64 " bytes\n", size_limit);
         return -1;
     }
-    if (validate_ddr_offset_for_channel(a) != 0) {
+    if (validate_ddr_offset_for_channel(a, 32ull * 1024ull * 1024ull) != 0) {
         return -1;
     }
     return 0;
@@ -549,6 +559,8 @@ int validate_ddr_pattern_store_args(const ParsedArgs *a) {
 int validate_ssd_lba_wrap_test_args(const ParsedArgs *a) {
     uint64_t size = a->has_size ? a->size_bytes : (4ull * 1024ull * 1024ull);
     uint64_t aligned = (size + 4095ull) & ~4095ull;
+    const ChannelConfig *cfg = find_channel(LOW_SPEED_CHANNEL_ID);
+    uint64_t max_size = cfg ? cfg->dma_ring_bytes / 4u : 0u;
 
     if (!a->has_lba || a->lba_auto) {
         fprintf(stderr, "ssd-lba-wrap-test requires explicit --ssd-lba 0x... and will overwrite test ranges\n");
@@ -566,9 +578,9 @@ int validate_ssd_lba_wrap_test_args(const ParsedArgs *a) {
         fprintf(stderr, "--size must be aligned to %u bytes\n", SECTOR_SIZE);
         return -1;
     }
-    if (size == 0u || aligned > CHANNEL_CPU_DDR_BYTES / 4u) {
-        fprintf(stderr, "--size must fit four buffers in ch2 CPU DDR window; max=%" PRIu64 " bytes\n",
-                (uint64_t)(CHANNEL_CPU_DDR_BYTES / 4u));
+    if (size == 0u || aligned > max_size) {
+        fprintf(stderr, "--size must fit four buffers in ch2 DDR ring; max=%" PRIu64 " bytes\n",
+                max_size);
         return -1;
     }
     return 0;

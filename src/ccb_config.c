@@ -5,10 +5,11 @@
  * capacities.
  *
  * Compared with the older bare-metal table in src_mb, the device tree is the
- * authority here for MMIO bases and descriptor BRAM CPU addresses. The
- * channel DDR CPU windows are only 64 MiB each, while DMA/NVMe are connected
- * to wider data-buffer DDR windows. ch0/ch1 are clamped by software to the
- * stable low 1 GiB window; larger environment requests are rejected at runtime.
+ * authority here for MMIO bases and descriptor BRAM CPU addresses. Channel
+ * data DDR is not mapped into the CPU address space; software passes only
+ * channel-local DDR offsets or DMA/NVMe hardware addresses. ch0/ch1 are
+ * clamped to the stable low 1 GiB window; larger environment requests are
+ * rejected at runtime.
  *
  * Descriptor BRAM uses the device-tree CPU address for /dev/mem access, while
  * AXI DMA still uses the old descriptor hardware-view base 0x10000000.
@@ -27,12 +28,14 @@ const ChannelConfig kChannels[NUM_CHANNELS] = {
         .desc_cpu_base = 0x20000000ull,
         .desc_dma_base = 0x10000000ull,
         .desc_cpu_size = 0x4000ull,
-        .ddr_cpu_base = 0x10000000ull,
         .ddr_hw_base = 0x00000000ull,
-        .ddr_cpu_size = CHANNEL_CPU_DDR_BYTES,
         .dma_ring_bytes = CHANNEL0_DDR_BYTES,
         .dma_ring_bytes_max = CHANNEL0_DDR_BYTES_MAX,
         .dma_desc_bytes_default = DMA_DESC_BYTES_CH0_DEFAULT,
+        .nvme_manual_prp = true,
+        .prp_list_cpu_base = 0xc0000000ull,
+        .prp_list_hw_base = 0xc0000000ull,
+        .prp_list_size = 0x8000u,
     },
     {
         .id = HIGH_Q_CHANNEL_ID,
@@ -41,17 +44,18 @@ const ChannelConfig kChannels[NUM_CHANNELS] = {
         .dma_base = 0xa0060000ull,
         .axis_switch_base = 0xa0070000ull,
         .nvme_base = 0xa0080000ull,
-        /* 0xd0000000 is the ch1 DDR CPU window, not PCIe bridge control. */
         .pcie_bridge_base = 0ull,
         .desc_cpu_base = 0x30000000ull,
         .desc_dma_base = 0x10000000ull,
         .desc_cpu_size = 0x4000ull,
-        .ddr_cpu_base = 0xd0000000ull,
         .ddr_hw_base = 0x00000000ull,
-        .ddr_cpu_size = CHANNEL_CPU_DDR_BYTES,
         .dma_ring_bytes = CHANNEL1_DDR_BYTES,
         .dma_ring_bytes_max = CHANNEL1_DDR_BYTES_MAX,
         .dma_desc_bytes_default = DMA_DESC_BYTES_CH0_DEFAULT,
+        .nvme_manual_prp = true,
+        .prp_list_cpu_base = 0xc2000000ull,
+        .prp_list_hw_base = 0xc2000000ull,
+        .prp_list_size = 0x8000u,
     },
     {
         .id = LOW_SPEED_CHANNEL_ID,
@@ -64,9 +68,7 @@ const ChannelConfig kChannels[NUM_CHANNELS] = {
         .desc_cpu_base = 0x20004000ull,
         .desc_dma_base = 0x10000000ull,
         .desc_cpu_size = 0x4000ull,
-        .ddr_cpu_base = 0xc0000000ull,
         .ddr_hw_base = 0x00000000ull,
-        .ddr_cpu_size = CHANNEL_CPU_DDR_BYTES,
         .dma_ring_bytes = CHANNEL2_DDR_BYTES,
         .dma_ring_bytes_max = CHANNEL2_DDR_BYTES_MAX,
         .dma_desc_bytes_default = DMA_DESC_BYTES_CH2_DEFAULT,

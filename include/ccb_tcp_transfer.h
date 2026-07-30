@@ -12,7 +12,7 @@ typedef struct {
     uint64_t dma_base;
     uint64_t desc_cpu_base;
     uint64_t desc_dma_base;
-    uint64_t ddr_dma_base;
+    uint64_t ddr_hw_addr;
     uint64_t transfer_bytes;
     uint32_t timeout_us;
     bool dry_run;

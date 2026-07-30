@@ -67,7 +67,7 @@ typedef struct {
     uint64_t file_offset;
     uint64_t start_lba;
     uint64_t sectors;
-    uint64_t hw_addr;
+    uint64_t ddr_hw_addr;
 } PendingDdrSlot;
 
 typedef enum {
@@ -405,10 +405,9 @@ static int flush_slot_to_nvme(ChannelRuntime *rt,
                               uint32_t file_index,
                               int metadata_slot,
                               const char *task_no);
-static int storage_slot_addresses(const ChannelRuntime *rt,
-                                  const PendingDdrSlot *item,
-                                  uint64_t *buffer_offset,
-                                  uint64_t *cpu_addr);
+static int storage_slot_offset(const ChannelRuntime *rt,
+                               const PendingDdrSlot *item,
+                               uint64_t *buffer_offset);
 static int storage_zero_tail_padding(ChannelRuntime *rt,
                                      const PendingDdrSlot *item,
                                      uint64_t buffer_offset);
@@ -1996,9 +1995,9 @@ static int storage_local_queue_push_batch(StorageWriteQueue *q, const PendingDdr
             items[i].start_lba > UINT64_MAX - items[i].sectors ||
             (q->rt->nvme_max_lba != 0u &&
              !nvme_lba_range_valid(q->rt, items[i].start_lba, items[i].sectors)) ||
-            items[i].hw_addr != expected_hw_addr ||
-            items[i].hw_addr > UINT64_MAX - items[i].media_bytes) goto bad;
-        ddr_end = items[i].hw_addr + items[i].media_bytes;
+            items[i].ddr_hw_addr != expected_hw_addr ||
+            items[i].ddr_hw_addr > UINT64_MAX - items[i].media_bytes) goto bad;
+        ddr_end = items[i].ddr_hw_addr + items[i].media_bytes;
         if (q->rt->cfg->ddr_hw_base > UINT64_MAX - q->rt->dma_ring_bytes ||
             ddr_end > q->rt->cfg->ddr_hw_base + q->rt->dma_ring_bytes ||
             batch_bytes > UINT64_MAX - items[i].bytes) goto bad;
@@ -3288,7 +3287,7 @@ static int storage_cross_slot_done_cb(void *opaque, const NvmeWriteSlotReq *req)
     item.file_offset = req->file_offset;
     item.start_lba = req->start_lba;
     item.sectors = req->sectors;
-    item.hw_addr = req->hw_addr;
+    item.ddr_hw_addr = req->ddr_hw_addr;
     storage_trace_flush_done(q->rt, &item, q->file_index, q->metadata_slot, q->task_no);
     return storage_complete_slot(q, &item);
 }
@@ -3473,10 +3472,12 @@ static void *storage_nvme_cross_slot_writer_thread(void *arg) {
             wait_for_item = false;
             memset(&req, 0, sizeof(req));
             req.slot = item.slot; req.start_lba = item.start_lba; req.sectors = item.sectors;
-            req.hw_addr = item.hw_addr; req.bytes = item.bytes; req.chunk_index = item.chunk_index;
+            req.ddr_hw_addr = item.ddr_hw_addr;
+            req.bytes = item.bytes;
+            req.chunk_index = item.chunk_index;
             req.media_bytes = item.media_bytes;
             req.file_offset = item.file_offset;
-            if (storage_slot_addresses(q->rt, &item, &buffer_offset, NULL) != 0 ||
+            if (storage_slot_offset(q->rt, &item, &buffer_offset) != 0 ||
                 storage_zero_tail_padding(q->rt, &item, buffer_offset) != 0) {
                 storage_set_writer_error_reason(
                     q, q->rt->nvme_last_error[0] != '\0'
@@ -3585,9 +3586,7 @@ static int storage_write_stop_requested(void) {
 static void print_report_write(const ChannelRuntime *rt,
                                uint32_t slot,
                                uint64_t ddr_offset,
-                               uint64_t cpu_addr,
-                               uint32_t cpu_visible,
-                               uint64_t hw_addr,
+                               uint64_t ddr_hw_addr,
                                uint64_t lba,
                                uint64_t sectors,
                                uint64_t bytes,
@@ -3598,16 +3597,13 @@ static void print_report_write(const ChannelRuntime *rt,
         return;
     }
     printf("transfer_report channel=%d source=%s ddr_slot=%u ddr_offset=0x%08" PRIx64
-           " ddr_cpu_addr=0x%08" PRIx64 " ddr_cpu_visible=%u"
            " ddr_hw_addr=0x%08" PRIx64 " ssd_lba=0x%08" PRIx64
            " sector_count=%" PRIu64 " byte_count=%" PRIu64 " task_no=%s file_index=%u metadata_slot=%d\n",
            rt->cfg->id,
            "write",
            slot,
            ddr_offset,
-           cpu_addr,
-           (unsigned)cpu_visible,
-           hw_addr,
+           ddr_hw_addr,
            lba,
            sectors,
            bytes,
@@ -3616,10 +3612,9 @@ static void print_report_write(const ChannelRuntime *rt,
            metadata_slot);
 }
 
-static int storage_slot_addresses(const ChannelRuntime *rt,
-                                  const PendingDdrSlot *item,
-                                  uint64_t *buffer_offset,
-                                  uint64_t *cpu_addr) {
+static int storage_slot_offset(const ChannelRuntime *rt,
+                               const PendingDdrSlot *item,
+                               uint64_t *buffer_offset) {
     uint64_t offset;
     uint64_t media_bytes;
 
@@ -3634,11 +3629,6 @@ static int storage_slot_addresses(const ChannelRuntime *rt,
     }
     if (buffer_offset) {
         *buffer_offset = offset;
-    }
-    if (cpu_addr) {
-        *cpu_addr = (offset + media_bytes) <= rt->cfg->ddr_cpu_size
-                        ? rt->cfg->ddr_cpu_base + offset
-                        : 0u;
     }
     return 0;
 }
@@ -3663,7 +3653,7 @@ static int storage_zero_tail_padding(ChannelRuntime *rt, const PendingDdrSlot *i
 static void storage_trace_flush_start(const ChannelRuntime *rt, const PendingDdrSlot *item) {
     uint64_t buffer_offset = 0u;
 
-    if (!rt || !item || storage_slot_addresses(rt, item, &buffer_offset, NULL) != 0) {
+    if (!rt || !item || storage_slot_offset(rt, item, &buffer_offset) != 0) {
         return;
     }
     if (storage_trace_chunk_enabled(item->chunk_index, item->slot)) {
@@ -3681,7 +3671,7 @@ static void storage_trace_flush_start(const ChannelRuntime *rt, const PendingDdr
                item->sectors,
                item->start_lba,
                buffer_offset,
-               item->hw_addr);
+               item->ddr_hw_addr);
         fflush(stdout);
     }
     dbg_verbose_printf("[DBG][WRITE] flush start ch=%d slot=%u bytes=%" PRIu64
@@ -3691,18 +3681,17 @@ static void storage_trace_flush_start(const ChannelRuntime *rt, const PendingDdr
                        item->bytes,
                        item->start_lba,
                        item->sectors,
-                       item->hw_addr);
+                       item->ddr_hw_addr);
 }
 
 static void storage_trace_flush_done(const ChannelRuntime *rt,
                                      const PendingDdrSlot *item,
                                      uint32_t file_index,
                                      int metadata_slot,
-                                     const char *task_no) {
+    const char *task_no) {
     uint64_t buffer_offset = 0u;
-    uint64_t cpu_addr = 0u;
 
-    if (!rt || !item || storage_slot_addresses(rt, item, &buffer_offset, &cpu_addr) != 0) {
+    if (!rt || !item || storage_slot_offset(rt, item, &buffer_offset) != 0) {
         return;
     }
     dbg_verbose_printf("[DBG][WRITE] flush done ch=%d slot=%u bytes=%" PRIu64
@@ -3731,9 +3720,7 @@ static void storage_trace_flush_done(const ChannelRuntime *rt,
     print_report_write(rt,
                        item->slot,
                        buffer_offset,
-                       cpu_addr,
-                       (cpu_addr != 0u) ? 1u : 0u,
-                       item->hw_addr,
+                       item->ddr_hw_addr,
                        item->start_lba,
                        item->sectors,
                        item->bytes,
@@ -3774,7 +3761,7 @@ static int flush_slot_to_nvme(ChannelRuntime *rt,
                 (unsigned)rt->dma_desc_count);
         return -1;
     }
-    if (storage_slot_addresses(rt, item, &buffer_offset, NULL) != 0) {
+    if (storage_slot_offset(rt, item, &buffer_offset) != 0) {
         fprintf(stderr,
                 "DMA write range exceeds ring window: channel=%d slot=%u bytes=%" PRIu64
                 " ring_size=%" PRIu64 "\n",
@@ -3786,7 +3773,8 @@ static int flush_slot_to_nvme(ChannelRuntime *rt,
     }
     if (storage_zero_tail_padding(rt, item, buffer_offset) != 0) return -1;
     sectors = media_bytes / SECTOR_SIZE;
-    if (item->sectors != sectors || item->hw_addr != rt->cfg->ddr_hw_base + buffer_offset) {
+    if (item->sectors != sectors ||
+        item->ddr_hw_addr != rt->cfg->ddr_hw_base + buffer_offset) {
         fprintf(stderr,
                 "DMA queued slot invariant failed: channel=%d slot=%u bytes=%" PRIu64
                 " queued_sectors=%" PRIu64 " expected_sectors=%" PRIu64
@@ -3796,7 +3784,7 @@ static int flush_slot_to_nvme(ChannelRuntime *rt,
                 item->bytes,
                 item->sectors,
                 sectors,
-                item->hw_addr,
+                item->ddr_hw_addr,
                 rt->cfg->ddr_hw_base + buffer_offset);
         return -1;
     }
@@ -3842,7 +3830,7 @@ static int flush_slot_to_nvme(ChannelRuntime *rt,
     }
     if (rt->nvme_feed_mode == NVME_FEED_MODE_TIGHT) {
         if (nvme_write_contiguous_tight_qd_payload(rt,
-                                           item->hw_addr,
+                                           item->ddr_hw_addr,
                                            item->start_lba,
                                            media_bytes,
                                            item->bytes,
@@ -3855,7 +3843,8 @@ static int flush_slot_to_nvme(ChannelRuntime *rt,
             return -1;
         }
     } else if (nvme_write_slot_qd_payload(rt, item->slot, item->start_lba,
-                                          item->sectors, item->bytes, item->hw_addr) != 0) {
+                                          item->sectors, item->bytes,
+                                          item->ddr_hw_addr) != 0) {
         dbg_printf("[DBG][WRITE] nvme write failed ch=%d lba=0x%08" PRIx64 " sectors=%" PRIu64 "\n",
                    rt->cfg->id,
                    item->start_lba,
@@ -4248,7 +4237,7 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
     dma_started = false;
     dbg_verbose_printf("[DBG][WRITE] dma ready ch=%d desc_bytes=%u desc_count=%u desc_cpu=0x%08" PRIx64
                        " desc_dma=0x%08" PRIx64 " desc_size=0x%08" PRIx64
-                       " ddr_cpu=0x%08" PRIx64 " ddr_hw=0x%08" PRIx64
+                       " ddr_hw_addr=0x%08" PRIx64
                        " ring_bytes=%" PRIu64 " continuous=%u\n",
                        cfg->id,
                        (unsigned)rt.dma_desc_bytes,
@@ -4256,7 +4245,6 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                        cfg->desc_cpu_base,
                        cfg->desc_dma_base,
                        cfg->desc_cpu_size,
-                       cfg->ddr_cpu_base,
                        cfg->ddr_hw_base,
                        rt.dma_ring_bytes,
                        bounded ? 0u : 1u);
@@ -5347,7 +5335,7 @@ int execute_write_with_result_mode(const ParsedArgs *args, GlobalOptions gopt,
                         batch_item_invalid = true;
                         break;
                     }
-                    pending[valid_count].hw_addr = rt.cfg->ddr_hw_base +
+                    pending[valid_count].ddr_hw_addr = rt.cfg->ddr_hw_base +
                                          (uint64_t)pending[valid_count].slot * rt.dma_desc_bytes;
                     batch_bytes += queued_bytes;
                     batch_sectors += pending[valid_count].sectors;
@@ -6271,7 +6259,7 @@ out:
                             storage_mark_harvest_slot_failed(&write_queue, stopped_items[i].slot);
                             continue;
                         }
-                        stopped_pending[valid_count].hw_addr = rt.cfg->ddr_hw_base +
+                        stopped_pending[valid_count].ddr_hw_addr = rt.cfg->ddr_hw_base +
                             (uint64_t)stopped_pending[valid_count].slot * rt.dma_desc_bytes;
                         batch_bytes += bytes;
                         batch_sectors += stopped_pending[valid_count].sectors;
@@ -6673,128 +6661,6 @@ int execute_write(const ParsedArgs *args, GlobalOptions gopt) {
 }
 
 #ifdef CCB_BUILD_DIAG
-static void fill_dual16_increment_pattern(volatile uint8_t *base, uint64_t bytes)
-{
-    uint64_t words = bytes / sizeof(uint32_t);
-    volatile uint32_t *p32 = (volatile uint32_t *)(void *)base;
-    uint64_t i;
-
-    for (i = 0u; i < words; ++i) {
-        uint32_t v = (uint32_t)(i & 0xffffu);
-        p32[i] = (v << 16u) | v;
-    }
-    __sync_synchronize();
-}
-
-static int verify_dual16_increment_pattern(const volatile uint8_t *base,
-                                           uint64_t bytes,
-                                           const char *stage)
-{
-    const volatile uint32_t *p32 = (const volatile uint32_t *)(const void *)base;
-    uint64_t words = bytes / sizeof(uint32_t);
-    uint64_t i;
-
-    __sync_synchronize();
-    for (i = 0u; i < words; ++i) {
-        uint32_t v = (uint32_t)(i & 0xffffu);
-        uint32_t expected = (v << 16u) | v;
-        uint32_t actual = p32[i];
-
-        if (actual != expected) {
-            printf("ddr_pattern_verify stage=%s result=failed word=%" PRIu64
-                   " byte_offset=%" PRIu64 " expected=0x%08x actual=0x%08x\n",
-                   stage,
-                   i,
-                   i * sizeof(uint32_t),
-                   expected,
-                   actual);
-            fflush(stdout);
-            return -1;
-        }
-    }
-    printf("ddr_pattern_verify stage=%s result=ok words=%" PRIu64 " bytes=%" PRIu64 "\n",
-           stage,
-           words,
-           bytes);
-    fflush(stdout);
-    return 0;
-}
-
-static uint32_t wrap_test_word(uint32_t seed, uint64_t word_index)
-{
-    uint32_t lo = (uint32_t)((word_index + seed) & 0xffffu);
-    uint32_t hi = (uint32_t)(((word_index >> 3u) ^ (uint64_t)(seed >> 16u)) & 0xffffu);
-    return (hi << 16u) | lo;
-}
-
-static void fill_wrap_test_pattern_at(volatile uint8_t *base,
-                                      uint64_t bytes,
-                                      uint32_t seed,
-                                      uint64_t base_word)
-{
-    uint64_t words = bytes / sizeof(uint32_t);
-    volatile uint32_t *p32 = (volatile uint32_t *)(void *)base;
-    uint64_t i;
-
-    for (i = 0u; i < words; ++i) {
-        p32[i] = wrap_test_word(seed, base_word + i);
-    }
-    __sync_synchronize();
-}
-
-static void fill_wrap_test_pattern(volatile uint8_t *base, uint64_t bytes, uint32_t seed)
-{
-    fill_wrap_test_pattern_at(base, bytes, seed, 0u);
-}
-
-static int verify_wrap_test_pattern_at(const volatile uint8_t *base,
-                                       uint64_t bytes,
-                                       uint32_t seed,
-                                       uint64_t base_word,
-                                       uint64_t base_byte_offset,
-                                       const char *stage)
-{
-    const volatile uint32_t *p32 = (const volatile uint32_t *)(const void *)base;
-    uint64_t words = bytes / sizeof(uint32_t);
-    uint64_t i;
-
-    __sync_synchronize();
-    for (i = 0u; i < words; ++i) {
-        uint32_t expected = wrap_test_word(seed, base_word + i);
-        uint32_t actual = p32[i];
-
-        if (actual != expected) {
-            printf("ssd_pattern_verify stage=%s result=failed word=%" PRIu64
-                   " byte_offset=%" PRIu64 " expected=0x%08x actual=0x%08x seed=0x%08x\n",
-                   stage,
-                   base_word + i,
-                   base_byte_offset + i * sizeof(uint32_t),
-                   expected,
-                   actual,
-                   seed);
-            fflush(stdout);
-            return -1;
-        }
-    }
-    printf("ssd_pattern_verify stage=%s result=ok words=%" PRIu64
-           " bytes=%" PRIu64 " byte_offset=%" PRIu64 " seed=0x%08x\n",
-           stage,
-           words,
-           bytes,
-           base_byte_offset,
-           seed);
-    fflush(stdout);
-    return 0;
-}
-
-static int verify_wrap_test_pattern(const volatile uint8_t *base,
-                                    uint64_t bytes,
-                                    uint32_t seed,
-                                    const char *stage)
-{
-    return verify_wrap_test_pattern_at(base, bytes, seed, 0u, 0u, stage);
-}
-
 int execute_ddr_pattern_store_with_result(const ParsedArgs *args, GlobalOptions gopt, WriteResult *result)
 {
     int channel_id = args && args->has_channel ? args->channel_id : LOW_SPEED_CHANNEL_ID;
@@ -6811,13 +6677,11 @@ int execute_ddr_pattern_store_with_result(const ParsedArgs *args, GlobalOptions 
     uint64_t ddr_offset = 0u;
     uint64_t ddr_hw_addr = 0u;
     uint64_t start_us = 0u;
-    uint64_t fill_us = 0u;
     uint64_t write_us = 0u;
     uint64_t perf_expected_cmds = 0u;
     uint32_t effective_file_index;
     DmaStopReport dma_stop_report;
     bool raw_store;
-    bool raw_verify;
 
     if (result) {
         memset(result, 0, sizeof(*result));
@@ -6827,7 +6691,19 @@ int execute_ddr_pattern_store_with_result(const ParsedArgs *args, GlobalOptions 
         return -1;
     }
     raw_store = storage_env_flag_enabled("SRC_REAL_DDR_RAW_STORE") != 0;
-    raw_verify = raw_store && storage_env_flag_enabled("SRC_REAL_DDR_RAW_VERIFY") != 0;
+    if (!raw_store) {
+        fprintf(stderr,
+                "ddr-pattern-store cannot generate a CPU pattern because data DDR"
+                " is not CPU-accessible; use SRC_REAL_DDR_RAW_STORE=1 with"
+                " preloaded DDR data\n");
+        return -1;
+    }
+    if (storage_env_flag_enabled("SRC_REAL_DDR_RAW_VERIFY") != 0) {
+        fprintf(stderr,
+                "SRC_REAL_DDR_RAW_VERIFY is unsupported because data DDR is not"
+                " CPU-accessible\n");
+        return -1;
+    }
     effective_file_index = args->file_index;
     if (args->has_size) {
         size_bytes = args->size_bytes;
@@ -6835,12 +6711,16 @@ int execute_ddr_pattern_store_with_result(const ParsedArgs *args, GlobalOptions 
     if (args->has_ddr_offset) {
         ddr_offset = args->ddr_offset;
     }
+    if (cfg->ddr_hw_base > UINT64_MAX - ddr_offset) {
+        fprintf(stderr, "DDR hardware address overflow on channel %d\n", cfg->id);
+        return -1;
+    }
     ddr_hw_addr = cfg->ddr_hw_base + ddr_offset;
     sectors = bytes_to_sectors(size_bytes);
     dbg_printf("[DBG][PATTERN] start ch=%d mode=%s size=%" PRIu64
                " ddr_offset=0x%08" PRIx64 " task=%s idx=%u lba_auto=%u dry=%u\n",
                cfg->id,
-               raw_store ? "raw" : "pattern",
+               "raw",
                size_bytes,
                ddr_offset,
                args->task_no,
@@ -6861,7 +6741,8 @@ int execute_ddr_pattern_store_with_result(const ParsedArgs *args, GlobalOptions 
         goto out;
     }
     if (dma_stop_s2mm(&rt, &dma_stop_report) == DMA_STOP_FAILED) {
-        dbg_printf("[DBG][PATTERN] failed to quiesce DMA before CPU DDR fill ch=%d\n", cfg->id);
+        dbg_printf("[DBG][PATTERN] failed to quiesce DMA before raw DDR store ch=%d\n",
+                   cfg->id);
         goto out;
     }
     printf("ddr_pattern_dma_quiesce channel=%d result=full_reset"
@@ -6880,32 +6761,18 @@ int execute_ddr_pattern_store_with_result(const ParsedArgs *args, GlobalOptions 
                 rt.dma_ring_bytes);
         goto out;
     }
-    if (raw_store) {
-        printf("ddr_raw_store_config channel=%d bytes=%" PRIu64
-               " ring_bytes=%" PRIu64
-               " cpu_mapped_bytes=%" PRIu64
-               " raw_no_cpu_access=1 ddr_hw_start=0x%08" PRIx64
-               " ddr_hw_end=0x%08" PRIx64 "\n",
-               cfg->id,
-               size_bytes,
-               rt.dma_ring_bytes,
-               (uint64_t)rt.ddr.size,
-               ddr_hw_addr,
-               ddr_hw_addr + size_bytes);
-        fflush(stdout);
-    }
-    if (!raw_store && ddr_offset != 0u) {
-        fprintf(stderr, "--ddr-offset is only supported with SRC_REAL_DDR_RAW_STORE=1\n");
-        goto out;
-    }
-    if (!raw_store && size_bytes > cfg->ddr_cpu_size) {
-        fprintf(stderr,
-                "Pattern size exceeds channel %d CPU DDR window: size=%" PRIu64 " window=%" PRIu64 "\n",
-                cfg->id,
-                size_bytes,
-                cfg->ddr_cpu_size);
-        goto out;
-    }
+    printf("ddr_raw_store_config channel=%d bytes=%" PRIu64
+           " ring_bytes=%" PRIu64
+           " ddr_offset=0x%08" PRIx64
+           " ddr_hw_start=0x%08" PRIx64
+           " ddr_hw_end=0x%08" PRIx64 "\n",
+           cfg->id,
+           size_bytes,
+           rt.dma_ring_bytes,
+           ddr_offset,
+           ddr_hw_addr,
+           ddr_hw_addr + size_bytes);
+    fflush(stdout);
     if (metadata_read(&rt, table) != 0) {
         dbg_printf("[DBG][PATTERN] metadata_read failed ch=%d\n", cfg->id);
         goto out;
@@ -6948,57 +6815,10 @@ int execute_ddr_pattern_store_with_result(const ParsedArgs *args, GlobalOptions 
     }
 
     if (!gopt.dry_run) {
-        bool source_cpu_visible = (ddr_offset <= cfg->ddr_cpu_size &&
-                                   size_bytes <= (cfg->ddr_cpu_size - ddr_offset) &&
-                                   ddr_offset <= rt.ddr.size &&
-                                   size_bytes <= ((uint64_t)rt.ddr.size - ddr_offset));
-        uint64_t readback_offset = (ddr_offset + size_bytes + 4095ull) & ~4095ull;
-        volatile uint8_t *source = source_cpu_visible ? rt.ddr.virt + ddr_offset : NULL;
-
-        if (!raw_store && !source_cpu_visible) {
-            fprintf(stderr,
-                    "Pattern source is outside CPU DDR window: offset=0x%08" PRIx64
-                    " size=%" PRIu64 " window=%" PRIu64 "\n",
-                    ddr_offset,
-                    size_bytes,
-                    cfg->ddr_cpu_size);
-            goto out;
-        }
-        if (raw_verify && !source_cpu_visible) {
-            fprintf(stderr,
-                    "Raw DDR verify requires source inside CPU DDR window:"
-                    " offset=0x%08" PRIx64 " size=%" PRIu64
-                    " window=%" PRIu64 "\n",
-                    ddr_offset,
-                    size_bytes,
-                    cfg->ddr_cpu_size);
-            goto out;
-        }
-        if (raw_verify && readback_offset + size_bytes > cfg->ddr_cpu_size) {
-            fprintf(stderr,
-                    "Raw DDR store requires a second DDR buffer for readback compare:"
-                    " size=%" PRIu64 " aligned=%" PRIu64 " window=%" PRIu64 "\n",
-                    size_bytes,
-                    readback_offset,
-                    cfg->ddr_cpu_size);
-            goto out;
-        }
-        if (!raw_store) {
-            start_us = storage_wall_time_us();
-            fill_dual16_increment_pattern(source, size_bytes);
-            fill_us = storage_elapsed_us(start_us);
-            if (verify_dual16_increment_pattern(source, size_bytes, "cpu_fill") != 0) {
-                dbg_printf("[DBG][PATTERN] CPU fill verify failed ch=%d\n", cfg->id);
-                goto out;
-            }
-        }
-        __sync_synchronize();
-        if (raw_store) {
-            nvme_reset_sw_timing(&rt);
-            perf_expected_cmds = nvme_perf_calc_begin(&rt, size_bytes);
-        }
+        nvme_reset_sw_timing(&rt);
+        perf_expected_cmds = nvme_perf_calc_begin(&rt, size_bytes);
         start_us = storage_wall_time_us();
-        if (raw_store && rt.nvme_feed_mode == NVME_FEED_MODE_TIGHT) {
+        if (rt.nvme_feed_mode == NVME_FEED_MODE_TIGHT) {
             if (nvme_write_contiguous_tight_qd(&rt,
                                                ddr_hw_addr,
                                                start_lba,
@@ -7022,73 +6842,15 @@ int execute_ddr_pattern_store_with_result(const ParsedArgs *args, GlobalOptions 
             goto out;
         }
         write_us = storage_elapsed_us(start_us);
-        if (raw_store) {
-            nvme_perf_calc_print(&rt, size_bytes, perf_expected_cmds, write_us);
-            nvme_print_sw_timing(&rt);
-        }
-        if (raw_store && !raw_verify) {
-            printf("ddr_raw_store_verify channel=%d result=skipped"
-                   " reason=raw_write_only bytes=%" PRIu64
-                   " ddr_offset=0x%08" PRIx64 "\n",
-                   cfg->id,
-                   size_bytes,
-                   ddr_offset);
-            fflush(stdout);
-        } else if (readback_offset + size_bytes <= cfg->ddr_cpu_size) {
-            volatile uint8_t *readback = rt.ddr.virt + readback_offset;
-
-            memset((void *)readback, 0xa5, (size_t)size_bytes);
-            __sync_synchronize();
-            if (nvme_rw(&rt,
-                        false,
-                        start_lba,
-                        sectors,
-                        cfg->ddr_hw_base + readback_offset) != 0) {
-                dbg_printf("[DBG][PATTERN] SSD readback failed ch=%d lba=0x%08" PRIx64
-                           " sectors=%" PRIu64 " hw=0x%08" PRIx64 "\n",
-                           cfg->id,
-                           start_lba,
-                           sectors,
-                           cfg->ddr_hw_base + readback_offset);
-                goto out;
-            }
-            if (raw_store) {
-                if (memcmp((const void *)source, (const void *)readback, (size_t)size_bytes) != 0) {
-                    uint64_t mismatch = 0u;
-
-                    while (mismatch < size_bytes &&
-                           source[mismatch] == readback[mismatch]) {
-                        ++mismatch;
-                    }
-                    printf("ddr_raw_store_verify channel=%d result=mismatch"
-                           " offset=%" PRIu64 " expected=0x%02x actual=0x%02x\n",
-                           cfg->id,
-                           mismatch,
-                           (unsigned)source[mismatch],
-                           (unsigned)readback[mismatch]);
-                    fflush(stdout);
-                    dbg_printf("[DBG][PATTERN] raw SSD readback verify failed ch=%d offset=%" PRIu64 "\n",
-                               cfg->id,
-                               mismatch);
-                    goto out;
-                }
-                printf("ddr_raw_store_verify channel=%d result=ok bytes=%" PRIu64 "\n",
-                       cfg->id,
-                       size_bytes);
-                fflush(stdout);
-            } else {
-                if (verify_dual16_increment_pattern(readback, size_bytes, "ssd_readback") != 0) {
-                    dbg_printf("[DBG][PATTERN] SSD readback verify failed ch=%d\n", cfg->id);
-                    goto out;
-                }
-            }
-        } else {
-            printf("ddr_pattern_verify stage=ssd_readback result=skipped reason=insufficient_second_buffer"
-                   " bytes=%" PRIu64 " ddr_window=%" PRIu64 "\n",
-                   size_bytes,
-                   cfg->ddr_cpu_size);
-            fflush(stdout);
-        }
+        nvme_perf_calc_print(&rt, size_bytes, perf_expected_cmds, write_us);
+        nvme_print_sw_timing(&rt);
+        printf("ddr_raw_store_verify channel=%d result=skipped"
+               " reason=data_ddr_not_cpu_accessible bytes=%" PRIu64
+               " ddr_offset=0x%08" PRIx64 "\n",
+               cfg->id,
+               size_bytes,
+               ddr_offset);
+        fflush(stdout);
     }
 
     {
@@ -7112,30 +6874,23 @@ int execute_ddr_pattern_store_with_result(const ParsedArgs *args, GlobalOptions 
         goto out;
     }
 
-    printf("ddr_pattern_store_done channel=%d mode=%s task=%s file_index=%u bytes=%" PRIu64
+    printf("ddr_pattern_store_done channel=%d mode=raw task=%s file_index=%u bytes=%" PRIu64
            " metadata_size_saturated=%u"
-           " ddr_cpu=0x%08" PRIx64 " ddr_offset=0x%08" PRIx64
-           " ddr_dma=0x%08" PRIx64
+           " ddr_offset=0x%08" PRIx64 " ddr_hw_addr=0x%08" PRIx64
            " start_lba=0x%08" PRIx64 " sectors=%" PRIu64
-           " proto_file_type=%u metadata_slot=%d fill_ms=%" PRIu64
-           " nvme_write_ms=%" PRIu64
-           " raw_large_ddr_store=%u\n",
+           " proto_file_type=%u metadata_slot=%d nvme_write_ms=%" PRIu64 "\n",
            cfg->id,
-           raw_store ? "raw" : "pattern",
            args->task_no,
            (unsigned)effective_file_index,
            size_bytes,
            size_bytes > UINT32_MAX ? 1u : 0u,
-           cfg->ddr_cpu_base,
            ddr_offset,
            ddr_hw_addr,
            start_lba,
            sectors,
            (unsigned)args->proto_file_type,
            metadata_slot,
-           fill_us / 1000u,
-           write_us / 1000u,
-           (unsigned)(raw_store && size_bytes > cfg->ddr_cpu_size));
+           write_us / 1000u);
     fflush(stdout);
     if (result) {
         result->channel_id = cfg->id;
@@ -7161,34 +6916,32 @@ int execute_ssd_lba_wrap_test(const ParsedArgs *args, GlobalOptions gopt)
 {
     const ChannelConfig *cfg = find_channel(LOW_SPEED_CHANNEL_ID);
     ChannelRuntime rt;
-    DmaStopReport dma_stop_report;
     int rc = -1;
     uint64_t size_bytes = args && args->has_size ? args->size_bytes : (4ull * 1024ull * 1024ull);
     uint64_t aligned_bytes = (size_bytes + 4095ull) & ~4095ull;
     uint64_t sectors = bytes_to_sectors(size_bytes);
     uint64_t lba_a;
     uint64_t lba_b;
-    uint64_t off_a = 0u;
-    uint64_t off_b = aligned_bytes;
-    uint64_t off_read_a = aligned_bytes * 2u;
-    uint64_t off_read_b = aligned_bytes * 3u;
-    const uint32_t seed_a = 0x13572468u;
-    const uint32_t seed_b = 0x24681357u;
 
     memset(&rt, 0, sizeof(rt));
-    memset(&dma_stop_report, 0, sizeof(dma_stop_report));
     if (!args || !cfg || !args->has_lba || args->lba_auto || sectors == 0u) {
         return -1;
     }
     lba_a = args->lba;
     lba_b = lba_a + 0x100000ull;
-    if (off_read_b + aligned_bytes > cfg->ddr_cpu_size) {
+    if (aligned_bytes > cfg->dma_ring_bytes / 4u) {
         fprintf(stderr,
-                "ssd-lba-wrap-test buffers exceed ch2 CPU DDR window: size=%" PRIu64
-                " aligned=%" PRIu64 " window=%" PRIu64 "\n",
+                "ssd-lba-wrap-test buffers exceed ch2 DDR ring: size=%" PRIu64
+                " aligned=%" PRIu64 " ring=%" PRIu64 "\n",
                 size_bytes,
                 aligned_bytes,
-                cfg->ddr_cpu_size);
+                cfg->dma_ring_bytes);
+        return -1;
+    }
+    if (!gopt.dry_run) {
+        fprintf(stderr,
+                "ssd-lba-wrap-test is unavailable because data DDR is not"
+                " CPU-accessible for pattern generation and comparison\n");
         return -1;
     }
 
@@ -7219,70 +6972,15 @@ int execute_ssd_lba_wrap_test(const ParsedArgs *args, GlobalOptions gopt)
                 rt.nvme_max_lba);
         goto out;
     }
-    if (!gopt.dry_run && dma_stop_s2mm(&rt, &dma_stop_report) == DMA_STOP_FAILED) {
-        dbg_printf("[DBG][WRAP] failed to quiesce DMA before SSD LBA wrap test ch=2\n");
-        goto out;
-    }
-
-    if (!gopt.dry_run) {
-        fill_wrap_test_pattern(rt.ddr.virt + off_a, size_bytes, seed_a);
-        fill_wrap_test_pattern(rt.ddr.virt + off_b, size_bytes, seed_b);
-        if (verify_wrap_test_pattern(rt.ddr.virt + off_a, size_bytes, seed_a, "cpu_fill_a") != 0 ||
-            verify_wrap_test_pattern(rt.ddr.virt + off_b, size_bytes, seed_b, "cpu_fill_b") != 0) {
-            goto out;
-        }
-
-        if (nvme_rw(&rt, true, lba_a, sectors, cfg->ddr_hw_base + off_a) != 0) {
-            dbg_printf("[DBG][WRAP] write A failed lba=0x%08" PRIx64 " sectors=%" PRIu64 "\n",
-                       lba_a,
-                       sectors);
-            goto out;
-        }
-        if (nvme_rw(&rt, true, lba_b, sectors, cfg->ddr_hw_base + off_b) != 0) {
-            dbg_printf("[DBG][WRAP] write B failed lba=0x%08" PRIx64 " sectors=%" PRIu64 "\n",
-                       lba_b,
-                       sectors);
-            goto out;
-        }
-
-        memset((void *)(rt.ddr.virt + off_read_a), 0xa5, (size_t)size_bytes);
-        memset((void *)(rt.ddr.virt + off_read_b), 0x5a, (size_t)size_bytes);
-        __sync_synchronize();
-        if (nvme_rw(&rt, false, lba_a, sectors, cfg->ddr_hw_base + off_read_a) != 0) {
-            dbg_printf("[DBG][WRAP] read A failed lba=0x%08" PRIx64 " sectors=%" PRIu64 "\n",
-                       lba_a,
-                       sectors);
-            goto out;
-        }
-        if (nvme_rw(&rt, false, lba_b, sectors, cfg->ddr_hw_base + off_read_b) != 0) {
-            dbg_printf("[DBG][WRAP] read B failed lba=0x%08" PRIx64 " sectors=%" PRIu64 "\n",
-                       lba_b,
-                       sectors);
-            goto out;
-        }
-
-        if (verify_wrap_test_pattern(rt.ddr.virt + off_read_a, size_bytes, seed_a, "readback_a") != 0 ||
-            verify_wrap_test_pattern(rt.ddr.virt + off_read_b, size_bytes, seed_b, "readback_b") != 0) {
-            printf("ssd_lba_wrap_test result=failed lba_a=0x%08" PRIx64
-                   " lba_b=0x%08" PRIx64 " delta_sectors=0x100000"
-                   " bytes=%" PRIu64 "\n",
-                   lba_a,
-                   lba_b,
-                   size_bytes);
-            fflush(stdout);
-            goto out;
-        }
-    }
-
     printf("ssd_lba_wrap_test result=ok channel=2 lba_a=0x%08" PRIx64
            " lba_b=0x%08" PRIx64 " delta_sectors=0x100000"
            " bytes=%" PRIu64 " sectors=%" PRIu64
-           " ddr_cpu=0x%08" PRIx64 "\n",
+           " ddr_hw_base=0x%08" PRIx64 " dry_run=1\n",
            lba_a,
            lba_b,
            size_bytes,
            sectors,
-           cfg->ddr_cpu_base);
+           cfg->ddr_hw_base);
     fflush(stdout);
     rc = 0;
 
@@ -7295,26 +6993,20 @@ int execute_ssd_continuous_pattern_test(const ParsedArgs *args, GlobalOptions go
 {
     const ChannelConfig *cfg = find_channel(LOW_SPEED_CHANNEL_ID);
     ChannelRuntime rt;
-    DmaStopReport dma_stop_report;
     int rc = -1;
     uint64_t size_bytes = args && args->has_size ? args->size_bytes : SSD_CONTINUOUS_PATTERN_TEST_DEFAULT_BYTES;
     uint64_t total_sectors = bytes_to_sectors(size_bytes);
     uint64_t start_lba;
     uint64_t chunk_bytes;
-    uint64_t read_offset;
-    uint64_t remaining;
-    uint64_t file_offset;
-    uint64_t cur_lba;
-    uint64_t chunk_index;
-    uint64_t write_start_us = 0u;
-    uint64_t read_start_us = 0u;
-    uint64_t write_us = 0u;
-    uint64_t read_us = 0u;
-    const uint32_t seed = 0x5a17c0deu;
 
     memset(&rt, 0, sizeof(rt));
-    memset(&dma_stop_report, 0, sizeof(dma_stop_report));
     if (!args || !cfg || !args->has_lba || args->lba_auto || total_sectors == 0u) {
+        return -1;
+    }
+    if (!gopt.dry_run) {
+        fprintf(stderr,
+                "ssd-continuous-pattern-test is unavailable because data DDR"
+                " is not CPU-accessible for pattern generation and comparison\n");
         return -1;
     }
     start_lba = args->lba;
@@ -7322,18 +7014,16 @@ int execute_ssd_continuous_pattern_test(const ParsedArgs *args, GlobalOptions go
     if (chunk_bytes == 0u) {
         chunk_bytes = 16ull * 1024ull * 1024ull;
     }
-    if (chunk_bytes > (cfg->ddr_cpu_size / 2u)) {
-        chunk_bytes = cfg->ddr_cpu_size / 2u;
+    if (chunk_bytes > (cfg->dma_ring_bytes / 2u)) {
+        chunk_bytes = cfg->dma_ring_bytes / 2u;
     }
     chunk_bytes &= ~(uint64_t)(SECTOR_SIZE - 1u);
     if (chunk_bytes == 0u) {
         fprintf(stderr,
-                "ssd-continuous-pattern-test has no usable DDR buffers: ddr_window=%" PRIu64 "\n",
-                cfg->ddr_cpu_size);
+                "ssd-continuous-pattern-test has no usable DDR buffers: ring=%" PRIu64 "\n",
+                cfg->dma_ring_bytes);
         return -1;
     }
-    read_offset = chunk_bytes;
-
     dbg_printf("[DBG][CONT] start ch=2 lba=0x%08" PRIx64
                " bytes=%" PRIu64 " sectors=%" PRIu64
                " chunk_bytes=%" PRIu64 " dry=%u\n",
@@ -7362,142 +7052,15 @@ int execute_ssd_continuous_pattern_test(const ParsedArgs *args, GlobalOptions go
                 rt.nvme_max_lba);
         goto out;
     }
-    if (!gopt.dry_run && dma_stop_s2mm(&rt, &dma_stop_report) == DMA_STOP_FAILED) {
-        dbg_printf("[DBG][CONT] failed to quiesce DMA before SSD continuous pattern test ch=2\n");
-        goto out;
-    }
-
-    if (!gopt.dry_run) {
-        remaining = size_bytes;
-        file_offset = 0u;
-        cur_lba = start_lba;
-        chunk_index = 0u;
-        write_start_us = storage_wall_time_us();
-        while (remaining > 0u) {
-            uint64_t this_bytes = remaining > chunk_bytes ? chunk_bytes : remaining;
-            uint64_t this_sectors = bytes_to_sectors(this_bytes);
-            uint64_t base_word = file_offset / sizeof(uint32_t);
-
-            fill_wrap_test_pattern_at(rt.ddr.virt, this_bytes, seed, base_word);
-            if (verify_wrap_test_pattern_at(rt.ddr.virt,
-                                            this_bytes,
-                                            seed,
-                                            base_word,
-                                            file_offset,
-                                            "continuous_cpu_fill") != 0) {
-                goto out;
-            }
-            if ((file_offset % (512ull * 1024ull * 1024ull)) == 0u) {
-                printf("ssd_continuous_boundary phase=write chunk=%" PRIu64
-                       " file_offset=%" PRIu64 " lba=0x%08" PRIx64 "\n",
-                       chunk_index,
-                       file_offset,
-                       cur_lba);
-                fflush(stdout);
-            }
-            if (nvme_rw(&rt, true, cur_lba, this_sectors, cfg->ddr_hw_base) != 0) {
-                dbg_printf("[DBG][CONT] write failed chunk=%" PRIu64
-                           " file_offset=%" PRIu64 " lba=0x%08" PRIx64
-                           " sectors=%" PRIu64 "\n",
-                           chunk_index,
-                           file_offset,
-                           cur_lba,
-                           this_sectors);
-                goto out;
-            }
-            printf("ssd_continuous_write chunk=%" PRIu64 " file_offset=%" PRIu64
-                   " lba=0x%08" PRIx64 " bytes=%" PRIu64
-                   " sectors=%" PRIu64 "\n",
-                   chunk_index,
-                   file_offset,
-                   cur_lba,
-                   this_bytes,
-                   this_sectors);
-            fflush(stdout);
-            remaining -= this_bytes;
-            file_offset += this_bytes;
-            cur_lba += this_sectors;
-            ++chunk_index;
-        }
-        write_us = storage_elapsed_us(write_start_us);
-
-        remaining = size_bytes;
-        file_offset = 0u;
-        cur_lba = start_lba;
-        chunk_index = 0u;
-        read_start_us = storage_wall_time_us();
-        while (remaining > 0u) {
-            uint64_t this_bytes = remaining > chunk_bytes ? chunk_bytes : remaining;
-            uint64_t this_sectors = bytes_to_sectors(this_bytes);
-            uint64_t base_word = file_offset / sizeof(uint32_t);
-            volatile uint8_t *read_buf = rt.ddr.virt + read_offset;
-
-            memset((void *)read_buf, 0xa5, (size_t)this_bytes);
-            __sync_synchronize();
-            if ((file_offset % (512ull * 1024ull * 1024ull)) == 0u) {
-                printf("ssd_continuous_boundary phase=read chunk=%" PRIu64
-                       " file_offset=%" PRIu64 " lba=0x%08" PRIx64 "\n",
-                       chunk_index,
-                       file_offset,
-                       cur_lba);
-                fflush(stdout);
-            }
-            if (nvme_rw(&rt, false, cur_lba, this_sectors, cfg->ddr_hw_base + read_offset) != 0) {
-                dbg_printf("[DBG][CONT] read failed chunk=%" PRIu64
-                           " file_offset=%" PRIu64 " lba=0x%08" PRIx64
-                           " sectors=%" PRIu64 "\n",
-                           chunk_index,
-                           file_offset,
-                           cur_lba,
-                           this_sectors);
-                goto out;
-            }
-            if (verify_wrap_test_pattern_at(read_buf,
-                                            this_bytes,
-                                            seed,
-                                            base_word,
-                                            file_offset,
-                                            "continuous_readback") != 0) {
-                printf("ssd_continuous_pattern_test result=failed chunk=%" PRIu64
-                       " file_offset=%" PRIu64 " lba=0x%08" PRIx64
-                       " bytes=%" PRIu64 "\n",
-                       chunk_index,
-                       file_offset,
-                       cur_lba,
-                       this_bytes);
-                fflush(stdout);
-                goto out;
-            }
-            printf("ssd_continuous_read chunk=%" PRIu64 " file_offset=%" PRIu64
-                   " lba=0x%08" PRIx64 " bytes=%" PRIu64
-                   " sectors=%" PRIu64 "\n",
-                   chunk_index,
-                   file_offset,
-                   cur_lba,
-                   this_bytes,
-                   this_sectors);
-            fflush(stdout);
-            remaining -= this_bytes;
-            file_offset += this_bytes;
-            cur_lba += this_sectors;
-            ++chunk_index;
-        }
-        read_us = storage_elapsed_us(read_start_us);
-    }
-
-    printf("ssd_continuous_pattern_test result=ok channel=2 lba=0x%08" PRIx64
+    printf("ssd_continuous_pattern_test result=dry_run channel=2 lba=0x%08" PRIx64
            " bytes=%" PRIu64 " sectors=%" PRIu64
            " chunk_bytes=%" PRIu64 " chunks=%" PRIu64
-           " write_ms=%" PRIu64 " read_ms=%" PRIu64
-           " ddr_cpu=0x%08" PRIx64 " ddr_dma=0x%08" PRIx64 "\n",
+           " ddr_hw_base=0x%08" PRIx64 "\n",
            start_lba,
            size_bytes,
            total_sectors,
            chunk_bytes,
            (size_bytes + chunk_bytes - 1u) / chunk_bytes,
-           write_us / 1000u,
-           read_us / 1000u,
-           cfg->ddr_cpu_base,
            cfg->ddr_hw_base);
     fflush(stdout);
     rc = 0;
@@ -7641,7 +7204,9 @@ int execute_read(const ParsedArgs *args, GlobalOptions gopt) {
     const ChannelConfig *cfg = find_channel(args->channel_id);
     ChannelRuntime rt;
     int rc = -1;
-    uint64_t ddr_cpu_addr;
+    uint64_t ddr_offset = args->has_ddr_offset ? args->ddr_offset : 0u;
+    uint64_t ddr_hw_addr;
+    uint64_t read_bytes;
     uint64_t lba = 0u;
     uint64_t sectors = 0u;
 
@@ -7658,8 +7223,6 @@ int execute_read(const ParsedArgs *args, GlobalOptions gopt) {
         fprintf(stderr, "NVMe capacity unavailable on channel %d\n", cfg->id);
         goto out;
     }
-
-    ddr_cpu_addr = cfg->ddr_cpu_base;
 
     if (args->has_task_no && args->has_file_index) {
         FileEntry table[MAX_FILES_TOTAL];
@@ -7683,12 +7246,32 @@ int execute_read(const ParsedArgs *args, GlobalOptions gopt) {
         sectors = bytes_to_sectors(args->size_bytes);
     }
 
-    if (nvme_rw(&rt, false, lba, sectors, cpu_to_hw_addr(cfg, ddr_cpu_addr)) != 0) {
+    if (sectors > UINT64_MAX / SECTOR_SIZE) {
+        fprintf(stderr, "Read size overflow on channel %d\n", cfg->id);
+        goto out;
+    }
+    read_bytes = sectors * SECTOR_SIZE;
+    if (ddr_offset > rt.dma_ring_bytes ||
+        read_bytes > rt.dma_ring_bytes - ddr_offset ||
+        cfg->ddr_hw_base > UINT64_MAX - ddr_offset) {
+        fprintf(stderr,
+                "Read DDR range exceeds channel %d ring: offset=0x%08" PRIx64
+                " bytes=%" PRIu64 " ring=%" PRIu64 "\n",
+                cfg->id,
+                ddr_offset,
+                read_bytes,
+                rt.dma_ring_bytes);
+        goto out;
+    }
+    ddr_hw_addr = cfg->ddr_hw_base + ddr_offset;
+    if (nvme_rw(&rt, false, lba, sectors, ddr_hw_addr) != 0) {
         goto out;
     }
 
-    printf("read_done channel=%d ddr_cpu_addr=0x%08" PRIx64 " ddr_hw_addr=0x%08" PRIx64 " lba=0x%08" PRIx64 " sectors=%" PRIu64 "\n",
-           cfg->id, ddr_cpu_addr, cpu_to_hw_addr(cfg, ddr_cpu_addr), lba, sectors);
+    printf("read_done channel=%d ddr_offset=0x%08" PRIx64
+           " ddr_hw_addr=0x%08" PRIx64 " lba=0x%08" PRIx64
+           " sectors=%" PRIu64 "\n",
+           cfg->id, ddr_offset, ddr_hw_addr, lba, sectors);
     rc = 0;
 
 out:

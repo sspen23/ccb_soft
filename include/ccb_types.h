@@ -12,9 +12,6 @@
 #define HIGH_Q_CHANNEL_ID 1
 #define LOW_SPEED_CHANNEL_ID 2
 
-/* CPU-visible data-buffer DDR windows are limited by the Linux address map. */
-#define CHANNEL_CPU_DDR_BYTES (64ull * 1024ull * 1024ull)
-
 /*
  * Usable DMA/NVMe S2MM ring windows from the FPGA address map. ch0/ch1 are
  * limited in software to the currently reliable low 1 GiB window.
@@ -39,6 +36,9 @@
 #define DMA_DESC_ENTRY_BYTES 64u
 #define DMA_DESC_BRAM_BYTES 8192u
 #define DMA_DESC_COUNT_MAX (DMA_DESC_BRAM_BYTES / DMA_DESC_ENTRY_BYTES)
+
+/* ch0/ch1 manual-PRP mode owns one 4 KiB page per in-flight command. */
+#define NVME_PRP_SLOT_CAPACITY 8u
 
 /* SSD metadata layout constants. */
 #define SECTOR_SIZE 512u
@@ -120,12 +120,14 @@ typedef struct {
     uint64_t desc_cpu_base;
     uint64_t desc_dma_base;
     uint64_t desc_cpu_size;
-    uint64_t ddr_cpu_base;
     uint64_t ddr_hw_base;
-    uint64_t ddr_cpu_size;
     uint64_t dma_ring_bytes;
     uint64_t dma_ring_bytes_max;
     uint32_t dma_desc_bytes_default;
+    bool nvme_manual_prp;
+    uint64_t prp_list_cpu_base;
+    uint64_t prp_list_hw_base;
+    uint32_t prp_list_size;
 } ChannelConfig;
 
 /* Generic mapped physical-memory region descriptor. */
@@ -235,7 +237,7 @@ typedef struct {
     MappedRegion nvme;
     MappedRegion pcie_bridge;
     MappedRegion desc;
-    MappedRegion ddr;
+    MappedRegion prp_list;
     uint64_t pcie_bridge_base_effective;
 
     uint32_t next_harvest_bd;
@@ -249,6 +251,7 @@ typedef struct {
     uint8_t dma_bd_harvested[DMA_DESC_COUNT_MAX];
     uint16_t next_cmd_id;
     uint32_t nvme_block_size;
+    uint32_t nvme_page_size;
     uint32_t nvme_max_dts_raw;
     uint32_t nvme_max_dts_blocks;
     uint32_t nvme_max_dts_bytes;
@@ -257,6 +260,9 @@ typedef struct {
     uint32_t nvme_cmd_sectors;
     uint32_t nvme_qd_requested;
     uint32_t nvme_qd_effective;
+    uint32_t nvme_prp_slot_count;
+    bool nvme_prp_slot_in_use[NVME_PRP_SLOT_CAPACITY];
+    uint16_t nvme_prp_slot_cid[NVME_PRP_SLOT_CAPACITY];
     uint32_t nvme_feed_mode;
     uint32_t nvme_cq_pop_batch;
     bool nvme_diag_timing;

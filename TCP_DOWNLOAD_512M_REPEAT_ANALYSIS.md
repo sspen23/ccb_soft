@@ -165,8 +165,8 @@ for each valid metadata entry:
 ```c
 reg_write32(QUEUE_CTX0, ((sectors - 1) << 16) | opcode);
 reg_write32(QUEUE_CTX1, cid);
-reg_write32(QUEUE_PRP1_L, hw_addr[31:0]);
-reg_write32(QUEUE_PRP1_H, hw_addr[63:32]);
+reg_write32(QUEUE_PRP1_L, ddr_hw_addr[31:0]);
+reg_write32(QUEUE_PRP1_H, ddr_hw_addr[63:32]);
 reg_write32(QUEUE_LBA_L, lba[31:0]);
 reg_write32(QUEUE_LBA_H, lba[63:32]);
 reg_write32(QUEUE_TX_CTRL, CMD_PENDING);

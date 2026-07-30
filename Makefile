@@ -101,7 +101,7 @@ storage-host-tests:
 		$(STORAGE_CONFIG_SRC) -o /tmp/mock_storage_profile_test
 	/tmp/mock_storage_profile_test
 	$(CC) $(CFLAGS) -Wformat=2 -Iinclude tests/mock_protocol_golden_test.c \
-		src/serial_proto.c src/debug_uart.c $(STORAGE_CONFIG_SRC) -o /tmp/mock_protocol_golden_test
+		src/serial_proto.c $(STORAGE_CONFIG_SRC) -o /tmp/mock_protocol_golden_test
 	/tmp/mock_protocol_golden_test
 	$(CC) $(CFLAGS) -Wformat=2 -Iinclude tests/mock_storage_commit_test.c \
 		src/ccb_storage_commit.c -o /tmp/mock_storage_commit_test
@@ -150,6 +150,13 @@ storage-host-tests:
 	$(CC) $(CFLAGS) -Wformat=2 -ffunction-sections -fdata-sections -Iinclude \
 		tests/mock_nvme_capability_test.c src/ccb_hw.c src/debug_uart.c $(STORAGE_CONFIG_SRC) $(STORAGE_ERROR_SRC) -Wl,--gc-sections -o /tmp/mock_nvme_capability_test
 	/tmp/mock_nvme_capability_test
+	$(CC) $(CFLAGS) -Wformat=2 -ffunction-sections -fdata-sections -Iinclude \
+		tests/mock_nvme_prp_test.c src/ccb_config.c src/ccb_hw.c src/debug_uart.c $(STORAGE_CONFIG_SRC) $(STORAGE_ERROR_SRC) -lpthread -Wl,--gc-sections -o /tmp/mock_nvme_prp_test
+	/tmp/mock_nvme_prp_test
+	$(CC) $(CFLAGS) -Wformat=2 -ffunction-sections -fdata-sections -Iinclude \
+		tests/mock_ddr_address_args_test.c src/ccb_cli.c src/ccb_config.c $(STORAGE_CONFIG_SRC) \
+		-Wl,--gc-sections -o /tmp/mock_ddr_address_args_test
+	/tmp/mock_ddr_address_args_test
 	$(CC) $(CFLAGS) -Wformat=2 -ffunction-sections -fdata-sections -Iinclude \
 		tests/mock_dma_harvest_batch_test.c src/ccb_hw.c $(STORAGE_CONFIG_SRC) -Wl,--gc-sections -o /tmp/mock_dma_harvest_batch_test
 	/tmp/mock_dma_harvest_batch_test

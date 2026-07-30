@@ -29,12 +29,13 @@ typedef struct {
 
 static void queue_completion(Mock *mock, uint16_t cid, int error);
 
-static int submit(void *opaque, uint16_t cid, uint64_t lba, uint32_t sectors, uint64_t ddr_addr)
+static int submit(void *opaque, uint16_t cid, uint64_t lba,
+                  uint32_t sectors, uint64_t ddr_hw_addr)
 {
     Mock *mock = opaque;
     (void)lba;
     (void)sectors;
-    (void)ddr_addr;
+    (void)ddr_hw_addr;
     if (mock->sq_full_once) {
         mock->sq_full_once = 0;
         return 1;
@@ -121,7 +122,7 @@ static NvmeWriteSlotReq request(uint32_t slot, uint64_t sectors)
     value.slot = slot;
     value.start_lba = slot * 16u;
     value.sectors = sectors;
-    value.hw_addr = slot * 4096u;
+    value.ddr_hw_addr = slot * 4096u;
     value.bytes = sectors * 512u;
     return value;
 }

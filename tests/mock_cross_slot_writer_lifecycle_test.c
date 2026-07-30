@@ -21,14 +21,14 @@ typedef struct {
 } WriterMock;
 
 static int submit(void *opaque, uint16_t cid, uint64_t lba,
-                  uint32_t sectors, uint64_t ddr_addr)
+                  uint32_t sectors, uint64_t ddr_hw_addr)
 {
     WriterMock *mock = opaque;
     NvmeCompletion *completion;
 
     (void)lba;
     (void)sectors;
-    (void)ddr_addr;
+    (void)ddr_hw_addr;
     assert(mock->submit_count < MAX_COMMANDS);
     assert(mock->completion_tail < MAX_COMMANDS);
     mock->submitted[mock->submit_count++] = cid;
@@ -91,7 +91,7 @@ static NvmeWriteSlotReq request(uint32_t slot, uint64_t sectors)
     req.slot = slot;
     req.start_lba = (uint64_t)slot * SLOT_SECTORS;
     req.sectors = sectors;
-    req.hw_addr = (uint64_t)slot * 8u * 1024u * 1024u;
+    req.ddr_hw_addr = (uint64_t)slot * 8u * 1024u * 1024u;
     req.bytes = sectors * 512u;
     req.media_bytes = req.bytes;
     return req;

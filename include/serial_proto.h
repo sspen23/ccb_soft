@@ -156,6 +156,16 @@ typedef struct {
     uint8_t  frame_head;
     uint8_t  device_id;
     uint8_t  cmd_type;
+    uint8_t  reserved[12];
+    uint8_t  frame_tail;
+} CmdStopTransfer;
+#pragma pack()
+
+#pragma pack(1)
+typedef struct {
+    uint8_t  frame_head;
+    uint8_t  device_id;
+    uint8_t  cmd_type;
     uint8_t  result;
     uint8_t  reserved[11];
     uint8_t  frame_tail;
@@ -195,19 +205,29 @@ typedef struct {
 #pragma pack()
 
 _Static_assert(sizeof(CmdTaskInfo) == 64u, "CmdTaskInfo must be 64 bytes");
+_Static_assert(offsetof(CmdTaskInfo, task_id) == 3u, "CmdTaskInfo task_id offset mismatch");
 _Static_assert(offsetof(CmdTaskInfo, azimuth_angle) == 34u, "CmdTaskInfo azimuth offset mismatch");
 _Static_assert(offsetof(CmdTaskInfo, elevation_angle) == 36u, "CmdTaskInfo elevation offset mismatch");
 _Static_assert(offsetof(CmdTaskInfo, envelope_duration) == 38u, "CmdTaskInfo duration offset mismatch");
 _Static_assert(offsetof(CmdTaskInfo, period_setting) == 45u, "CmdTaskInfo period offset mismatch");
 _Static_assert(offsetof(CmdTaskInfo, frame_tail) == 63u, "CmdTaskInfo tail offset mismatch");
 _Static_assert(sizeof(CmdAcqCtrl) == 16u, "CmdAcqCtrl must be 16 bytes");
+_Static_assert(offsetof(CmdAcqCtrl, switch_flag) == 3u, "CmdAcqCtrl switch offset mismatch");
 _Static_assert(sizeof(CmdUsbTransfer) == 16u, "CmdUsbTransfer must be 16 bytes");
+_Static_assert(offsetof(CmdUsbTransfer, switch_flag) == 3u, "CmdUsbTransfer switch offset mismatch");
 _Static_assert(sizeof(CmdFileList) == 16u, "CmdFileList must be 16 bytes");
+_Static_assert(offsetof(CmdFileList, control) == 3u, "CmdFileList control offset mismatch");
 _Static_assert(sizeof(CmdFileOp) == 32u, "CmdFileOp must be 32 bytes");
+_Static_assert(offsetof(CmdFileOp, operation) == 3u, "CmdFileOp operation offset mismatch");
+_Static_assert(offsetof(CmdFileOp, task_id) == 4u, "CmdFileOp task_id offset mismatch");
 _Static_assert(sizeof(CmdStatusQuery) == 16u, "CmdStatusQuery must be 16 bytes");
+_Static_assert(sizeof(CmdStopTransfer) == 16u, "CmdStopTransfer must be 16 bytes");
 _Static_assert(sizeof(AckCommon) == 16u, "AckCommon must be 16 bytes");
+_Static_assert(offsetof(AckCommon, result) == 3u, "AckCommon result offset mismatch");
 _Static_assert(sizeof(AckAcqCtrl) == 16u, "AckAcqCtrl must be 16 bytes");
+_Static_assert(offsetof(AckAcqCtrl, result) == 3u, "AckAcqCtrl result offset mismatch");
 _Static_assert(sizeof(AckFileList) == 41u, "AckFileList must be 41 bytes");
+_Static_assert(offsetof(AckFileList, result) == 3u, "AckFileList result offset mismatch");
 
 typedef union {
     uint8_t        raw[64];
@@ -217,6 +237,7 @@ typedef union {
     CmdFileList    file_list_cmd;
     CmdFileOp      file_op;
     CmdStatusQuery status_query;
+    CmdStopTransfer stop_transfer;
 } CommandPkt;
 
 typedef union {

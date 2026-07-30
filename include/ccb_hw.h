@@ -10,8 +10,6 @@ uint64_t bytes_to_sectors(uint64_t bytes);
 /* nvme_max_lba is kept as an exclusive capacity limit in software. */
 bool nvme_lba_range_valid(const ChannelRuntime *rt, uint64_t start_lba,
                           uint64_t sectors);
-uint64_t cpu_to_hw_addr(const ChannelConfig *cfg, uint64_t cpu_addr);
-int ddr_addr_validate(const ChannelConfig *cfg, uint64_t cpu_addr, uint64_t size);
 
 /* Build/release mapped runtime state for one channel. */
 int channel_runtime_open(ChannelRuntime *rt, const ChannelConfig *cfg, GlobalOptions gopt);
@@ -25,6 +23,16 @@ int nvme_clamp_command_bytes(uint32_t requested_bytes,
                              uint32_t nvme_max_transfer_bytes,
                              uint32_t logical_block_bytes,
                              uint32_t *effective_bytes);
+/* Build PRP2 and, for transfers spanning more than two pages, PRP-list
+ * entries.  prp_list_addr and entries are only required in the list case. */
+int nvme_build_prp(uint64_t prp1,
+                   uint64_t transfer_bytes,
+                   uint32_t page_size,
+                   uint64_t prp_list_addr,
+                   uint64_t *entries,
+                   uint32_t entry_capacity,
+                   uint64_t *prp2,
+                   uint32_t *entry_count);
 uint32_t nvme_poll_backoff_us(uint32_t busy_poll_us,
                               uint32_t base_sleep_us,
                               uint32_t waited_us);
@@ -36,31 +44,32 @@ void nvme_request_stop(void);
 int nvme_stop_requested(void);
 
 /* Submit segmented NVMe read/write covering the requested sector range. */
-int nvme_rw(ChannelRuntime *rt, bool is_write, uint64_t lba, uint64_t sectors, uint64_t hw_addr);
-/* Read commands intentionally use a smaller diagnostic transfer size than writes. */
+int nvme_rw(ChannelRuntime *rt, bool is_write, uint64_t lba, uint64_t sectors,
+            uint64_t ddr_hw_addr);
+/* Read command size is channel-aware and can be overridden per channel. */
 uint32_t nvme_read_command_sectors(const ChannelRuntime *rt);
 /* The return value follows NvmeSubmitResult.  Once the doorbell is written,
  * STOP and timeout are acceptance-unknown, never ordinary cancellation. */
 int nvme_submit_command_async(ChannelRuntime *rt, uint8_t opcode,
                               uint16_t cid, uint64_t lba,
-                              uint32_t sectors, uint64_t ddr_addr);
+                              uint32_t sectors, uint64_t ddr_hw_addr);
 int nvme_submit_write_async(ChannelRuntime *rt,
                             uint16_t cid,
                             uint64_t lba,
                             uint32_t sectors,
-                            uint64_t ddr_addr);
+                            uint64_t ddr_hw_addr);
 int nvme_poll_cq(ChannelRuntime *rt, NvmeCompletion *out_cpl, uint32_t timeout_us);
 int nvme_write_slot_qd(ChannelRuntime *rt,
                        uint32_t slot,
                        uint64_t lba,
                        uint64_t sectors,
-                       uint64_t hw_addr);
+                       uint64_t ddr_hw_addr);
 int nvme_write_slot_qd_payload(ChannelRuntime *rt,
                                uint32_t slot,
                                uint64_t lba,
                                uint64_t sectors,
                                uint64_t payload_bytes,
-                               uint64_t hw_addr);
+                               uint64_t ddr_hw_addr);
 int nvme_write_contiguous_tight_qd(ChannelRuntime *rt,
                                    uint64_t ddr_hw_start,
                                    uint64_t start_lba,
@@ -77,7 +86,7 @@ typedef struct {
     uint32_t slot;
     uint64_t start_lba;
     uint64_t sectors;
-    uint64_t hw_addr;
+    uint64_t ddr_hw_addr;
     uint64_t bytes;
     uint64_t chunk_index;
     uint64_t file_offset;
@@ -127,7 +136,8 @@ typedef enum {
     NVME_SUBMIT_ACCEPTANCE_UNKNOWN = -3
 } NvmeSubmitResult;
 typedef struct {
-    int (*submit)(void *opaque, uint16_t cid, uint64_t lba, uint32_t sectors, uint64_t ddr_addr);
+    int (*submit)(void *opaque, uint16_t cid, uint64_t lba,
+                  uint32_t sectors, uint64_t ddr_hw_addr);
     int (*poll_completion)(void *opaque, NvmeCompletion *out);
     uint64_t (*monotonic_us)(void *opaque);
     void (*sleep_us)(void *opaque, uint32_t us);

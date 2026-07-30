@@ -9,8 +9,7 @@
 #define TCP_DMA_BASE_DEFAULT            0x41E00000ull
 #define TCP_DESC_CPU_BASE_DEFAULT       0x20000000ull
 #define TCP_DESC_DMA_BASE_DEFAULT       0x10000000ull
-#define TCP_DDR_CPU_BASE_DEFAULT        0x10000000ull
-#define TCP_DDR_DMA_BASE_DEFAULT        0x00000000ull
+#define TCP_DDR_HW_ADDR_DEFAULT         0x00000000ull
 #define TCP_MAX_BYTES_PER_DESC          (16u * 1024u * 1024u)
 /* ch0/ch1 fill one TCP buffer with two independent 8 MiB SSD reads. */
 #define SSD_READ_BYTES_PER_CHUNK_HIGH   (8u * 1024u * 1024u)

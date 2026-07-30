@@ -12,8 +12,8 @@
 | 存盘 worker 调度 | `src/system.c:start_storage_worker()` | `0x11` 后提前 fork 存盘 worker，worker 先准备 DMA/NVMe |
 | 采集开始/停止 | `src/system.c:handle_frame()` | `0x21=0x11` 只 ACK 开始；`0x21=0xFF` 给 worker 发停止信号并等待退出 |
 | DMA/NVMe 存盘算法 | `src/ccb_commands.c:execute_write_with_result()` | AXI DMA S2MM 写 DDR ring，NVMe writer 线程从 DDR 写 SSD |
-| DDR pattern 写盘测试 | `src/ccb_commands.c:execute_ddr_pattern_store_with_result()` | CPU 写 ch2 DDR pattern，再用 NVMe 写 SSD 并登记数据库 |
-| 硬件 MMIO/NVMe/DMA 底层 | `src/ccb_hw.c` | `/dev/mem` 映射、AXIS switch、DMA SG ring、NVMe command |
+| DDR raw 写盘测试 | `src/ccb_commands.c:execute_ddr_pattern_store_with_result()` | 使用硬件预装载的 DDR 数据，通过 NVMe 写 SSD 并登记数据库 |
+| 硬件 MMIO/NVMe/DMA 底层 | `src/ccb_hw.c` | `/dev/mem` 映射控制 MMIO/BRAM、AXIS switch、DMA SG ring、NVMe command |
 | 文件列表和任务数据库 | `src/file_list.c`, `src/system.c` | `filelist.db` 和任务状态记录 |
 | metadata | `src/ccb_metadata.c` | 每通道文件条目、LBA 分配、重复检查 |
 | 网络发送 | `src/system.c:network_send_existing_file()`, `src/ccb_tcp_transfer.c` | NVMe read 到 DDR，再走 TCP MM2S DMA 发送 |
@@ -57,8 +57,8 @@
 | descriptor CPU 地址 | `0x20000000` |
 | descriptor DMA 地址 | `0x10000000` |
 | descriptor 大小 | `0x4000` |
-| DDR CPU 窗口 | `0x10000000`, 64MiB |
 | DDR DMA/NVMe 视角 | `0x00000000`, 运行时1GiB |
+| manual PRP BRAM CPU/NVMe地址 | `0xc0000000`, 32KiB |
 | 默认 DMA descriptor payload | 16MiB |
 
 ### ch1 HIGH_Q
@@ -71,8 +71,8 @@
 | descriptor CPU 地址 | `0x30000000` |
 | descriptor DMA 地址 | `0x10000000` |
 | descriptor 大小 | `0x4000` |
-| DDR CPU 窗口 | `0xd0000000`, 64MiB |
 | DDR DMA/NVMe 视角 | `0x00000000`, 运行时1GiB |
+| manual PRP BRAM CPU/NVMe地址 | `0xc2000000`, 32KiB |
 | 默认 DMA descriptor payload | 16MiB |
 
 ### ch2 LOW_SPEED/CALIB
@@ -85,11 +85,11 @@
 | descriptor CPU 地址 | `0x20004000` |
 | descriptor DMA 地址 | `0x10000000` |
 | descriptor 大小 | `0x4000` |
-| DDR CPU 窗口 | `0xc0000000`, 64MiB |
 | DDR DMA/NVMe 视角 | `0x00000000`, 512MiB |
+| PRP模式 | Host Core auto |
 | 默认 DMA descriptor payload | 16MiB |
 
-注意：CPU 只 mmap 64MiB DDR 窗口；DMA/NVMe 使用硬件本地 DDR offset，可覆盖完整 ring。
+注意：三路数据DDR均不映射给CPU；DMA/NVMe/TCP使用硬件本地DDR offset。
 
 ### SSD PCIe reset GPIO
 
@@ -112,24 +112,13 @@
 入口：`storage.elf ddr-pattern-store`，代码为
 `execute_ddr_pattern_store_with_result()`。
 
-用途是绕过外部 S2MM 输入，直接在 ch2 CPU 视角 DDR `0xc0000000`
-写入默认 32MiB pattern，然后用 ch2 DMA/NVMe 视角地址 `0x00000000`
-写入 SSD。每个 32-bit word 的格式：
+当前FPGA不向CPU映射通道数据DDR，因此该诊断不再由CPU生成或比较pattern。
+`ddr-pattern-store`只允许`SRC_REAL_DDR_RAW_STORE=1`：调用方先通过硬件数据通路
+把内容放入DDR，再由软件使用`ddr_offset`换算成`ddr_hw_addr`提交NVMe写命令。
+CPU填充、CPU读回以及网络DDR sentinel验证均已移除。
 
-```text
-word[n] = ((n & 0xffff) << 16) | (n & 0xffff)
-```
-
-写盘完成后复用现有 metadata 和 `filelist.db` 登记逻辑，所以上位机可以通过
+写盘完成后仍复用现有 metadata 和 `filelist.db` 登记逻辑，所以上位机可以通过
 现有文件列表和 TCP 下载流程读取该文件。该模式本身不主动 TCP 发送。
-
-测试开始时先对通道AXI DMA执行full reset，防止上一次异常任务留下的S2MM继续
-覆盖DDR ring。默认32MiB测试随后执行两级完整校验：CPU填充后输出
-`ddr_pattern_verify stage=cpu_fill`；NVMe写完成后再读回到ch2 CPU DDR窗口的
-第二个32MiB区域，逐32-bit word检查并输出
-`ddr_pattern_verify stage=ssd_readback`。只有两级都通过才登记metadata和数据库。
-网络下载在第一个chunk的NVMe read完成、TCP MM2S启动前输出
-`[DBG][NET] DDR prefix before TCP ...`，用于区分SSD/DDR问题和TCP数据通路问题。
 
 ### 5.1 初始化阶段
 
@@ -447,11 +436,11 @@ SSD metadata保持原有32字节`FileEntry`布局：超过4GiB时
 
 `flush_slot_to_nvme()` 把一个 DDR slot 转为 NVMe write：
 
-1. producer 在 DMA harvest 时就计算并记录 `start_lba`、`sectors`、`hw_addr`。
+1. producer 在 DMA harvest 时就计算并记录 `start_lba`、`sectors`、`ddr_hw_addr`。
 2. `sectors = bytes_to_sectors(bytes)`，尾部不足 512B 时仍占用一个完整 sector。
 3. producer 用 `next_queue_lba += sectors` 推进 LBA cursor；writer 不再用
    `file_offset / 512` 反推 LBA，也不在写盘完成后串行推进 LBA。
-4. 默认 single-slot writer 调用 `nvme_write_slot_qd(rt, slot, start_lba, sectors, hw_addr)`。
+4. 默认 single-slot writer 调用 `nvme_write_slot_qd(rt, slot, start_lba, sectors, ddr_hw_addr)`。
 
 环境变量`SRC_REAL_NVME_CMD_KIB`允许配置256、512、1024、2048、4096KiB；
 也支持按通道覆盖：`SRC_REAL_NVME_CMD_KIB_CH0`、`SRC_REAL_NVME_CMD_KIB_CH1`、
@@ -682,7 +671,7 @@ flash1。未挂载时只有该同步命令返回失败，不影响 daemon、存�
 2. 停止采集时，最后不足一个 descriptor 的数据如果没有让 DMA BD complete，软件无法写入这段数据。
 3. DDR ring 只能吸收突发。如果平均输入速率长期高于 NVMe 写盘速率，ring 最终会满；当前硬件不能把该状态反压到 Aurora 对端，因此会丢数。
 4. NVMe写盘支持最大QD32，但实际吞吐仍受Host Core协商tag数、SQ FIFO、PCIe和SSD持续写性能限制。
-5. CPU 只可访问 64MiB DDR 窗口，不要用 CPU 地址判断完整 ring 数据。
+5. 通道数据DDR对CPU完全不可见；只能依据`ddr_offset`/`ddr_hw_addr`、DMA状态和硬件抓取判断ring数据。
 6. TCP 下载查当前目录 `filelist.db`。如果运行目录不对，会查到空库或旧库；不要再从 `/mnt/spi1/filelist.db` 判断下载目标。
 7. TCP与存储共享一个AXI DMA实例。正常切换只应halt对应方向；整核reset仅用于
    DMASR error恢复，否则可能因S2MM/SG时钟域未运行而卡住Reset bit。

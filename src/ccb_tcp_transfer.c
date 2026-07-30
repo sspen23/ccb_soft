@@ -204,14 +204,15 @@ static void tcp_log_mm2s_state(const char *prefix,
     }
 
     fprintf(stderr,
-            "%s bytes=%" PRIu64 " dma=0x%08" PRIx64 " ddr_dma=0x%08" PRIx64
+            "%s bytes=%" PRIu64 " dma=0x%08" PRIx64
+            " ddr_hw_addr=0x%08" PRIx64
             " desc=%u completed=%u/%u desc_control=0x%08x desc_status=0x%08x"
             " desc_buf=0x%08x dmasr=0x%08x curdesc=0x%08x taildesc=0x%08x"
             " waited_us=%u poll_dmasr=%d last_dmasr=0x%08x\n",
             prefix ? prefix : "tcp MM2S state",
             cfg ? cfg->transfer_bytes : 0u,
             cfg ? cfg->dma_base : 0u,
-            cfg ? cfg->ddr_dma_base : 0u,
+            cfg ? cfg->ddr_hw_addr : 0u,
             (unsigned)next_desc,
             (unsigned)completed,
             (unsigned)desc_count,
@@ -225,14 +226,14 @@ static void tcp_log_mm2s_state(const char *prefix,
             poll_dmasr,
             last_dmasr);
     dbg_printf("[DBG][TCP] %s bytes=%" PRIu64 " dma=0x%08" PRIx64
-               " ddr_dma=0x%08" PRIx64 " desc=%u completed=%u/%u"
+               " ddr_hw_addr=0x%08" PRIx64 " desc=%u completed=%u/%u"
                " desc_control=0x%08x desc_status=0x%08x desc_buf=0x%08x"
                " dmasr=0x%08x curdesc=0x%08x taildesc=0x%08x"
                " waited_us=%u poll_dmasr=%d last_dmasr=0x%08x\n",
                prefix ? prefix : "tcp MM2S state",
                cfg ? cfg->transfer_bytes : 0u,
                cfg ? cfg->dma_base : 0u,
-               cfg ? cfg->ddr_dma_base : 0u,
+               cfg ? cfg->ddr_hw_addr : 0u,
                (unsigned)next_desc,
                (unsigned)completed,
                (unsigned)desc_count,
@@ -268,7 +269,7 @@ static void tcp_trace_descriptors(const char *event,
            cfg->dma_base,
            cfg->switch_base,
            (unsigned)cfg->switch_input_select,
-           cfg->ddr_dma_base,
+           cfg->ddr_hw_addr,
            cfg->desc_cpu_base,
            cfg->desc_dma_base,
            (unsigned)desc_count,
@@ -520,7 +521,7 @@ static uint32_t tcp_prepare_desc(const TcpTransferConfig *cfg, const MappedRegio
     uint32_t desc_count = (uint32_t)((cfg->transfer_bytes + TCP_MAX_BYTES_PER_DESC - 1u) / TCP_MAX_BYTES_PER_DESC);
     DmaSgDesc *desc = (DmaSgDesc *)(void *)desc_region->virt;
     uint64_t remaining = cfg->transfer_bytes;
-    uint64_t ddr_addr = cfg->ddr_dma_base;
+    uint64_t ddr_hw_addr = cfg->ddr_hw_addr;
     uint32_t i;
 
     for (i = 0u; i < desc_count; ++i) {
@@ -537,10 +538,10 @@ static uint32_t tcp_prepare_desc(const TcpTransferConfig *cfg, const MappedRegio
 
         memset(&desc[i], 0, sizeof(desc[i]));
         desc[i].next_desc = (uint32_t)(cfg->desc_dma_base + (uint64_t)next * sizeof(DmaSgDesc));
-        desc[i].buffer_addr = (uint32_t)ddr_addr;
+        desc[i].buffer_addr = (uint32_t)ddr_hw_addr;
         desc[i].control = control;
 
-        ddr_addr += chunk;
+        ddr_hw_addr += chunk;
         remaining -= chunk;
     }
     return desc_count;
@@ -554,7 +555,7 @@ void tcp_transfer_default_config(TcpTransferConfig *cfg, uint64_t transfer_bytes
     cfg->dma_base = TCP_DMA_BASE_DEFAULT;
     cfg->desc_cpu_base = TCP_DESC_CPU_BASE_DEFAULT;
     cfg->desc_dma_base = TCP_DESC_DMA_BASE_DEFAULT;
-    cfg->ddr_dma_base = TCP_DDR_DMA_BASE_DEFAULT;
+    cfg->ddr_hw_addr = TCP_DDR_HW_ADDR_DEFAULT;
     cfg->transfer_bytes = transfer_bytes;
     cfg->timeout_us = gopt.timeout_us ? gopt.timeout_us : DEFAULT_TIMEOUT_US;
     cfg->dry_run = gopt.dry_run;
@@ -626,14 +627,15 @@ int tcp_transfer_send(const TcpTransferConfig *cfg)
     if (cfg->dry_run) {
         printf("network_send_done dry_run=1 bytes=%" PRIu64 " dma=0x%08" PRIx64
                " switch=0x%08" PRIx64 " input=%u desc_cpu=0x%08" PRIx64
-               " desc_dma=0x%08" PRIx64 " ddr_dma=0x%08" PRIx64 "\n",
+               " desc_dma=0x%08" PRIx64
+               " ddr_hw_addr=0x%08" PRIx64 "\n",
                cfg->transfer_bytes,
                cfg->dma_base,
                cfg->switch_base,
                (unsigned)cfg->switch_input_select,
                cfg->desc_cpu_base,
                cfg->desc_dma_base,
-               cfg->ddr_dma_base);
+               cfg->ddr_hw_addr);
         return 0;
     }
 
@@ -654,11 +656,11 @@ int tcp_transfer_send(const TcpTransferConfig *cfg)
                poll_dmasr);
     dbg_verbose_printf("[DBG][TCP] route detail switch=0x%08" PRIx64
                        " desc_cpu=0x%08" PRIx64 " desc_dma=0x%08" PRIx64
-                       " ddr_dma=0x%08" PRIx64 "\n",
+                       " ddr_hw_addr=0x%08" PRIx64 "\n",
                        cfg->switch_base,
                        cfg->desc_cpu_base,
                        cfg->desc_dma_base,
-                       cfg->ddr_dma_base);
+                       cfg->ddr_hw_addr);
 
     if (tcp_route_switch(cfg, &sw) != 0) {
         goto out;
@@ -787,8 +789,9 @@ int tcp_transfer_send(const TcpTransferConfig *cfg)
     }
 
     tcp_trace_descriptors("completed", cfg, &dma, desc, desc_count);
-    printf("network_send_done bytes=%" PRIu64 " desc_count=%u ddr_dma=0x%08" PRIx64 "\n",
-           cfg->transfer_bytes, desc_count, cfg->ddr_dma_base);
+    printf("network_send_done bytes=%" PRIu64
+           " desc_count=%u ddr_hw_addr=0x%08" PRIx64 "\n",
+           cfg->transfer_bytes, desc_count, cfg->ddr_hw_addr);
     rc = 0;
 
 out:

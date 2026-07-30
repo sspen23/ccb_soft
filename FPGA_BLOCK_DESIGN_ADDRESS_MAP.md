@@ -142,10 +142,11 @@
   - descriptor CPU base: 0x20000000
   - descriptor DMA-view base: 0x10000000
   - descriptor BRAM size: 0x4000
-  - DDR CPU-visible base: 0x10000000
-  - DDR CPU-visible size: 64 MiB
+  - DDR CPU-visible mapping: none
   - DDR DMA/NVMe hardware-view base: 0x00000000
   - DDR DMA/NVMe hardware-view range: 2 GiB
+  - manual PRP BRAM CPU/NVMe base: 0xC0000000
+  - manual PRP BRAM size: 32 KiB
   - 软件默认 ring: 1 GiB
   - 软件允许最大 ring: 2 GiB
   - 默认 DMA descriptor payload: 16 MiB
@@ -157,10 +158,11 @@
   - descriptor CPU base: 0x30000000
   - descriptor DMA-view base: 0x10000000
   - descriptor BRAM size: 0x4000
-  - DDR CPU-visible base: 0xD0000000
-  - DDR CPU-visible size: 64 MiB
+  - DDR CPU-visible mapping: none
   - DDR DMA/NVMe hardware-view base: 0x00000000
   - DDR DMA/NVMe hardware-view range: 2 GiB
+  - manual PRP BRAM CPU/NVMe base: 0xC2000000
+  - manual PRP BRAM size: 32 KiB
   - 软件默认 ring: 1 GiB
   - 软件允许最大 ring: 2 GiB
   - 默认 DMA descriptor payload: 16 MiB
@@ -172,18 +174,17 @@
   - descriptor CPU base: 0x20004000
   - descriptor DMA-view base: 0x10000000
   - descriptor BRAM size: 0x4000
-  - DDR CPU-visible base: 0xC0000000
-  - DDR CPU-visible size: 64 MiB
+  - DDR CPU-visible mapping: none
   - DDR DMA/NVMe hardware-view base: 0x00000000
   - DDR DMA/NVMe hardware-view range: 512 MiB
+  - Host Core PRP mode: auto
   - 软件 ring: 512 MiB
   - 默认 DMA descriptor payload: 16 MiB
 
   注意：
-  CPU 看到的 DDR 地址和 DMA/NVMe 看到的 DDR 地址不同。
-  CPU 只能 mmap 每通道低 64 MiB。
-  DMA descriptor 和 NVMe PRP 必须使用硬件视角地址，也就是 0x00000000 + offset。
-  不能用 CPU 地址判断整个 1 GiB / 2 GiB ring 是否正常。
+  通道数据DDR不在CPU地址空间中。
+  DMA descriptor、NVMe PRP和TCP MM2S必须使用硬件视角地址，也就是
+  0x00000000 + offset。
 
   ------------------------------------------------------------
   NVMe Host Core
@@ -339,7 +340,7 @@ and cross-checked against:
 - `src_real/src/ccb_hw.c`
 - NVMe Host Core wrapper files under `DBQ_CCB_ku115.ip_user_files/bd/design_1/ipshared/ab03/src/`
 
-## 1. CPU-visible MMIO and DDR address map
+## 1. CPU-visible MMIO and shared-BRAM address map
 
 MicroBlaze `/microblaze_0` Data address space:
 
@@ -348,6 +349,9 @@ MicroBlaze `/microblaze_0` Data address space:
 | ch2 DMA SG descriptor BRAM CPU view | `/adl_data_channel_2/axi_bram_ctrl_0/S_AXI/Mem0` | `0x20004000` | `16K` | `desc_cpu_base=0x20004000`, `desc_cpu_size=0x4000` |
 | ch0 DMA SG descriptor BRAM CPU view | `/adh_data_channel_0/axi_bram_ctrl_0/S_AXI/Mem0` | `0x20000000` | `16K` | `desc_cpu_base=0x20000000`, `desc_cpu_size=0x4000` |
 | ch1 DMA SG descriptor BRAM CPU view | `/adh_data_channel_1/axi_bram_ctrl_0/S_AXI/Mem0` | `0x30000000` | `16K` | `desc_cpu_base=0x30000000`, `desc_cpu_size=0x4000` |
+| ch0 manual PRP BRAM | `/shared_mem_ch0/axi_bram_ctrl_0/S_AXI/Mem0` | `0xC0000000` | `32K` | `prp_list_cpu_base=prp_list_hw_base=0xC0000000` |
+| ch1 manual PRP BRAM | `/shared_mem_ch1/axi_bram_ctrl_0/S_AXI/Mem0` | `0xC2000000` | `32K` | `prp_list_cpu_base=prp_list_hw_base=0xC2000000` |
+| ch2 shared BRAM, auto PRP mode | `/shared_mem_ch2/axi_bram_ctrl_0/S_AXI/Mem0` | `0xC4000000` | `32K` | software does not use it for PRP lists |
 | ch2 AXI DMA control | `/adl_data_channel_2/axi_dma_0/S_AXI_LITE/Reg` | `0x00030000` | `64K` | `dma_base=0x00030000` |
 | ch0 AXI DMA control | `/adh_data_channel_0/axi_dma_0/S_AXI_LITE/Reg` | `0x41E00000` | `64K` | `dma_base=0x41E00000` |
 | ch1 AXI DMA control | `/adh_data_channel_1/axi_dma_0/S_AXI_LITE/Reg` | `0xA0060000` | `64K` | `dma_base=0xA0060000` |
@@ -359,38 +363,39 @@ MicroBlaze `/microblaze_0` Data address space:
 | ch0 NVMe Host Core command/control regs | `/adh_data_channel_0/NVMe_hier_0/nvme_host_core_0/S_AXI/reg0` | `0x44A00000` | `64K` | `nvme_base=0x44A00000` |
 | ch1 NVMe Host Core command/control regs | `/adh_data_channel_1/NVMe_hier_0/nvme_host_core_0/S_AXI/reg0` | `0xA0080000` | `64K` | `nvme_base=0xA0080000` |
 | SSD reset GPIO, active-low output | `/axi_gpio_ssd_rstn/S_AXI/Reg` | `0x40010000` | `64K` | used by `ssd_rst` |
-| ch2 DDR CPU-visible window | `/adl_data_channel_2/ddr4_16b_0/...` | `0xC0000000` | `64M` | `ddr_cpu_base=0xC0000000`, `ddr_cpu_size=64M` |
-| ch0 DDR CPU-visible window | `/adh_data_channel_0/ddr4_64b_0/...` | `0x10000000` | `64M` | `ddr_cpu_base=0x10000000`, `ddr_cpu_size=64M` |
-| ch1 DDR CPU-visible window | `/adh_data_channel_1/ddr4_64b_0/...` | `0xD0000000` | `64M` | `ddr_cpu_base=0xD0000000`, `ddr_cpu_size=64M` |
 | MicroBlaze main DDR | `/ddr4_0/C0_DDR4...` | `0x80000000` | `512M` | Linux memory area |
 
 Notes:
 
 - ch0/ch1/ch2 descriptor BRAM is `16K` in BD and current `src_real` software uses the full `0x4000` bytes.
+- ch0/ch1/ch2 channel data DDR does not appear in the MicroBlaze Data address
+  space. `0xC0000000`, `0xC2000000`, and `0xC4000000` are shared BRAM
+  apertures, not data-DDR windows.
 
 ## 2. DMA/NVMe hardware-view data address map
 
-The CPU physical address is not the same as the DMA/NVMe hardware-view address for channel data DDR.
+Channel data DDR has no CPU physical address in the current design.
 
 | Path | Master address space | Target DDR | Master-view base | Master-view range | CPU view |
 |---|---|---|---:|---:|---:|
 | ch2 AXI DMA SG | `Data_SG` | ch2 descriptor BRAM | `0x10000000` | `16K` | CPU writes desc at `0x20004000` |
-| ch2 AXI DMA MM2S | `Data_MM2S` | ch2 DDR | `0x00000000` | `512M` | CPU maps first `64M` at `0xC0000000` |
-| ch2 AXI DMA S2MM | `Data_S2MM` | ch2 DDR | `0x00000000` | `512M` | CPU maps first `64M` at `0xC0000000` |
-| ch2 NVMe/PCIe M_AXI | `M_AXI` | ch2 DDR | `0x00000000` | `512M` | CPU maps first `64M` at `0xC0000000` |
+| ch2 AXI DMA MM2S | `Data_MM2S` | ch2 DDR | `0x00000000` | `512M` | not CPU-mapped |
+| ch2 AXI DMA S2MM | `Data_S2MM` | ch2 DDR | `0x00000000` | `512M` | not CPU-mapped |
+| ch2 NVMe/PCIe M_AXI | `M_AXI` | ch2 DDR | `0x00000000` | `512M` | not CPU-mapped |
 | ch0 AXI DMA SG | `Data_SG` | ch0 descriptor BRAM | `0x10000000` | `16K` | CPU writes desc at `0x20000000` |
-| ch0 AXI DMA MM2S | `Data_MM2S` | ch0 DDR | `0x00000000` | `2G` | CPU maps first `64M` at `0x10000000` |
-| ch0 AXI DMA S2MM | `Data_S2MM` | ch0 DDR | `0x00000000` | `2G` | CPU maps first `64M` at `0x10000000` |
-| ch0 NVMe/PCIe M_AXI | `M_AXI` | ch0 DDR | `0x00000000` | `2G` | CPU maps first `64M` at `0x10000000` |
+| ch0 AXI DMA MM2S | `Data_MM2S` | ch0 DDR | `0x00000000` | `2G` | not CPU-mapped |
+| ch0 AXI DMA S2MM | `Data_S2MM` | ch0 DDR | `0x00000000` | `2G` | not CPU-mapped |
+| ch0 NVMe/PCIe M_AXI | `M_AXI` | ch0 DDR | `0x00000000` | `2G` | not CPU-mapped |
 | ch1 AXI DMA SG | `Data_SG` | ch1 descriptor BRAM | `0x10000000` | `16K` | CPU writes desc at `0x30000000` |
-| ch1 AXI DMA MM2S | `Data_MM2S` | ch1 DDR | `0x00000000` | `2G` | CPU maps first `64M` at `0xD0000000` |
-| ch1 AXI DMA S2MM | `Data_S2MM` | ch1 DDR | `0x00000000` | `2G` | CPU maps first `64M` at `0xD0000000` |
-| ch1 NVMe/PCIe M_AXI | `M_AXI` | ch1 DDR | `0x00000000` | `2G` | CPU maps first `64M` at `0xD0000000` |
+| ch1 AXI DMA MM2S | `Data_MM2S` | ch1 DDR | `0x00000000` | `2G` | not CPU-mapped |
+| ch1 AXI DMA S2MM | `Data_S2MM` | ch1 DDR | `0x00000000` | `2G` | not CPU-mapped |
+| ch1 NVMe/PCIe M_AXI | `M_AXI` | ch1 DDR | `0x00000000` | `2G` | not CPU-mapped |
 
 Software consequence:
 
 - DMA BD buffer addresses and NVMe PRP addresses must use `ddr_hw_base + offset`, currently `0x00000000 + offset`.
-- CPU debug/verify accesses use `ddr_cpu_base + offset`, only reliable inside the first `64M` CPU-visible window unless the mmap cap is changed.
+- Software does not map channel data DDR through `/dev/mem`; APIs pass
+  `ddr_offset` or `ddr_hw_addr`.
 
 ## 3. Storage RX datapath
 
@@ -699,8 +704,9 @@ Risk note:
 
 - The block design confirms `CmdLBA` is 64-bit and fed into the command queue path.
 - The exact CDW10/CDW11 bit assignment cannot be proven from plain RTL because the final SQ encoder is encrypted/encoded.
-- Your `ssd-lba-wrap-test` passing for `LBA` and `LBA + 0x100000` makes a simple low-20-bit LBA wrap unlikely.
-- The newer `ssd-continuous-pattern-test` is the better software-side check for continuous >512MiB LBA behavior without TCP.
+- Historical `ssd-lba-wrap-test` results made a simple low-20-bit LBA wrap
+  unlikely. The CPU pattern diagnostics are disabled in the current software
+  because channel data DDR is no longer CPU-accessible.
 
 ## 8. Current software/FPGA correspondence summary
 
@@ -712,7 +718,6 @@ The current `src_real` address configuration matches the Vivado BD for the impor
   - NVMe regs `0x00010000`: match
   - desc CPU `0x20004000`: match base, software uses full `16K`
   - desc DMA `0x10000000`: match DMA SG view
-  - DDR CPU `0xC0000000`: match first `64M`
   - DDR DMA/NVMe address `0x00000000`: match ch2 DMA/NVMe master view
 
 - ch0 storage/TCP default:
@@ -721,7 +726,7 @@ The current `src_real` address configuration matches the Vivado BD for the impor
   - NVMe regs `0x44A00000`: match
   - desc CPU `0x20000000`: match
   - desc DMA `0x10000000`: match DMA SG view
-  - DDR CPU `0x10000000`: match first `64M`
+  - manual PRP BRAM CPU/NVMe `0xC0000000`: match, `32K`
   - DDR DMA/NVMe address `0x00000000`: match ch0 DMA/NVMe master view
 
 - ch1 storage/TCP:
@@ -730,7 +735,7 @@ The current `src_real` address configuration matches the Vivado BD for the impor
   - NVMe regs `0xA0080000`: match
   - desc CPU `0x30000000`: match
   - desc DMA `0x10000000`: match DMA SG view
-  - DDR CPU `0xD0000000`: match first `64M`
+  - manual PRP BRAM CPU/NVMe `0xC2000000`: match, `32K`
   - DDR DMA/NVMe address `0x00000000`: match ch1 DMA/NVMe master view
 
 - TCP download top switch:
