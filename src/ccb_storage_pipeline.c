@@ -3,6 +3,20 @@
 #include <stdlib.h>
 #include <string.h>
 
+#define STORAGE_DMA_DESC_STS_CMPLT (1u << 31)
+#define STORAGE_DMA_DESC_STS_RXSOF (1u << 27)
+#define STORAGE_DMA_DESC_STS_RXEOF (1u << 26)
+
+bool storage_dma_empty_frame_is_ignorable(uint32_t actual_bytes,
+                                          uint32_t descriptor_status)
+{
+    const uint32_t complete_empty_frame = STORAGE_DMA_DESC_STS_CMPLT |
+                                          STORAGE_DMA_DESC_STS_RXSOF |
+                                          STORAGE_DMA_DESC_STS_RXEOF;
+
+    return actual_bytes == 0u && descriptor_status == complete_empty_frame;
+}
+
 uint32_t storage_ring_pressure_level(uint32_t occupied_slots,
                                      uint32_t total_slots,
                                      uint32_t warning_percent,
@@ -41,6 +55,21 @@ bool storage_ring_pressure_should_stop(uint32_t pressure_level,
            now_us - critical_since_us >= critical_duration_us;
 }
 
+bool storage_ring_pressure_requires_degraded_drain(uint32_t pressure_level,
+                                                   bool drain_requested)
+{
+    return pressure_level >= 2u && !drain_requested;
+}
+
+bool storage_receive_failure_allows_drain(bool safe_discard,
+                                          bool pressure_drain,
+                                          bool dma_error,
+                                          bool descriptor_error)
+{
+    return (safe_discard || pressure_drain) && !dma_error &&
+           !descriptor_error;
+}
+
 StorageFirstDmaDeadlineOutcome storage_first_dma_deadline_outcome(
     bool deadline_due, bool saw_dma_data, bool stop_requested,
     int harvest_rc, uint32_t harvest_count)
@@ -51,6 +80,42 @@ StorageFirstDmaDeadlineOutcome storage_first_dma_deadline_outcome(
     if (deadline_due && !stop_requested)
         return STORAGE_FIRST_DMA_DEADLINE_EXPIRED;
     return STORAGE_FIRST_DMA_DEADLINE_WAIT;
+}
+
+uint32_t storage_dma_harvest_batch_limit(uint32_t base_limit,
+                                         uint32_t total_slots,
+                                         uint32_t completed_unharvested,
+                                         uint32_t available_limit)
+{
+    uint32_t limit = base_limit;
+    uint32_t quarter;
+    uint32_t half;
+
+    if (base_limit == 0u || total_slots == 0u || available_limit == 0u)
+        return 0u;
+    quarter = (total_slots + 3u) / 4u;
+    half = (total_slots + 1u) / 2u;
+    if (completed_unharvested >= half && limit < 64u) limit = 64u;
+    else if (completed_unharvested >= quarter && limit < 32u) limit = 32u;
+    if (limit > available_limit) limit = available_limit;
+    return limit;
+}
+
+bool storage_dma_emergency_harvest(uint32_t dma_writable,
+                                   uint32_t completed_unharvested,
+                                   uint32_t total_slots)
+{
+    uint32_t half;
+
+    if (total_slots == 0u) return false;
+    half = (total_slots + 1u) / 2u;
+    return dma_writable == 0u || completed_unharvested >= half;
+}
+
+bool storage_dma_producer_may_idle(uint32_t harvested,
+                                   uint32_t completed_unharvested)
+{
+    return harvested == 0u && completed_unharvested == 0u;
 }
 
 int storage_pipeline_counts_valid(const StoragePipeline *p)

@@ -95,20 +95,21 @@ static void assert_resolution(int channel, StorageCrossSlotConfigParam param,
 static void test_defaults(void)
 {
     static const uint32_t expected[3][8] = {
-        {1u, 4u, 8u, 8u, 300u, 20u, 1u, 5000000u},
-        {1u, 4u, 8u, 8u, 300u, 20u, 1u, 5000000u},
+        {1u, 4u, 8u, 8u, 1000u, 50u, 5u, 5000000u},
+        {1u, 4u, 8u, 8u, 1000u, 50u, 5u, 5000000u},
         {0u, 1u, 8u, 8u, 300u, 20u, 1u, 5000000u},
     };
     int channel;
     int param;
 
     clear_cross_slot_env();
+    setenv("CCB_STORAGE_PROFILE", "CROSS_SLOT_EXPERIMENTAL", 1);
     for (channel = 0; channel < 3; ++channel) {
         for (param = STORAGE_CROSS_SLOT_CONFIG_ENABLED;
              param <= STORAGE_CROSS_SLOT_CONFIG_NO_PROGRESS_TIMEOUT_US; ++param) {
             assert_resolution(channel, (StorageCrossSlotConfigParam)param,
                               expected[channel][param], STORAGE_CROSS_SLOT_SOURCE_DEFAULT,
-                              param <= STORAGE_CROSS_SLOT_CONFIG_CQ_BATCH
+                              param <= STORAGE_CROSS_SLOT_CONFIG_EMPTY_SLEEP_US
                                   ? "profile" : "default");
         }
     }

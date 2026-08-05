@@ -44,5 +44,10 @@ void storage_commit_state_reset(StorageCommitState *state);
 int storage_commit_run_once(StorageCommitState *state, const char *task_id,
                             const StorageCommitItem *items, size_t count,
                             const StorageCommitOps *ops);
+int storage_commit_run_once_status(StorageCommitState *state,
+                                   const char *task_id,
+                                   const StorageCommitItem *items,
+                                   size_t count, TaskStatus final_status,
+                                   const StorageCommitOps *ops);
 
 #endif

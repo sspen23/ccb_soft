@@ -18,6 +18,8 @@
 #include <sched.h>
 #include <time.h>
 
+static void nvme_set_last_error(ChannelRuntime *rt, const char *reason);
+
 /*
  * Hardware access layer:
  * - Maps channel MMIO/DDR regions from /dev/mem
@@ -36,6 +38,10 @@
 
 #define NVME_BUSY_POLL_US_DEFAULT 0u
 #define NVME_POLL_SLEEP_US_DEFAULT 10u
+#define NVME_POLL_SLEEP_US_MAX 50u
+#define NVME_CROSS_SLOT_COMMANDS_PER_QD_ROUND 8u
+#define NVME_CROSS_SLOT_VALIDATE_INTERVAL_US 50000u
+#define NVME_CROSS_SLOT_STATS_INTERVAL_US 50000u
 #define NVME_SECTOR_BYTES 512u
 #define NVME_CMD_KIB_DEFAULT 256u
 #define NVME_CMD_KIB_HIGH_DEFAULT 1024u
@@ -75,10 +81,6 @@
 #define AXIS_SWITCH_MI0_MUX_OFFSET 0x0040u
 #define AXIS_SWITCH_REG_UPDATE (1u << 1)
 
-/* Xilinx/AMD AXI Bridge for PCIe Gen3 PG194 PHY Status/Control register. */
-#define PCIE_BRIDGE_PHY_STATUS_CONTROL 0x144u
-#define PCIE_BRIDGE_MMAP_BYTES 0x1000u
-
 /* NVMe host register offsets/bits */
 #define GENERIC_REG_OFFSET 0x00u
 #define GENERIC_NVM_STATUS 0x14u
@@ -110,6 +112,7 @@
 #define PERF_CALC_OVERFLOW (1u << 31)
 #define NVME_PERF_CLOCK_PERIOD_NS_DEFAULT 4u
 #define NVME_SUBMIT_STALL_US 1000u
+#define DMA_STOP_RESET_STABLE_US 1000u
 
 #define NVM_WRITE 0x01u
 #define NVM_READ 0x02u
@@ -227,125 +230,9 @@ static int hw_env_flag_enabled(const char *name) {
     return 1;
 }
 
-static int env_u64_exact(const char *name, uint64_t *out) {
-    const char *v = storage_config_compat_getenv(name);
-    char *end = NULL;
-    unsigned long long parsed;
-
-    if (!v || v[0] == '\0') {
-        return 0;
-    }
-    errno = 0;
-    parsed = strtoull(v, &end, 0);
-    if (errno != 0 || end == v || *end != '\0') {
-        fprintf(stderr, "warning: invalid %s=%s; ignoring PCIe bridge override\n", name, v);
-        return -1;
-    }
-    *out = (uint64_t)parsed;
-    return 1;
-}
-
-static uint64_t pcie_bridge_base_for_channel(const ChannelConfig *cfg) {
-    char name[64];
-    uint64_t base = 0u;
-    int rc;
-
-    if (!cfg) {
-        return 0u;
-    }
-    snprintf(name, sizeof(name), "SRC_REAL_PCIE_BRIDGE_BASE_CH%d", cfg->id);
-    rc = env_u64_exact(name, &base);
-    if (rc > 0) {
-        return base;
-    }
-    return cfg->pcie_bridge_base;
-}
-
-static const char *pcie_link_speed_name(uint32_t phy_reg) {
-    bool link_up = (phy_reg & (1u << 11u)) != 0u;
-    bool gen3 = (phy_reg & (1u << 12u)) != 0u;
-    bool gen2 = (phy_reg & (1u << 0u)) != 0u;
-
-    if (!link_up) {
-        return "down";
-    }
-    if (gen3) {
-        return "Gen3_8GT";
-    }
-    if (gen2) {
-        return "Gen2_5GT";
-    }
-    return "Gen1_2p5GT";
-}
-
-static const char *pcie_link_width_name(uint32_t phy_reg) {
-    uint32_t width_code;
-
-    if ((phy_reg & (1u << 13u)) != 0u) {
-        return "x16";
-    }
-    width_code = (phy_reg >> 1u) & 0x3u;
-    switch (width_code) {
-    case 0u:
-        return "x1";
-    case 1u:
-        return "x2";
-    case 2u:
-        return "x4";
-    case 3u:
-        return "x8";
-    default:
-        return "unknown";
-    }
-}
-
-void storage_print_pcie_link_status(ChannelRuntime *rt, const char *reason) {
-    uint64_t base;
-    uint32_t phy_reg;
-    uint32_t link_up;
-    uint32_t ltssm;
-
-    if (!rt || !rt->cfg) {
-        return;
-    }
-    if (!reason || reason[0] == '\0') {
-        reason = "unknown";
-    }
-    if (!hw_storage_log_at_least_debug()) {
-        return;
-    }
-    base = rt->pcie_bridge_base_effective;
-    if (base == 0u) {
-        printf("pcie_link_status channel=%d reason=%s error=no_bridge_base\n",
-               rt->cfg->id,
-               reason);
-        fflush(stdout);
-        return;
-    }
-    if (!rt->pcie_bridge.valid) {
-        printf("pcie_link_status channel=%d reason=%s bridge_base=0x%08" PRIx64
-               " error=read_failed\n",
-               rt->cfg->id,
-               reason,
-               base);
-        fflush(stdout);
-        return;
-    }
-
-    phy_reg = reg_read32(&rt->pcie_bridge, PCIE_BRIDGE_PHY_STATUS_CONTROL);
-    link_up = (phy_reg >> 11u) & 0x1u;
-    ltssm = (phy_reg >> 3u) & 0x3fu;
-    printf("pcie_link_status channel=%d reason=%s bridge_base=0x%08" PRIx64
-           " phy_reg=0x%08x link_up=%u speed=%s width=%s ltssm=0x%02x\n",
-           rt->cfg->id,
-           reason,
-           base,
-           phy_reg,
-           link_up,
-           pcie_link_speed_name(phy_reg),
-           pcie_link_width_name(phy_reg),
-           ltssm);
-    fflush(stdout);
+static bool nvme_read_trace_enabled(const ChannelRuntime *rt)
+{
+    return rt && rt->cfg && hw_env_flag_enabled("SRC_REAL_NVME_READ_TRACE") != 0;
 }
 
 static bool nvme_cmd_kib_allowed(uint32_t kib) {
@@ -367,6 +254,14 @@ uint32_t nvme_default_qd_for_channel(int channel_id) {
         return NVME_QD_HIGH_DEFAULT;
     }
     return NVME_QD_DEFAULT;
+}
+
+uint32_t nvme_read_command_sectors(const ChannelRuntime *rt)
+{
+    if (rt && rt->nvme_cmd_sectors != 0u) {
+        return rt->nvme_cmd_sectors;
+    }
+    return NVME_CMD_KIB_DEFAULT * 1024u / NVME_SECTOR_BYTES;
 }
 
 static uint32_t channel_default_nvme_qd(const ChannelRuntime *rt) {
@@ -569,43 +464,77 @@ static uint32_t parse_nvme_feed_mode(ChannelRuntime *rt) {
     return NVME_FEED_MODE_LEGACY;
 }
 
-static void nvme_configure_runtime(ChannelRuntime *rt) {
+int nvme_decode_max_transfer(uint32_t raw_value,
+                             uint32_t logical_block_bytes,
+                             uint32_t *blocks,
+                             uint32_t *bytes)
+{
+    uint64_t actual_blocks;
+    uint64_t actual_bytes;
+
+    if (!blocks || !bytes || raw_value == 0u || raw_value > 0x1fffu ||
+        logical_block_bytes == 0u) {
+        return -1;
+    }
+    /* NVMStatus.MaxTransferSize is a block count, unlike CmdSectCnt which is
+     * NLB-minus-one.  A zero value means the capability is not available. */
+    actual_blocks = raw_value;
+    actual_bytes = actual_blocks * logical_block_bytes;
+    if (actual_bytes > UINT32_MAX) return -1;
+    *blocks = (uint32_t)actual_blocks;
+    *bytes = (uint32_t)actual_bytes;
+    return 0;
+}
+
+int nvme_clamp_command_bytes(uint32_t requested_bytes,
+                             uint32_t nvme_max_transfer_bytes,
+                             uint32_t logical_block_bytes,
+                             uint32_t *effective_bytes)
+{
+    if (!effective_bytes || requested_bytes == 0u ||
+        nvme_max_transfer_bytes == 0u || logical_block_bytes == 0u ||
+        requested_bytes % logical_block_bytes != 0u ||
+        nvme_max_transfer_bytes % logical_block_bytes != 0u) {
+        return -1;
+    }
+    *effective_bytes = requested_bytes < nvme_max_transfer_bytes
+                           ? requested_bytes : nvme_max_transfer_bytes;
+    return 0;
+}
+
+static int nvme_configure_runtime(ChannelRuntime *rt) {
+    const ChannelStorageConfig *profile = rt && rt->cfg
+        ? storage_config_channel(storage_config_get(), (uint32_t)rt->cfg->id)
+        : NULL;
     uint32_t requested_kib = parse_nvme_cmd_kib(rt);
     uint64_t requested_bytes = (uint64_t)requested_kib * 1024ull;
     uint64_t safe_limit = (uint64_t)NVME_CMD_KIB_MAX * 1024ull;
-    uint64_t effective_bytes;
+    uint32_t effective_bytes;
 
     if (rt->nvme_max_dts_bytes > 0u && safe_limit > rt->nvme_max_dts_bytes) {
         safe_limit = rt->nvme_max_dts_bytes;
     }
-    safe_limit -= safe_limit % NVME_SECTOR_BYTES;
-    if (safe_limit < NVME_SECTOR_BYTES) {
-        safe_limit = NVME_SECTOR_BYTES;
+    if (safe_limit > UINT32_MAX ||
+        nvme_clamp_command_bytes((uint32_t)requested_bytes,
+                                 (uint32_t)safe_limit,
+                                 rt->nvme_block_size,
+                                 &effective_bytes) != 0) {
+        nvme_set_last_error(rt, "nvme_command_size_invalid");
+        rt->nvme_cmd_size_bytes = 0u;
+        rt->nvme_cmd_sectors = 0u;
+        return -1;
     }
-
-    effective_bytes = requested_bytes;
-    if (effective_bytes > safe_limit) {
-        uint32_t candidate_kib;
-
-        effective_bytes = safe_limit;
-        for (candidate_kib = NVME_CMD_KIB_DEFAULT; candidate_kib <= NVME_CMD_KIB_MAX;
-             candidate_kib *= 2u) {
-            uint64_t candidate_bytes = (uint64_t)candidate_kib * 1024ull;
-            if (candidate_bytes > safe_limit || candidate_bytes > requested_bytes) {
-                break;
-            }
-            effective_bytes = candidate_bytes;
-        }
+    if (effective_bytes < requested_bytes && hw_storage_log_at_least_debug()) {
         fprintf(stderr,
                 "warning: SRC_REAL_NVME_CMD_KIB=%u exceeds NVMe safe limit=%" PRIu64
-                " bytes (max_dts=%u); effective=%" PRIu64 " bytes\n",
+                " bytes (max_dts=%u); effective=%u bytes\n",
                 requested_kib,
                 safe_limit,
                 (unsigned)rt->nvme_max_dts_bytes,
                 effective_bytes);
     }
 
-    rt->nvme_cmd_size_bytes = (uint32_t)effective_bytes;
+    rt->nvme_cmd_size_bytes = effective_bytes;
     rt->nvme_cmd_sectors = rt->nvme_cmd_size_bytes / NVME_SECTOR_BYTES;
     rt->nvme_qd_requested = parse_nvme_qd(rt);
     rt->nvme_qd_effective = rt->nvme_qd_requested;
@@ -615,7 +544,7 @@ static void nvme_configure_runtime(ChannelRuntime *rt) {
     rt->nvme_feed_mode = parse_nvme_feed_mode(rt);
     rt->nvme_cq_pop_batch = parse_channel_u32_env(rt,
                                                   "SRC_REAL_NVME_CQ_POP_BATCH",
-                                                  1u,
+                                                  profile ? profile->cq_batch : 1u,
                                                   NVME_QD_SAFETY_MAX);
     if (rt->nvme_cq_pop_batch == 0u) {
         rt->nvme_cq_pop_batch = 1u;
@@ -624,7 +553,8 @@ static void nvme_configure_runtime(ChannelRuntime *rt) {
     rt->nvme_skip_const_ctx = hw_env_flag_enabled("SRC_REAL_NVME_SKIP_CONST_CTX") != 0;
     rt->nvme_busy_poll_us = parse_channel_u32_env(rt,
                                                   "SRC_REAL_NVME_BUSY_POLL_US",
-                                                  NVME_BUSY_POLL_US_DEFAULT,
+                                                  profile ? profile->busy_poll_us
+                                                          : NVME_BUSY_POLL_US_DEFAULT,
                                                   1000000u);
     rt->nvme_poll_sleep_us = parse_channel_u32_env(rt,
                                                    "SRC_REAL_NVME_POLL_SLEEP_US",
@@ -658,6 +588,7 @@ static void nvme_configure_runtime(ChannelRuntime *rt) {
                (unsigned)rt->nvme_qd_effective);
         fflush(stdout);
     }
+    return 0;
 }
 
 static void atomic_update_min_u64(uint64_t *target, uint64_t value) {
@@ -712,21 +643,47 @@ static void nvme_record_submit_stall(ChannelRuntime *rt, uint64_t submit_us) {
     atomic_update_max_u64(&rt->nvme_submit_stall_max_us, submit_us);
 }
 
+static void nvme_nanosleep_us(uint32_t sleep_us)
+{
+    struct timespec delay;
+
+    if (sleep_us == 0u) return;
+    delay.tv_sec = sleep_us / 1000000u;
+    delay.tv_nsec = (long)(sleep_us % 1000000u) * 1000L;
+    while (nanosleep(&delay, &delay) != 0 && errno == EINTR) {
+    }
+}
+
+uint32_t nvme_poll_backoff_us(uint32_t busy_poll_us,
+                              uint32_t base_sleep_us,
+                              uint32_t waited_us)
+{
+    uint32_t stalled_us;
+    uint32_t multiplier = 1u;
+    uint64_t sleep_us;
+
+    if (base_sleep_us == 0u || waited_us < busy_poll_us) return 0u;
+    stalled_us = waited_us - busy_poll_us;
+    if (stalled_us >= 1000u) multiplier = 4u;
+    else if (stalled_us >= 100u) multiplier = 2u;
+    sleep_us = (uint64_t)base_sleep_us * multiplier;
+    return sleep_us > NVME_POLL_SLEEP_US_MAX
+               ? NVME_POLL_SLEEP_US_MAX : (uint32_t)sleep_us;
+}
+
 static void nvme_poll_pause(ChannelRuntime *rt, uint64_t start_us) {
     uint32_t waited_us;
+    uint32_t sleep_us;
 
     if (!rt) {
-        usleep(NVME_POLL_SLEEP_US_DEFAULT);
+        nvme_nanosleep_us(NVME_POLL_SLEEP_US_DEFAULT);
         return;
     }
     waited_us = elapsed_us_since(start_us);
-    if (waited_us < rt->nvme_busy_poll_us) {
-        return;
-    }
-    if (rt->nvme_poll_sleep_us == 0u) {
-        return;
-    }
-    usleep(rt->nvme_poll_sleep_us);
+    sleep_us = nvme_poll_backoff_us(rt->nvme_busy_poll_us,
+                                    rt->nvme_poll_sleep_us,
+                                    waited_us);
+    if (sleep_us != 0u) nvme_nanosleep_us(sleep_us);
 }
 
 void nvme_reset_sw_timing(ChannelRuntime *rt) {
@@ -744,6 +701,14 @@ void nvme_reset_sw_timing(ChannelRuntime *rt) {
     rt->nvme_cq_wait_total_us = 0u;
     rt->nvme_cq_pop_total_us = 0u;
     rt->nvme_cq_completed = 0u;
+    rt->nvme_first_submit_us = 0u;
+    rt->nvme_last_completion_us = 0u;
+    rt->nvme_active_qd_integral_us = 0u;
+    rt->nvme_active_qd_observed_us = 0u;
+    rt->nvme_active_us = 0u;
+    rt->nvme_active_qd_last_update_us = 0u;
+    rt->nvme_active_qd_current = 0u;
+    rt->nvme_active_qd_max = 0u;
     rt->nvme_active_qd_event_sum = 0u;
     rt->nvme_active_qd_event_samples = 0u;
     rt->nvme_active_qd_event_min = UINT32_MAX;
@@ -940,10 +905,6 @@ static int MAYBE_UNUSED map_region(int fd, uint64_t phys, size_t size, MappedReg
     return map_region_common(fd, phys, size, out, true);
 }
 
-static int map_region_optional(int fd, uint64_t phys, size_t size, MappedRegion *out) {
-    return map_region_common(fd, phys, size, out, false);
-}
-
 static void unmap_region(MappedRegion *r) {
 #if HAVE_POSIX_MMAP
     if (r->valid && r->map_base && r->map_len > 0u) {
@@ -1059,6 +1020,10 @@ static void nvme_update_active_qd(ChannelRuntime *rt, uint32_t new_qd, uint64_t 
         (void)__atomic_add_fetch(&rt->nvme_active_qd_observed_us,
                                  elapsed_us,
                                  __ATOMIC_RELAXED);
+        if (old_qd != 0u) {
+            (void)__atomic_add_fetch(&rt->nvme_active_us, elapsed_us,
+                                     __ATOMIC_RELAXED);
+        }
     }
     rt->nvme_active_qd_last_update_us = now_us;
     __atomic_store_n(&rt->nvme_active_qd_current, new_qd, __ATOMIC_RELEASE);
@@ -1139,6 +1104,9 @@ int nvme_submit_command_async(ChannelRuntime *rt,
                               uint64_t hw_addr) {
     uint64_t submit_start_us;
     uint64_t pending_start_us;
+    uint32_t tx_status_before;
+    uint32_t ctx0;
+    bool trace;
 
     if (!rt || sectors == 0u || sectors > UINT16_MAX) {
         return NVME_SUBMIT_NOT_ACCEPTED;
@@ -1149,12 +1117,15 @@ int nvme_submit_command_async(ChannelRuntime *rt,
     if (nvme_stop_requested()) {
         return NVME_SUBMIT_STOPPED_BEFORE_DOORBELL;
     }
-    if ((reg_read32(&rt->nvme, QUEUE_REG_OFFSET + QUEUE_TX_STATUS) & QUEUE_SQ_FIFO_FULL) != 0u) {
+    tx_status_before = reg_read32(&rt->nvme, QUEUE_REG_OFFSET + QUEUE_TX_STATUS);
+    if ((tx_status_before & QUEUE_SQ_FIFO_FULL) != 0u) {
         rt->nvme_submit_sq_full_count++;
         return NVME_SUBMIT_RETRY_SQ_FULL;
     }
 
     submit_start_us = wall_time_us();
+    ctx0 = ((uint32_t)(sectors - 1u) << 16u) | opcode;
+    trace = opcode == NVM_READ && nvme_read_trace_enabled(rt);
     rt->nvme_submit_calls++;
     dbg_verbose_printf("[DBG][NVME] async submit ch=%d cid=%u op=%s lba=0x%08" PRIx64
                        " sectors=%u hw=0x%08" PRIx64 "\n",
@@ -1164,9 +1135,32 @@ int nvme_submit_command_async(ChannelRuntime *rt,
                        lba,
                        (unsigned)sectors,
                        hw_addr);
-    reg_write32(&rt->nvme,
-                QUEUE_REG_OFFSET + QUEUE_CTX0,
-                ((uint32_t)(sectors - 1u) << 16u) | opcode);
+    if (trace) {
+        printf("nvme_read_trace event=submit channel=%d ts_us=%" PRIu64
+               " cid=%u opcode=0x%02x slba=0x%08" PRIx64
+               " sectors=%u bytes=%" PRIu64 " prp1=0x%08" PRIx64
+               " ddr_end=0x%08" PRIx64 " ctx0=0x%08x ctx1=0x%08x"
+               " prp1_l=0x%08x prp1_h=0x%08x lba_l=0x%08x lba_h=0x%08x"
+               " tx_status_before=0x%08x\n",
+               rt->cfg->id,
+               submit_start_us,
+               (unsigned)cid,
+               (unsigned)opcode,
+               lba,
+               (unsigned)sectors,
+               (uint64_t)sectors * NVME_SECTOR_BYTES,
+               hw_addr,
+               hw_addr + (uint64_t)sectors * NVME_SECTOR_BYTES,
+               ctx0,
+               (unsigned)cid,
+               (uint32_t)(hw_addr & 0xffffffffull),
+               (uint32_t)(hw_addr >> 32u),
+               (uint32_t)(lba & 0xffffffffull),
+               (uint32_t)(lba >> 32u),
+               tx_status_before);
+        fflush(stdout);
+    }
+    reg_write32(&rt->nvme, QUEUE_REG_OFFSET + QUEUE_CTX0, ctx0);
     reg_write32(&rt->nvme, QUEUE_REG_OFFSET + QUEUE_CTX1, cid);
     reg_write32(&rt->nvme, QUEUE_REG_OFFSET + QUEUE_PRP1_L, (uint32_t)(hw_addr & 0xFFFFFFFFull));
     reg_write32(&rt->nvme, QUEUE_REG_OFFSET + QUEUE_PRP1_H, (uint32_t)(hw_addr >> 32u));
@@ -1212,6 +1206,16 @@ int nvme_submit_command_async(ChannelRuntime *rt,
         rt->nvme_submit_pending_wait_us += elapsed_us_since(pending_start_us);
         rt->nvme_submit_total_us += submit_us;
         nvme_record_submit_stall(rt, submit_us);
+    }
+    if (trace) {
+        printf("nvme_read_trace event=accepted channel=%d ts_us=%" PRIu64
+               " cid=%u tx_status_after=0x%08x int_status=0x%08x\n",
+               rt->cfg->id,
+               wall_time_us(),
+               (unsigned)cid,
+               reg_read32(&rt->nvme, QUEUE_REG_OFFSET + QUEUE_TX_STATUS),
+               reg_read32(&rt->nvme, QUEUE_REG_OFFSET + QUEUE_INT_STATUS));
+        fflush(stdout);
     }
     {
         uint64_t zero = 0u;
@@ -1321,11 +1325,7 @@ static int nvme_submit_write_fast(ChannelRuntime *rt,
             /* Doorbell ownership is ambiguous; caller must track and abort this CID. */
             return NVME_SUBMIT_ACCEPTANCE_UNKNOWN;
         }
-        if (rt->nvme_poll_sleep_us != 0u &&
-            pending_start_us != 0u &&
-            now_us - pending_start_us >= rt->nvme_busy_poll_us) {
-            usleep(rt->nvme_poll_sleep_us);
-        }
+        if (pending_start_us != 0u) nvme_poll_pause(rt, pending_start_us);
     }
     if (__atomic_load_n(&rt->nvme_first_submit_us, __ATOMIC_RELAXED) == 0u) {
         uint64_t zero = 0u;
@@ -1671,6 +1671,10 @@ static int nvme_simulate_write_qd_payload(ChannelRuntime *rt, uint64_t sectors,
                           : rt->nvme_qd_effective;
 
     (void)__atomic_add_fetch(&rt->nvme_cmd_count, command_count, __ATOMIC_RELAXED);
+    (void)__atomic_add_fetch(&rt->nvme_cq_completed, command_count,
+                             __ATOMIC_RELAXED);
+    (void)__atomic_add_fetch(&rt->nvme_completion_count, command_count,
+                             __ATOMIC_RELAXED);
     (void)__atomic_add_fetch(&rt->nvme_cmd_bytes_total, command_bytes, __ATOMIC_RELAXED);
     (void)__atomic_add_fetch(&rt->nvme_write_bytes_done, command_bytes, __ATOMIC_RELEASE);
     (void)__atomic_add_fetch(&rt->nvme_payload_bytes_done,
@@ -1966,12 +1970,7 @@ int nvme_write_contiguous_tight_qd_payload(ChannelRuntime *rt,
                              next_ddr);
             return -1;
         }
-        if (rt->nvme_poll_sleep_us != 0u &&
-            elapsed_us_since(no_progress_start_us) >= rt->nvme_busy_poll_us) {
-            usleep(rt->nvme_poll_sleep_us);
-        } else {
-            sched_yield();
-        }
+        nvme_poll_pause(rt, no_progress_start_us);
     }
 
     if (submitted != total_cmds || completed != total_cmds || active_qd != 0u ||
@@ -2431,6 +2430,9 @@ struct NvmeCrossSlotEngine {
     NvmeSlotWriteContext contexts[NVME_PENDING_CAPACITY];
     NvmeWriteSlotReq reqs[NVME_PENDING_CAPACITY];
     bool active[NVME_PENDING_CAPACITY];
+    uint64_t admission_sequence[NVME_PENDING_CAPACITY];
+    uint64_t next_admission_sequence;
+    uint64_t next_callback_sequence;
     uint32_t active_count;
     NvmeCrossSlotConfig config;
     uint32_t global_inflight;
@@ -2439,6 +2441,17 @@ struct NvmeCrossSlotEngine {
     uint64_t sq_full_start_us;
     uint64_t cq_empty_start_us;
     uint64_t no_progress_start_us;
+    uint64_t last_full_validation_us;
+    uint64_t stats_last_publish_us;
+    uint64_t stats_last_completion_us;
+    uint64_t stats_cmd_count;
+    uint64_t stats_cmd_bytes;
+    uint64_t stats_payload_bytes;
+    uint64_t stats_latency_total_us;
+    uint64_t stats_latency_samples;
+    uint64_t stats_latency_min_us;
+    uint64_t stats_latency_max_us;
+    uint32_t no_progress_rounds;
     NvmeCrossSlotStats stats;
     NvmeCrossSlotState state;
     char last_error[64];
@@ -2482,10 +2495,107 @@ static void cross_slot_clear_cq_empty(NvmeCrossSlotEngine *e, uint64_t now_us)
     }
 }
 
+static uint32_t cross_slot_adaptive_sleep_us(const NvmeCrossSlotEngine *e)
+{
+    uint32_t base_us;
+    uint32_t shift;
+    uint32_t cap_us;
+    uint64_t sleep_us;
+
+    if (!e || e->config.empty_sleep_us == 0u) return 0u;
+    base_us = e->config.empty_sleep_us;
+    shift = e->no_progress_rounds / 4u;
+    if (shift > 4u) shift = 4u;
+    cap_us = base_us > NVME_POLL_SLEEP_US_MAX
+                 ? base_us : NVME_POLL_SLEEP_US_MAX;
+    sleep_us = (uint64_t)base_us << shift;
+    return sleep_us > cap_us ? cap_us : (uint32_t)sleep_us;
+}
+
+static void cross_slot_publish_completion_stats(NvmeCrossSlotEngine *e,
+                                                uint64_t now_us,
+                                                bool force)
+{
+    ChannelRuntime *rt;
+
+    if (!e || !e->rt) return;
+    if (!force) {
+        if (e->stats_last_publish_us == 0u) {
+            e->stats_last_publish_us = now_us;
+            return;
+        }
+        if (now_us >= e->stats_last_publish_us &&
+            now_us - e->stats_last_publish_us <
+                NVME_CROSS_SLOT_STATS_INTERVAL_US)
+            return;
+    }
+    rt = e->rt;
+    if (e->stats_cmd_count != 0u) {
+        (void)__atomic_add_fetch(&rt->nvme_cmd_count,
+                                 e->stats_cmd_count, __ATOMIC_RELAXED);
+        (void)__atomic_add_fetch(&rt->nvme_cmd_bytes_total,
+                                 e->stats_cmd_bytes, __ATOMIC_RELAXED);
+        (void)__atomic_add_fetch(&rt->nvme_write_bytes_done,
+                                 e->stats_cmd_bytes, __ATOMIC_RELEASE);
+        (void)__atomic_add_fetch(&rt->nvme_payload_bytes_done,
+                                 e->stats_payload_bytes, __ATOMIC_RELEASE);
+        if (e->stats_last_completion_us != 0u)
+            __atomic_store_n(&rt->nvme_last_completion_us,
+                             e->stats_last_completion_us, __ATOMIC_RELEASE);
+        if (e->stats_latency_samples != 0u) {
+            (void)__atomic_add_fetch(&rt->nvme_cmd_latency_total_us,
+                                     e->stats_latency_total_us,
+                                     __ATOMIC_RELAXED);
+            (void)__atomic_add_fetch(&rt->nvme_latency_sample_count,
+                                     e->stats_latency_samples,
+                                     __ATOMIC_RELAXED);
+            atomic_update_min_u64(&rt->nvme_cmd_latency_min_us,
+                                  e->stats_latency_min_us);
+            atomic_update_max_u64(&rt->nvme_cmd_latency_max_us,
+                                  e->stats_latency_max_us);
+        }
+        e->stats_cmd_count = 0u;
+        e->stats_cmd_bytes = 0u;
+        e->stats_payload_bytes = 0u;
+        e->stats_latency_total_us = 0u;
+        e->stats_latency_samples = 0u;
+        e->stats_latency_min_us = 0u;
+        e->stats_latency_max_us = 0u;
+    }
+    e->stats_last_publish_us = now_us;
+}
+
+static void cross_slot_record_write_completion(NvmeCrossSlotEngine *e,
+                                               const NvmePendingCmd *pending,
+                                               uint64_t completion_us)
+{
+    uint64_t latency_us;
+
+    if (!e || !pending) return;
+    ++e->stats_cmd_count;
+    e->stats_cmd_bytes += pending->bytes;
+    e->stats_payload_bytes += pending->payload_bytes != 0u
+                                  ? pending->payload_bytes : pending->bytes;
+    e->stats_last_completion_us = completion_us;
+    if (pending->submit_us != 0u && completion_us >= pending->submit_us) {
+        latency_us = completion_us - pending->submit_us;
+        e->stats_latency_total_us += latency_us;
+        ++e->stats_latency_samples;
+        if (e->stats_latency_min_us == 0u ||
+            latency_us < e->stats_latency_min_us)
+            e->stats_latency_min_us = latency_us;
+        if (latency_us > e->stats_latency_max_us)
+            e->stats_latency_max_us = latency_us;
+    }
+    cross_slot_publish_completion_stats(e, completion_us, false);
+}
+
 static int cross_slot_fail_code(NvmeCrossSlotEngine *e, StorageErrorCode code,
                                 const char *reason)
 {
     if (e) {
+        cross_slot_publish_completion_stats(
+            e, e->ops.monotonic_us(e->ops_opaque), true);
         if (e->last_error[0] == '\0') {
             snprintf(e->last_error, sizeof(e->last_error), "%s", reason);
             nvme_set_error(e->rt, code, reason);
@@ -2507,6 +2617,7 @@ static int cross_slot_validate(NvmeCrossSlotEngine *e)
     uint32_t pending_for_context[NVME_PENDING_CAPACITY];
 
     if (!e) return -1;
+    ++e->stats.full_validation_count;
     memset(pending_for_context, 0, sizeof(pending_for_context));
     for (i = 0u; i < NVME_PENDING_CAPACITY; ++i) {
         NvmeSlotWriteContext *ctx = &e->contexts[i];
@@ -2516,8 +2627,15 @@ static int cross_slot_validate(NvmeCrossSlotEngine *e)
             ctx->slot != e->reqs[i].slot || ctx->next_submit_sector > ctx->total_sectors ||
             ctx->completed_cmds > ctx->submitted_cmds ||
             ctx->submitted_cmds !=
-                ctx->completed_cmds + ctx->failed_cmds + ctx->inflight_cmds)
+                ctx->completed_cmds + ctx->failed_cmds + ctx->inflight_cmds ||
+            e->admission_sequence[i] < e->next_callback_sequence ||
+            e->admission_sequence[i] >= e->next_admission_sequence)
             return cross_slot_fail(e, "context_count_invariant_failed");
+        for (uint32_t j = 0u; j < i; ++j) {
+            if (e->active[j] &&
+                e->admission_sequence[j] == e->admission_sequence[i])
+                return cross_slot_fail(e, "context_count_invariant_failed");
+        }
         inflight_count += ctx->inflight_cmds;
     }
     if (active_count != e->active_count || active_count > e->config.max_active_slots)
@@ -2548,11 +2666,27 @@ static int cross_slot_validate(NvmeCrossSlotEngine *e)
     return 0;
 }
 
-static int cross_slot_handle_completion(NvmeCrossSlotEngine *e, const NvmeCompletion *completion)
+static int cross_slot_validate_periodic(NvmeCrossSlotEngine *e,
+                                        uint64_t now_us,
+                                        bool force)
+{
+    if (!e) return -1;
+    if (!force && e->last_full_validation_us != 0u &&
+        now_us >= e->last_full_validation_us &&
+        now_us - e->last_full_validation_us <
+            NVME_CROSS_SLOT_VALIDATE_INTERVAL_US)
+        return 0;
+    if (cross_slot_validate(e) != 0) return -1;
+    e->last_full_validation_us = now_us;
+    return 0;
+}
+
+static int cross_slot_handle_completion(NvmeCrossSlotEngine *e,
+                                        const NvmeCompletion *completion,
+                                        uint64_t completion_us)
 {
     NvmePendingCmd *entry;
     NvmeSlotWriteContext *ctx;
-    uint64_t completion_us = 0u;
     if (!e || !completion) return -1;
     entry = nvme_find_pending_by_cid(e->pending, NVME_PENDING_CAPACITY, completion->cid);
     if (!entry) {
@@ -2565,8 +2699,6 @@ static int cross_slot_handle_completion(NvmeCrossSlotEngine *e, const NvmeComple
     ctx = nvme_find_slot_context(e->contexts, NVME_PENDING_CAPACITY, entry->slot);
     if (!ctx || ctx->inflight_cmds == 0u || e->global_inflight == 0u)
         return cross_slot_fail(e, "pending_cid_state_inconsistent");
-    if (e->rt->nvme_diag_timing)
-        completion_us = e->ops.monotonic_us(e->ops_opaque);
     if (completion->error) {
         ++ctx->failed_cmds;
         entry->valid = false;
@@ -2576,14 +2708,14 @@ static int cross_slot_handle_completion(NvmeCrossSlotEngine *e, const NvmeComple
         nvme_record_active_qd_event(e->rt, e->global_inflight);
         return cross_slot_fail(e, "completion_status_error");
     }
-    nvme_record_write_completion(e->rt, entry, completion_us);
+    cross_slot_record_write_completion(e, entry, completion_us);
     entry->valid = false;
     e->completed_cid_seen[completion->cid] = true;
     --ctx->inflight_cmds;
     ++ctx->completed_cmds;
     --e->global_inflight;
     nvme_record_active_qd_event(e->rt, e->global_inflight);
-    return cross_slot_validate(e);
+    return 0;
 }
 
 static int cross_slot_real_submit(void *opaque, uint16_t cid, uint64_t lba,
@@ -2593,7 +2725,8 @@ static int cross_slot_real_submit(void *opaque, uint16_t cid, uint64_t lba,
 static int cross_slot_real_poll(void *opaque, NvmeCompletion *out)
 { return nvme_try_poll_cq_fast((ChannelRuntime *)opaque, out); }
 static uint64_t cross_slot_real_time(void *opaque) { (void)opaque; return wall_time_us(); }
-static void cross_slot_real_sleep(void *opaque, uint32_t us) { (void)opaque; usleep(us); }
+static void cross_slot_real_sleep(void *opaque, uint32_t us)
+{ (void)opaque; nvme_nanosleep_us(us); }
 static void cross_slot_real_yield(void *opaque) { (void)opaque; sched_yield(); }
 static int cross_slot_real_reset(void *opaque)
 {
@@ -2722,6 +2855,7 @@ static void cross_slot_discard_contexts(NvmeCrossSlotEngine *e)
         memset(&e->contexts[i], 0, sizeof(e->contexts[i]));
         e->contexts[i].slot = UINT32_MAX;
         memset(&e->reqs[i], 0, sizeof(e->reqs[i]));
+        e->admission_sequence[i] = 0u;
     }
     e->global_inflight = 0u;
     e->active_count = 0u;
@@ -2743,7 +2877,8 @@ int nvme_cross_slot_engine_drain_abort(NvmeCrossSlotEngine *e,
 
         if (rc < 0) break;
         if (rc > 0) {
-            (void)cross_slot_handle_completion(e, &completion);
+            (void)cross_slot_handle_completion(
+                e, &completion, e->ops.monotonic_us(e->ops_opaque));
             if (e->global_inflight < before) continue;
         }
         if (e->ops.yield_cpu) e->ops.yield_cpu(e->ops_opaque);
@@ -2751,6 +2886,11 @@ int nvme_cross_slot_engine_drain_abort(NvmeCrossSlotEngine *e,
             e->ops.sleep_us(e->ops_opaque, e->config.empty_sleep_us);
     }
     if (e->global_inflight == 0u) {
+        cross_slot_publish_completion_stats(
+            e, e->ops.monotonic_us(e->ops_opaque), true);
+        if (cross_slot_validate_periodic(
+                e, e->ops.monotonic_us(e->ops_opaque), true) != 0)
+            return -1;
         cross_slot_discard_contexts(e);
         cross_slot_state_store(e, NVME_CROSS_SLOT_QUIESCED);
         return 0;
@@ -2793,17 +2933,64 @@ int nvme_cross_slot_engine_add(NvmeCrossSlotEngine *e, const NvmeWriteSlotReq *r
             return cross_slot_fail(e, "duplicate_active_slot");
     }
     if (!nvme_cross_slot_engine_can_accept(e)) return 1;
+    if (e->next_admission_sequence == UINT64_MAX)
+        return cross_slot_fail(e, "admission_sequence_overflow");
     for (i = 0u; i < NVME_PENDING_CAPACITY; ++i) {
         if (!e->active[i]) {
             e->active[i] = true; e->reqs[i] = *req;
+            e->admission_sequence[i] = e->next_admission_sequence++;
             memset(&e->contexts[i], 0, sizeof(e->contexts[i]));
             e->contexts[i].slot = req->slot; e->contexts[i].base_lba = req->start_lba;
             e->contexts[i].base_ddr_addr = req->hw_addr; e->contexts[i].total_sectors = req->sectors;
             e->contexts[i].total_bytes = req->bytes; ++e->active_count;
-            return cross_slot_validate(e);
+            return cross_slot_validate_periodic(
+                e, e->ops.monotonic_us(e->ops_opaque), true);
         }
     }
     return 1;
+}
+
+/* AXI DMA SG tail-pointer ownership is ordered even though NVMe CQ entries
+ * are not.  Storage admits slots in DMA harvest order, so defer a completed
+ * slot callback until every earlier admitted slot is also complete.  This
+ * preserves NVMe command/CQ parallelism while preventing a later TAILDESC
+ * write from exposing an earlier descriptor that NVMe still owns. */
+static int cross_slot_retire_completed_in_order(
+    NvmeCrossSlotEngine *e, NvmeWriteSlotDoneCb done_cb, void *opaque,
+    bool *progress)
+{
+    while (e && e->active_count > 0u) {
+        NvmeSlotWriteContext *ctx = NULL;
+        uint32_t index;
+
+        for (index = 0u; index < NVME_PENDING_CAPACITY; ++index) {
+            if (e->active[index] &&
+                e->admission_sequence[index] == e->next_callback_sequence) {
+                ctx = &e->contexts[index];
+                break;
+            }
+        }
+        if (!ctx)
+            return cross_slot_fail(e, "callback_sequence_invariant_failed");
+        if (ctx->next_submit_sector != ctx->total_sectors ||
+            ctx->completed_cmds != ctx->submitted_cmds ||
+            ctx->inflight_cmds != 0u)
+            return 0;
+        if (ctx->failed_cmds != 0u)
+            return cross_slot_fail(e, "completion_status_error");
+        if (done_cb && done_cb(opaque, &e->reqs[index]) != 0)
+            return cross_slot_fail(e, "slot_callback_failed");
+
+        e->active[index] = false;
+        memset(ctx, 0, sizeof(*ctx));
+        ctx->slot = UINT32_MAX;
+        memset(&e->reqs[index], 0, sizeof(e->reqs[index]));
+        e->admission_sequence[index] = 0u;
+        --e->active_count;
+        ++e->next_callback_sequence;
+        if (progress) *progress = true;
+    }
+    return 0;
 }
 
 int nvme_cross_slot_engine_step(NvmeCrossSlotEngine *e, uint32_t budget_us,
@@ -2813,11 +3000,15 @@ int nvme_cross_slot_engine_step(NvmeCrossSlotEngine *e, uint32_t budget_us,
     uint64_t command_limit;
     uint32_t qd;
     uint32_t effective_budget;
+    uint32_t command_budget;
+    uint32_t command_work = 0u;
     if (!e || !e->rt || cross_slot_state_load(e) != NVME_CROSS_SLOT_RUNNING) return -1;
     qd = e->config.target_qd;
     command_limit = e->rt->nvme_cmd_sectors ? e->rt->nvme_cmd_sectors : 512u;
     effective_budget = budget_us != 0u ? budget_us : e->config.writer_budget_us;
+    command_budget = qd * NVME_CROSS_SLOT_COMMANDS_PER_QD_ROUND;
     start_us = e->ops.monotonic_us(e->ops_opaque);
+    if (cross_slot_validate_periodic(e, start_us, false) != 0) return -1;
     nvme_update_active_qd(e->rt, e->global_inflight, start_us);
     while (e->active_count > 0u) {
         uint32_t i, pops = 0u;
@@ -2827,9 +3018,9 @@ int nvme_cross_slot_engine_step(NvmeCrossSlotEngine *e, uint32_t budget_us,
          * iteration so the writer can enter the bounded drain/reset path
          * instead of spinning until the normal no-progress timeout. */
         if (cross_slot_state_load(e) != NVME_CROSS_SLOT_RUNNING) return -1;
-        if (cross_slot_validate(e) != 0) return -1;
         /* CQ first: completions may free QD before refill. */
-        while (pops < e->config.cq_batch && e->global_inflight > 0u) {
+        while (pops < e->config.cq_batch && e->global_inflight > 0u &&
+               command_work < command_budget) {
             NvmeCompletion cpl;
             int prc = e->ops.poll_completion(e->ops_opaque, &cpl);
             uint64_t poll_end_us = e->ops.monotonic_us(e->ops_opaque);
@@ -2841,7 +3032,8 @@ int nvme_cross_slot_engine_step(NvmeCrossSlotEngine *e, uint32_t budget_us,
             cross_slot_clear_cq_empty(e, poll_end_us);
             {
                 uint64_t process_start_us = poll_end_us;
-                if (cross_slot_handle_completion(e, &cpl) != 0) return -1;
+                if (cross_slot_handle_completion(e, &cpl, poll_end_us) != 0)
+                    return -1;
                 ++e->stats.completion_process_count;
                 if (e->rt->nvme_diag_timing)
                     cross_slot_update_max(&e->stats.completion_process_max_us,
@@ -2849,24 +3041,15 @@ int nvme_cross_slot_engine_step(NvmeCrossSlotEngine *e, uint32_t budget_us,
             }
             progress = true;
             ++pops;
+            ++command_work;
         }
-        /* Only fully drained contexts may invoke the slot callback. */
-        for (i = 0u; i < NVME_PENDING_CAPACITY; ++i) {
-            NvmeSlotWriteContext *ctx = &e->contexts[i];
-            if (e->active[i] && ctx->next_submit_sector == ctx->total_sectors &&
-                ctx->completed_cmds == ctx->submitted_cmds && ctx->inflight_cmds == 0u) {
-                if (ctx->failed_cmds != 0u) return cross_slot_fail(e, "completion_status_error");
-                if (done_cb && done_cb(opaque, &e->reqs[i]) != 0)
-                    return cross_slot_fail(e, "slot_callback_failed");
-                e->active[i] = false;
-                memset(&e->contexts[i], 0, sizeof(e->contexts[i]));
-                e->contexts[i].slot = UINT32_MAX;
-                memset(&e->reqs[i], 0, sizeof(e->reqs[i]));
-                --e->active_count; progress = true;
-            }
-        }
+        /* CQ completion is unordered.  Slot ownership returns to DMA only
+         * through callbacks retired in the original admission order. */
+        if (cross_slot_retire_completed_in_order(
+                e, done_cb, opaque, &progress) != 0)
+            return -1;
         /* Refill after processing CQ and completed contexts. */
-        while (e->global_inflight < qd) {
+        while (e->global_inflight < qd && command_work < command_budget) {
             bool done[NVME_PENDING_CAPACITY];
             int index;
             NvmeSlotWriteContext *ctx; NvmePendingCmd *p; uint64_t remaining; uint32_t sectors; uint16_t cid; int src;
@@ -2943,12 +3126,14 @@ int nvme_cross_slot_engine_step(NvmeCrossSlotEngine *e, uint32_t budget_us,
             ++e->global_inflight;
             nvme_record_active_qd_event(e->rt, e->global_inflight);
             progress = true;
+            ++command_work;
         }
         if (progress) {
             e->no_progress_start_us = 0u;
-            if (effective_budget == 0u ||
-                e->ops.monotonic_us(e->ops_opaque) - start_us < effective_budget) continue;
-            if (e->ops.yield_cpu) e->ops.yield_cpu(e->ops_opaque); else sched_yield();
+            e->no_progress_rounds = 0u;
+            if (command_work < command_budget &&
+                (effective_budget == 0u ||
+                 e->ops.monotonic_us(e->ops_opaque) - start_us < effective_budget)) continue;
             break;
         }
         {
@@ -2969,7 +3154,8 @@ int nvme_cross_slot_engine_step(NvmeCrossSlotEngine *e, uint32_t budget_us,
                 cross_slot_clear_cq_empty(e, poll_end_us);
                 {
                     uint64_t process_start_us = poll_end_us;
-                    if (cross_slot_handle_completion(e, &cpl) != 0) return -1;
+                    if (cross_slot_handle_completion(e, &cpl, poll_end_us) != 0)
+                        return -1;
                     ++e->stats.completion_process_count;
                     if (e->rt->nvme_diag_timing)
                         cross_slot_update_max(&e->stats.completion_process_max_us,
@@ -2980,29 +3166,18 @@ int nvme_cross_slot_engine_step(NvmeCrossSlotEngine *e, uint32_t budget_us,
             }
             if (busy_progress) {
                 e->no_progress_start_us = 0u;
+                e->no_progress_rounds = 0u;
+                ++command_work;
+                if (command_work >= command_budget) break;
                 continue;
             }
-            if (e->ops.yield_cpu) e->ops.yield_cpu(e->ops_opaque); else sched_yield();
-            if (e->global_inflight > 0u) {
-                NvmeCompletion cpl;
-                int prc = e->ops.poll_completion(e->ops_opaque, &cpl);
-                if (prc < 0) return cross_slot_fail(e, "completion_poll_failed");
-                if (prc > 0) {
-                    uint64_t process_start_us = e->rt->nvme_diag_timing
-                                                    ? e->ops.monotonic_us(e->ops_opaque) : 0u;
-                    if (cross_slot_handle_completion(e, &cpl) != 0) return -1;
-                    ++e->stats.completion_process_count;
-                    if (e->rt->nvme_diag_timing)
-                        cross_slot_update_max(&e->stats.completion_process_max_us,
-                                              e->ops.monotonic_us(e->ops_opaque) - process_start_us);
-                    e->no_progress_start_us = 0u;
-                    continue;
+            ++e->no_progress_rounds;
+            {
+                uint32_t sleep_us = cross_slot_adaptive_sleep_us(e);
+                if (sleep_us != 0u) {
+                    e->ops.sleep_us(e->ops_opaque, sleep_us);
+                    ++e->stats.no_progress_sleep_count;
                 }
-                cross_slot_record_cq_empty(e, e->ops.monotonic_us(e->ops_opaque));
-            }
-            if (e->config.empty_sleep_us != 0u) {
-                e->ops.sleep_us(e->ops_opaque, e->config.empty_sleep_us);
-                ++e->stats.no_progress_sleep_count;
             }
             now_us = e->ops.monotonic_us(e->ops_opaque);
             if (e->config.no_progress_timeout_us != 0u &&
@@ -3011,9 +3186,14 @@ int nvme_cross_slot_engine_step(NvmeCrossSlotEngine *e, uint32_t budget_us,
             if (effective_budget != 0u && now_us - start_us >= effective_budget) break;
         }
     }
-    nvme_update_active_qd(e->rt, e->global_inflight,
-                          e->ops.monotonic_us(e->ops_opaque));
-    return 0;
+    {
+        uint64_t end_us = e->ops.monotonic_us(e->ops_opaque);
+        bool force = e->active_count == 0u && e->global_inflight == 0u;
+
+        cross_slot_publish_completion_stats(e, end_us, force);
+        nvme_update_active_qd(e->rt, e->global_inflight, end_us);
+        return cross_slot_validate_periodic(e, end_us, force);
+    }
 }
 
 int nvme_write_slots_qd(ChannelRuntime *rt,
@@ -3359,8 +3539,11 @@ int channel_runtime_open(ChannelRuntime *rt, const ChannelConfig *cfg, GlobalOpt
     rt->gopt = gopt;
     rt->next_cmd_id = 1u;
     rt->next_harvest_bd = 0u;
+    rt->next_requeue_bd = 0u;
     rt->nvme_block_size = 512u;
-    rt->nvme_max_dts_bytes = 256u * 1024u;
+    rt->nvme_max_dts_raw = 0u;
+    rt->nvme_max_dts_blocks = 0u;
+    rt->nvme_max_dts_bytes = 0u;
     rt->nvme_cmd_size_bytes = NVME_CMD_KIB_DEFAULT * 1024u;
     rt->nvme_cmd_sectors = rt->nvme_cmd_size_bytes / NVME_SECTOR_BYTES;
     rt->nvme_qd_requested = NVME_QD_DEFAULT;
@@ -3370,11 +3553,8 @@ int channel_runtime_open(ChannelRuntime *rt, const ChannelConfig *cfg, GlobalOpt
     rt->dma_desc_count = (uint32_t)(rt->dma_ring_bytes / cfg->dma_desc_bytes_default);
     rt->dma_hw_desc_count = 0u;
     rt->dma_harvest_sequence = 0u;
-    rt->pcie_bridge_base_effective = pcie_bridge_base_for_channel(cfg);
-
     if (gopt.dry_run) {
         /* Dry-run skips all /dev/mem and MMIO setup. */
-        storage_print_pcie_link_status(rt, "startup");
         return 0;
     }
 #if !HAVE_POSIX_MMAP
@@ -3383,35 +3563,23 @@ int channel_runtime_open(ChannelRuntime *rt, const ChannelConfig *cfg, GlobalOpt
 #else
     {
         int fd = open("/dev/mem", O_RDWR | O_SYNC);
+        bool legacy_cpu_ddr_map = hw_env_flag_enabled("SRC_REAL_LEGACY_CPU_DDR_MAP") != 0;
+        uint64_t ddr_mmap_bytes = 0u;
+
         if (fd < 0) {
             fprintf(stderr, "Failed to open /dev/mem, errno=%d (%s)\n", errno, strerror(errno));
             return -1;
         }
         /*
-         * Map all per-channel regions:
-         * DMA, switch, NVMe host, descriptor BRAM, DDR data window.
+         * The live data DDR is not CPU-accessible on this platform.  Normal
+         * storage/download operation maps only control MMIO and descriptor
+         * BRAM; the legacy CPU-DDR mapping is explicitly opt-in for older
+         * hardware only and is never needed by the network diagnostics.
          */
-        uint64_t ddr_mmap_bytes = channel_ddr_mmap_bytes(cfg);
-        if (ddr_mmap_bytes > (uint64_t)SIZE_MAX) {
-            fprintf(stderr,
-                    "DDR mmap size too large for userspace: channel=%d size=%" PRIu64 "\n",
-                    cfg->id,
-                    ddr_mmap_bytes);
-            close(fd);
-            return -1;
-        }
-        if (ddr_mmap_bytes < cfg->ddr_cpu_size) {
-            dbg_verbose_printf("[DBG][HW] DDR mmap capped ch=%d map=%" PRIu64
-                               " total=%" PRIu64 "\n",
-                               cfg->id,
-                               ddr_mmap_bytes,
-                               cfg->ddr_cpu_size);
-        }
         if (map_region(fd, cfg->dma_base, 0x10000u, &rt->dma) != 0 ||
             map_region(fd, cfg->axis_switch_base, 0x10000u, &rt->axis_switch) != 0 ||
             map_region(fd, cfg->nvme_base, 0x10000u, &rt->nvme) != 0 ||
-            map_region(fd, cfg->desc_cpu_base, (size_t)cfg->desc_cpu_size, &rt->desc) != 0 ||
-            map_region(fd, cfg->ddr_cpu_base, (size_t)ddr_mmap_bytes, &rt->ddr) != 0) {
+            map_region(fd, cfg->desc_cpu_base, (size_t)cfg->desc_cpu_size, &rt->desc) != 0) {
             unmap_region(&rt->ddr);
             unmap_region(&rt->desc);
             unmap_region(&rt->nvme);
@@ -3420,21 +3588,27 @@ int channel_runtime_open(ChannelRuntime *rt, const ChannelConfig *cfg, GlobalOpt
             close(fd);
             return -1;
         }
+        if (legacy_cpu_ddr_map) {
+            ddr_mmap_bytes = channel_ddr_mmap_bytes(cfg);
+            if (ddr_mmap_bytes > (uint64_t)SIZE_MAX ||
+                map_region(fd, cfg->ddr_cpu_base, (size_t)ddr_mmap_bytes, &rt->ddr) != 0) {
+                unmap_region(&rt->ddr);
+                unmap_region(&rt->desc);
+                unmap_region(&rt->nvme);
+                unmap_region(&rt->axis_switch);
+                unmap_region(&rt->dma);
+                close(fd);
+                return -1;
+            }
+        }
         rt->dma.fd = fd;
         rt->axis_switch.fd = fd;
         rt->nvme.fd = fd;
         rt->desc.fd = fd;
-        rt->ddr.fd = fd;
-        if (rt->pcie_bridge_base_effective != 0u) {
-            if (map_region_optional(fd,
-                                    rt->pcie_bridge_base_effective,
-                                    PCIE_BRIDGE_MMAP_BYTES,
-                                    &rt->pcie_bridge) == 0) {
-                rt->pcie_bridge.fd = fd;
-            }
+        if (rt->ddr.valid) {
+            rt->ddr.fd = fd;
         }
     }
-    storage_print_pcie_link_status(rt, "startup");
     return 0;
 #endif
 }
@@ -3455,7 +3629,6 @@ void channel_runtime_close(ChannelRuntime *rt) {
     unmap_region(&rt->ddr);
     unmap_region(&rt->desc);
     unmap_region(&rt->nvme);
-    unmap_region(&rt->pcie_bridge);
     unmap_region(&rt->axis_switch);
     unmap_region(&rt->dma);
     if (fd >= 0) {
@@ -3514,7 +3687,8 @@ static int nvme_wait_links(ChannelRuntime *rt) {
 static int nvme_read_capability(ChannelRuntime *rt, const char *tag) {
     uint32_t status = reg_read32(&rt->nvme, GENERIC_REG_OFFSET + GENERIC_NVM_STATUS);
     uint32_t blk_exp = (status >> 29u) & 0x1Fu;
-    uint32_t max_dts_blocks = (status >> 16u) & 0x1FFFu;
+    uint32_t max_dts_raw = (status >> 16u) & 0x1FFFu;
+    uint32_t max_dts_blocks;
     uint32_t lba_l;
     uint32_t lba_h;
 
@@ -3527,20 +3701,29 @@ static int nvme_read_capability(ChannelRuntime *rt, const char *tag) {
         nvme_set_last_error(rt, "nvme_block_size_unsupported");
         return -1;
     }
-    if (max_dts_blocks == 0u) {
-        max_dts_blocks = 512u;
-    }
-    if ((uint64_t)max_dts_blocks * rt->nvme_block_size > UINT32_MAX) {
-        nvme_set_last_error(rt, "nvme_max_dts_overflow");
+    if (nvme_decode_max_transfer(max_dts_raw, rt->nvme_block_size,
+                                 &max_dts_blocks,
+                                 &rt->nvme_max_dts_bytes) != 0) {
+        nvme_set_last_error(rt, "nvme_max_transfer_invalid");
         return -1;
     }
-    rt->nvme_max_dts_bytes = max_dts_blocks * rt->nvme_block_size;
+    rt->nvme_max_dts_raw = max_dts_raw;
+    rt->nvme_max_dts_blocks = max_dts_blocks;
     lba_l = reg_read32(&rt->nvme, GENERIC_REG_OFFSET + GENERIC_MAXLBA_L);
     lba_h = reg_read32(&rt->nvme, GENERIC_REG_OFFSET + GENERIC_MAXLBA_H);
     rt->nvme_max_lba = ((uint64_t)lba_h << 32u) | (uint64_t)lba_l;
     if (rt->nvme_max_lba == 0u) {
         nvme_set_last_error(rt, "nvme_capacity_unavailable");
         return -1;
+    }
+
+    if (hw_storage_log_at_least_debug()) {
+        printf("nvme_capability channel=%d max_transfer_raw=%u"
+               " max_transfer_blocks=%u max_transfer_bytes=%u"
+               " logical_block_bytes=%u\n",
+               rt->cfg->id, max_dts_raw, max_dts_blocks,
+               rt->nvme_max_dts_bytes, rt->nvme_block_size);
+        fflush(stdout);
     }
 
     dbg_verbose_printf("[DBG][NVME] probe %s ch=%d status=0x%08x block=%u max_dts=%u max_lba=0x%08" PRIx64
@@ -3559,10 +3742,11 @@ static int nvme_read_capability(ChannelRuntime *rt, const char *tag) {
 int nvme_probe(ChannelRuntime *rt) {
     if (rt->gopt.dry_run) {
         rt->nvme_block_size = 512u;
+        rt->nvme_max_dts_raw = NVME_CMD_KIB_MAX * 2u;
+        rt->nvme_max_dts_blocks = rt->nvme_max_dts_raw;
         rt->nvme_max_dts_bytes = NVME_CMD_KIB_MAX * 1024u;
         rt->nvme_max_lba = 1024ull * 1024ull * 1024ull;
-        nvme_configure_runtime(rt);
-        storage_print_pcie_link_status(rt, "after_nvme_probe");
+        if (nvme_configure_runtime(rt) != 0) return -1;
         return 0;
     }
 
@@ -3575,9 +3759,7 @@ int nvme_probe(ChannelRuntime *rt) {
                 rt->cfg->id, rt->nvme_last_error);
         return -1;
     }
-    nvme_configure_runtime(rt);
-    storage_print_pcie_link_status(rt, "after_nvme_probe");
-
+    if (nvme_configure_runtime(rt) != 0) return -1;
     return 0;
 }
 
@@ -3662,6 +3844,20 @@ static int nvme_issue_one_sync(ChannelRuntime *rt,
                 (unsigned)completion.status_code);
         return -1;
     }
+    if (opcode == NVM_READ && nvme_read_trace_enabled(rt)) {
+        printf("nvme_read_trace event=completion channel=%d ts_us=%" PRIu64
+               " cid=%u cq_raw=0x%08x cq_status=0x%04x cq_status_code=0x%02x"
+               " tx_status=0x%08x int_status=0x%08x\n",
+               rt->cfg->id,
+               wall_time_us(),
+               (unsigned)cid,
+               completion.raw,
+               (unsigned)completion.status,
+               (unsigned)completion.status_code,
+               reg_read32(&rt->nvme, QUEUE_REG_OFFSET + QUEUE_TX_STATUS),
+               reg_read32(&rt->nvme, QUEUE_REG_OFFSET + QUEUE_INT_STATUS));
+        fflush(stdout);
+    }
     return 0;
 }
 
@@ -3670,12 +3866,18 @@ int nvme_rw(ChannelRuntime *rt, bool is_write, uint64_t lba, uint64_t sectors, u
     uint64_t submitted = 0u;
     uint64_t cur_lba = lba;
     uint64_t cur_hw = hw_addr;
+    uint64_t command_index = 0u;
+    bool trace;
 
     if (max_sectors == 0u) {
         max_sectors = NVME_CMD_KIB_DEFAULT * 1024u / NVME_SECTOR_BYTES;
     }
-    /* Preserve the legacy environment variable as an optional reducing cap. */
-    max_sectors = env_u64_limit("CCB_NVME_MAX_SECTORS", max_sectors, max_sectors);
+    /* Reads and writes use the same configured and capability-clamped command
+     * size so both directions exercise the same Host Core PRP behavior. */
+    max_sectors = env_u64_limit("CCB_NVME_MAX_SECTORS",
+                                max_sectors,
+                                max_sectors);
+    trace = !is_write && nvme_read_trace_enabled(rt);
     dbg_verbose_printf("[DBG][NVME] rw start ch=%d op=%s lba=0x%08" PRIx64
                        " sectors=%" PRIu64 " hw=0x%08" PRIx64
                        " max_sectors=%" PRIu64 " max_dts=%u block=%u\n",
@@ -3706,6 +3908,22 @@ int nvme_rw(ChannelRuntime *rt, bool is_write, uint64_t lba, uint64_t sectors, u
             return -2;
         }
 
+        if (trace) {
+            printf("nvme_read_trace event=command channel=%d command_index=%" PRIu64
+                   " slba=0x%08" PRIx64 " sectors=%u bytes=%" PRIu64
+                   " prp1=0x%08" PRIx64 " next_slba=0x%08" PRIx64
+                   " next_prp1=0x%08" PRIx64 "\n",
+                   rt->cfg->id,
+                   command_index,
+                   cur_lba,
+                   (unsigned)this_sectors,
+                   (uint64_t)this_sectors * NVME_SECTOR_BYTES,
+                   cur_hw,
+                   cur_lba + this_sectors,
+                   cur_hw + (uint64_t)this_sectors * NVME_SECTOR_BYTES);
+            fflush(stdout);
+        }
+
         issue_rc = nvme_issue_one_sync(rt, NVM_READ, cur_lba, this_sectors, cur_hw);
         if (issue_rc != 0) {
             if (issue_rc == NVME_SUBMIT_STOPPED_BEFORE_DOORBELL) {
@@ -3725,6 +3943,7 @@ int nvme_rw(ChannelRuntime *rt, bool is_write, uint64_t lba, uint64_t sectors, u
         submitted += this_sectors;
         cur_lba += this_sectors;
         cur_hw += this_sectors * (uint64_t)NVME_SECTOR_BYTES;
+        ++command_index;
     }
     dbg_verbose_printf("[DBG][NVME] rw done ch=%d op=%s lba=0x%08" PRIx64
                        " sectors=%" PRIu64 " hw=0x%08" PRIx64 "\n",
@@ -3800,9 +4019,30 @@ static int dma_reset_full(ChannelRuntime *rt, const char *tag) {
     return 0;
 }
 
+int dma_reset_after_storage_task(ChannelRuntime *rt)
+{
+    if (!rt || !rt->cfg) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (rt->gopt.dry_run) return 0;
+    if (!rt->dma.valid) {
+        errno = ENODEV;
+        return -1;
+    }
+    return dma_reset_full(rt, "post_storage_commit");
+}
+
 int dma_prepare_s2mm_ring(ChannelRuntime *rt, uint32_t dma_desc_bytes) {
-    uint32_t desc_count = (uint32_t)(rt->dma_ring_bytes / (uint64_t)dma_desc_bytes);
-    uint32_t desc_capacity = (uint32_t)(rt->cfg->desc_cpu_size / sizeof(DmaSgDesc));
+    uint32_t desc_count;
+    uint32_t desc_capacity;
+
+    if (!rt || !rt->cfg || dma_desc_bytes == 0u) {
+        errno = EINVAL;
+        return -1;
+    }
+    desc_count = (uint32_t)(rt->dma_ring_bytes / (uint64_t)dma_desc_bytes);
+    desc_capacity = (uint32_t)(rt->cfg->desc_cpu_size / sizeof(DmaSgDesc));
     /*
      * Descriptor count is constrained by:
      * - channel total hardware DDR coverage
@@ -3810,7 +4050,8 @@ int dma_prepare_s2mm_ring(ChannelRuntime *rt, uint32_t dma_desc_bytes) {
      */
     if (rt->dma_ring_bytes == 0u ||
         (rt->dma_ring_bytes % (uint64_t)dma_desc_bytes) != 0u ||
-        desc_count == 0u || desc_capacity == 0u || desc_count > desc_capacity) {
+        desc_count == 0u || desc_capacity == 0u || desc_count > desc_capacity ||
+        desc_count > DMA_DESC_COUNT_MAX) {
         fprintf(stderr,
                 "Invalid dma_desc_bytes=%u for channel %d: ring=%" PRIu64 " bytes, desc_count=%u (max descriptors=%u)\n",
                 (unsigned)dma_desc_bytes,
@@ -3822,6 +4063,9 @@ int dma_prepare_s2mm_ring(ChannelRuntime *rt, uint32_t dma_desc_bytes) {
     }
     rt->dma_desc_bytes = dma_desc_bytes;
     rt->dma_desc_count = desc_count;
+    rt->next_harvest_bd = 0u;
+    rt->next_requeue_bd = 0u;
+    memset(rt->dma_bd_harvested, 0, sizeof(rt->dma_bd_harvested));
     rt->dma_rx_packet_open = false;
     rt->dma_last_completed_bd = UINT32_MAX;
     rt->dma_last_completed_status = 0u;
@@ -3936,6 +4180,8 @@ int dma_start_s2mm_ring(ChannelRuntime *rt)
     }
     __atomic_store_n(&rt->dma_hw_desc_count, rt->dma_desc_count, __ATOMIC_RELEASE);
     rt->next_harvest_bd = 0u;
+    rt->next_requeue_bd = 0u;
+    memset(rt->dma_bd_harvested, 0, sizeof(rt->dma_bd_harvested));
     rt->dma_harvest_sequence = 0u;
     rt->dma_stop_latched = false;
     rt->dma_requeue_enabled = true;
@@ -3954,16 +4200,26 @@ static int dma_harvest_batch_impl(ChannelRuntime *rt, DmaHarvestItem *items,
 {
     uint32_t count = 0u;
     uint64_t start_us = 0u;
-    if (!rt || !items || !out_count || max_items == 0u) return -1;
+    if (!rt || !items || !out_count || max_items == 0u ||
+        rt->dma_desc_count == 0u || rt->dma_desc_count > DMA_DESC_COUNT_MAX) {
+        errno = EINVAL;
+        return -1;
+    }
     *out_count = 0u;
     if (budget_us != 0u) start_us = wall_time_us();
     if (rt->gopt.dry_run) {
         for (; count < max_items; ++count) {
-            items[count].slot = rt->next_harvest_bd;
+            uint32_t idx = rt->next_harvest_bd;
+            if (__atomic_load_n(&rt->dma_bd_harvested[idx],
+                                __ATOMIC_ACQUIRE) != 0u)
+                break;
+            __atomic_store_n(&rt->dma_bd_harvested[idx], 1u,
+                             __ATOMIC_RELEASE);
+            items[count].slot = idx;
             items[count].actual_bytes = rt->dma_desc_bytes;
             items[count].descriptor_status = 0u;
             items[count].submission_sequence = rt->dma_harvest_sequence++;
-            rt->next_harvest_bd = (rt->next_harvest_bd + 1u) % rt->dma_desc_count;
+            rt->next_harvest_bd = (idx + 1u) % rt->dma_desc_count;
         }
         *out_count = count;
         return 0;
@@ -3979,17 +4235,40 @@ static int dma_harvest_batch_impl(ChannelRuntime *rt, DmaHarvestItem *items,
         dsr = reg_read32(&rt->dma, S2MM_DMASR);
         if ((dsr & DMA_ERROR_MASK_S2MM) != 0u ||
             (!allow_halted && (dsr & DMA_SR_HALT_BIT) != 0u)) {
-            *out_count = count; return -1;
+            errno = (dsr & DMA_ERROR_MASK_S2MM) != 0u ? EIO : EPIPE;
+            *out_count = count;
+            return -1;
         }
         desc = (volatile DmaSgDesc *)(void *)rt->desc.virt;
-        idx = rt->next_harvest_bd; st = desc[idx].status;
+        idx = rt->next_harvest_bd;
+        if (__atomic_load_n(&rt->dma_bd_harvested[idx],
+                            __ATOMIC_ACQUIRE) != 0u) {
+            /* The status belongs to a descriptor already owned by software.
+             * In particular, a stopped ring may wrap onto stale completion
+             * status left by the normal harvester. */
+            if (allow_halted) break;
+            fprintf(stderr,
+                    "DMA harvest ownership conflict channel=%d slot=%u hw_owned=%u\n",
+                    rt->cfg ? rt->cfg->id : -1, (unsigned)idx,
+                    (unsigned)hw_owned);
+            errno = EPROTO;
+            *out_count = count;
+            return -1;
+        }
+        st = desc[idx].status;
         if ((st & DESC_STS_CMPLT) == 0u) break;
         rt->dma_last_completed_bd = idx; rt->dma_last_completed_status = st;
-        if ((st & DESC_STS_ERROR_MASK) != 0u) { *out_count = count; return -1; }
+        if ((st & DESC_STS_ERROR_MASK) != 0u) {
+            errno = EIO;
+            *out_count = count;
+            return -1;
+        }
         items[count].slot = idx;
         items[count].actual_bytes = st & DESC_STS_LEN_MASK;
         items[count].descriptor_status = st;
         items[count].submission_sequence = rt->dma_harvest_sequence++;
+        __atomic_store_n(&rt->dma_bd_harvested[idx], 1u,
+                         __ATOMIC_RELEASE);
         if ((st & DESC_STS_RXSOF) != 0u) { ++rt->dma_rxsof_count; rt->dma_rx_packet_open = true; }
         if ((st & DESC_STS_RXEOF) != 0u) { ++rt->dma_rxeof_count; rt->dma_rx_packet_open = false; }
         if (allow_halted) {
@@ -4045,7 +4324,10 @@ uint64_t dma_requeue_after_stop_count(const ChannelRuntime *rt)
 }
 
 int dma_requeue_one(ChannelRuntime *rt, uint32_t slot) {
-    if (!rt) return -1;
+    if (!rt) {
+        errno = EINVAL;
+        return -1;
+    }
     if (__atomic_load_n(&rt->dma_stop_latched, __ATOMIC_ACQUIRE) ||
         !__atomic_load_n(&rt->dma_requeue_enabled, __ATOMIC_ACQUIRE)) {
         (void)__atomic_add_fetch(&rt->dma_requeue_after_stop_count, 1u, __ATOMIC_RELAXED);
@@ -4054,8 +4336,32 @@ int dma_requeue_one(ChannelRuntime *rt, uint32_t slot) {
                 rt->cfg ? rt->cfg->id : -1, (unsigned)slot);
         return -2;
     }
-    if (!rt || rt->gopt.dry_run || slot >= rt->dma_desc_count) {
-        return (rt && rt->gopt.dry_run && slot < rt->dma_desc_count) ? 0 : -1;
+    if (slot >= rt->dma_desc_count || rt->dma_desc_count == 0u ||
+        rt->dma_desc_count > DMA_DESC_COUNT_MAX) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (slot != rt->next_requeue_bd) {
+        errno = EPROTO;
+        fprintf(stderr,
+                "DMA requeue order violation channel=%d slot=%u expected=%u\n",
+                rt->cfg ? rt->cfg->id : -1, (unsigned)slot,
+                (unsigned)rt->next_requeue_bd);
+        return -3;
+    }
+    if (__atomic_load_n(&rt->dma_bd_harvested[slot],
+                        __ATOMIC_ACQUIRE) == 0u) {
+        errno = EPROTO;
+        fprintf(stderr,
+                "DMA requeue ownership violation channel=%d slot=%u reason=not_harvested\n",
+                rt->cfg ? rt->cfg->id : -1, (unsigned)slot);
+        return -3;
+    }
+    if (rt->gopt.dry_run) {
+        __atomic_store_n(&rt->dma_bd_harvested[slot], 0u,
+                         __ATOMIC_RELEASE);
+        rt->next_requeue_bd = (slot + 1u) % rt->dma_desc_count;
+        return 0;
     }
 
     {
@@ -4078,14 +4384,21 @@ int dma_requeue_one(ChannelRuntime *rt, uint32_t slot) {
             uint32_t cr = reg_read32(&rt->dma, S2MM_DMACR);
             if ((sr & (DMA_ERROR_MASK_S2MM | DMA_SR_HALT_BIT)) != 0u ||
                 (cr & DMA_CR_RS_BIT) == 0u) {
+                errno = EIO;
                 fprintf(stderr,
                         "DMA requeue failed channel=%d slot=%u dmacr=0x%08x dmasr=0x%08x\n",
                         rt->cfg->id, (unsigned)slot, cr, sr);
                 return -1;
             }
         }
+        /* Publish software ownership release before increasing the hardware
+         * ownership count observed by the producer. */
+        __atomic_store_n(&rt->dma_bd_harvested[slot], 0u,
+                         __ATOMIC_RELEASE);
+        rt->next_requeue_bd = (slot + 1u) % rt->dma_desc_count;
         hw_owned = __atomic_add_fetch(&rt->dma_hw_desc_count, 1u, __ATOMIC_ACQ_REL);
         if (hw_owned > rt->dma_desc_count) {
+            errno = EOVERFLOW;
             fprintf(stderr,
                     "DMA descriptor ownership overflow on channel %d: hw_owned=%u total=%u\n",
                     rt->cfg->id,
@@ -4249,6 +4562,13 @@ static bool dma_stop_reset_safe(const ChannelRuntime *rt,
         if (report) (void)snprintf(report->reason, sizeof(report->reason), "tail_descriptor_incomplete");
         return false;
     }
+    if (rt->dma_rxsof_count != rt->dma_rxeof_count) {
+        if (report) {
+            (void)snprintf(report->reason, sizeof(report->reason),
+                           "packet_boundary_unconfirmed");
+        }
+        return false;
+    }
     if (dma_get_bd_snapshot((ChannelRuntime *)rt, software_slot_state, &snapshot) != 0) {
         if (report) (void)snprintf(report->reason, sizeof(report->reason), "slot_ownership_invariant_failed");
         return false;
@@ -4268,7 +4588,9 @@ static void dma_emit_quiesce_result(const ChannelRuntime *rt, const DmaStopRepor
            " CR=0x%08x SR=0x%08x CURDESC=0x%016" PRIx64
            " TAILDESC=0x%016" PRIx64
            " next_bd=%u next_bd_status=0x%08x hw_owned=%u"
-           " completed_unharvested=%u rx_packet_open=%u reset_attempted=%u\n",
+           " completed_unharvested=%u rx_packet_open=%u"
+           " idle_state_stable=%u idle_stable_us=%" PRIu64
+           " reset_attempted=%u\n",
            rt->cfg ? rt->cfg->id : -1,
            (int)report->result,
            report->reason[0] != '\0' ? report->reason : "unknown",
@@ -4280,6 +4602,8 @@ static void dma_emit_quiesce_result(const ChannelRuntime *rt, const DmaStopRepor
            report->next_bd_status, (unsigned)report->hw_owned,
            (unsigned)report->completed_unharvested,
            report->rx_packet_open ? 1u : 0u,
+           report->idle_state_stable ? 1u : 0u,
+           report->idle_stable_us,
            report->reset_attempted ? 1u : 0u);
     fflush(stdout);
 }
@@ -4292,6 +4616,10 @@ DmaStopResult dma_quiesce_s2mm_with_state(ChannelRuntime *rt, uint64_t deadline_
     uint32_t control;
     uint32_t next_status = 0u;
     uint32_t hw_owned;
+    uint64_t last_curdesc_addr;
+    uint64_t last_taildesc_addr;
+    uint32_t last_next_status;
+    uint64_t idle_stable_since_us;
 
     if (!rt || rt->gopt.dry_run) {
         if (report) {
@@ -4354,10 +4682,44 @@ DmaStopResult dma_quiesce_s2mm_with_state(ChannelRuntime *rt, uint64_t deadline_
         fflush(stdout);
     }
 
+    last_curdesc_addr = (uint64_t)reg_read32(&rt->dma, S2MM_CURDESC) |
+                        ((uint64_t)reg_read32(&rt->dma, S2MM_CURDESC_MSB) << 32u);
+    last_taildesc_addr = (uint64_t)reg_read32(&rt->dma, S2MM_TAILDESC) |
+                         ((uint64_t)reg_read32(&rt->dma, S2MM_TAILDESC_MSB) << 32u);
+    last_next_status = next_status;
+    idle_stable_since_us = wall_time_us();
     reg_write32(&rt->dma, S2MM_DMACR, control & ~DMA_CR_RS_BIT);
     __sync_synchronize();
     for (;;) {
         uint32_t status = reg_read32(&rt->dma, S2MM_DMASR);
+        uint64_t now_us = wall_time_us();
+        uint64_t curdesc_addr;
+        uint64_t taildesc_addr;
+        uint32_t observed_next_status = 0u;
+
+        curdesc_addr = (uint64_t)reg_read32(&rt->dma, S2MM_CURDESC) |
+                       ((uint64_t)reg_read32(&rt->dma, S2MM_CURDESC_MSB) << 32u);
+        taildesc_addr = (uint64_t)reg_read32(&rt->dma, S2MM_TAILDESC) |
+                        ((uint64_t)reg_read32(&rt->dma, S2MM_TAILDESC_MSB) << 32u);
+        if (desc && rt->next_harvest_bd < rt->dma_desc_count)
+            observed_next_status = desc[rt->next_harvest_bd].status;
+        if (curdesc_addr != last_curdesc_addr ||
+            taildesc_addr != last_taildesc_addr ||
+            observed_next_status != last_next_status) {
+            last_curdesc_addr = curdesc_addr;
+            last_taildesc_addr = taildesc_addr;
+            last_next_status = observed_next_status;
+            idle_stable_since_us = now_us;
+        }
+        if (report) {
+            report->curdesc_addr = curdesc_addr;
+            report->taildesc_addr = taildesc_addr;
+            report->next_bd_status = observed_next_status;
+            report->idle_stable_us = now_us >= idle_stable_since_us
+                                         ? now_us - idle_stable_since_us : 0u;
+            report->idle_state_stable =
+                report->idle_stable_us >= DMA_STOP_RESET_STABLE_US;
+        }
 
         if ((status & DMA_ERROR_MASK_S2MM) != 0u) {
             errno = EIO;
@@ -4366,13 +4728,25 @@ DmaStopResult dma_quiesce_s2mm_with_state(ChannelRuntime *rt, uint64_t deadline_
             return DMA_STOP_FAILED;
         }
         if ((status & DMA_SR_HALT_BIT) != 0u) break;
-        if (deadline_us != 0u && wall_time_us() >= deadline_us) {
+        if (deadline_us != 0u && now_us >= deadline_us) {
             errno = ETIMEDOUT;
-            /* A halted bit is not guaranteed when no frame has arrived.  A
-             * reset is allowed only after the complete ownership audit. */
+            /* dma_hw_desc_count is the number of descriptors available to
+             * hardware, not the number of active transfers.  A full idle
+             * ring is therefore eligible after packet-boundary validation. */
             if (!software_slot_state || !dma_stop_reset_safe(rt, software_slot_state, report))
             {
                 if (report) { report->s2mm_sr_after = status; dma_emit_quiesce_result(rt, report); }
+                return DMA_STOP_FAILED;
+            }
+            if (now_us < idle_stable_since_us ||
+                now_us - idle_stable_since_us < DMA_STOP_RESET_STABLE_US) {
+                if (report) {
+                    report->idle_state_stable = false;
+                    (void)snprintf(report->reason, sizeof(report->reason),
+                                   "dma_stop_state_unstable");
+                    report->s2mm_sr_after = status;
+                    dma_emit_quiesce_result(rt, report);
+                }
                 return DMA_STOP_FAILED;
             }
             if (report) report->reset_attempted = true;

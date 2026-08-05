@@ -16,11 +16,10 @@
 #define CHANNEL_CPU_DDR_BYTES (64ull * 1024ull * 1024ull)
 
 /*
- * Usable DMA/NVMe S2MM ring windows from the FPGA address map. ch0/ch1 are
- * limited in software to the currently reliable low 1 GiB window.
+ * Usable DMA/NVMe S2MM ring windows from the FPGA address map.
  */
-#define CHANNEL0_DDR_BYTES (1ull * 1024ull * 1024ull * 1024ull)
-#define CHANNEL1_DDR_BYTES (1ull * 1024ull * 1024ull * 1024ull)
+#define CHANNEL0_DDR_BYTES (2ull * 1024ull * 1024ull * 1024ull)
+#define CHANNEL1_DDR_BYTES (2ull * 1024ull * 1024ull * 1024ull)
 #define CHANNEL2_DDR_BYTES (512ull * 1024ull * 1024ull)
 #define CHANNEL0_DDR_BYTES_MAX (2ull * 1024ull * 1024ull * 1024ull)
 #define CHANNEL1_DDR_BYTES_MAX (2ull * 1024ull * 1024ull * 1024ull)
@@ -32,12 +31,9 @@
 #define DMA_DESC_BYTES_DEFAULT DMA_DESC_BYTES_CH2_DEFAULT
 #define DMA_DESC_BYTES_MAX DMA_DESC_BYTES_CH2_DEFAULT
 
-/*
- * Legacy descriptor limits used by the TCP MM2S helper.
- * Storage S2MM channels use ChannelConfig.desc_cpu_size instead.
- */
+/* All three descriptor BRAM windows are 0x4000 bytes. */
 #define DMA_DESC_ENTRY_BYTES 64u
-#define DMA_DESC_BRAM_BYTES 8192u
+#define DMA_DESC_BRAM_BYTES 16384u
 #define DMA_DESC_COUNT_MAX (DMA_DESC_BRAM_BYTES / DMA_DESC_ENTRY_BYTES)
 
 /* SSD metadata layout constants. */
@@ -239,8 +235,18 @@ typedef struct {
     uint64_t pcie_bridge_base_effective;
 
     uint32_t next_harvest_bd;
+    /* AXI DMA TAILDESC exposes a contiguous descriptor prefix.  Track the
+     * next descriptor that may legally extend that prefix, independently of
+     * unordered NVMe completion. */
+    uint32_t next_requeue_bd;
+    /* One byte per hardware descriptor records software ownership for the
+     * current ring generation.  A set entry must not be harvested again
+     * until its descriptor is returned to DMA. */
+    uint8_t dma_bd_harvested[DMA_DESC_COUNT_MAX];
     uint16_t next_cmd_id;
     uint32_t nvme_block_size;
+    uint32_t nvme_max_dts_raw;
+    uint32_t nvme_max_dts_blocks;
     uint32_t nvme_max_dts_bytes;
     uint64_t nvme_max_lba;
     uint32_t nvme_cmd_size_bytes;
@@ -267,6 +273,7 @@ typedef struct {
     uint32_t nvme_active_qd_current;
     uint64_t nvme_active_qd_integral_us;
     uint64_t nvme_active_qd_observed_us;
+    uint64_t nvme_active_us;
     uint64_t nvme_active_qd_last_update_us;
     uint64_t nvme_submit_calls;
     uint64_t nvme_submit_total_us;

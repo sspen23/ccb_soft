@@ -33,7 +33,10 @@ typedef enum {
 
 typedef enum {
     STORAGE_PROFILE_SAFE_QD1 = 0,
-    STORAGE_PROFILE_PERF_QD8
+    STORAGE_PROFILE_LEGACY_FAST_BASELINE,
+    STORAGE_PROFILE_PERF_QD8,
+    STORAGE_PROFILE_CROSS_SLOT_EXPERIMENTAL,
+    STORAGE_PROFILE_CROSS_SLOT_QD16_EXPERIMENTAL
 } StorageProfile;
 
 typedef enum {
@@ -54,10 +57,19 @@ typedef struct {
     uint32_t writer_priority;
     bool producer_realtime;
     uint32_t producer_priority;
+    uint32_t nominal_input_mib_s;
+    uint32_t writer_scheduler_weight;
+    uint32_t producer_scheduler_weight;
+    int32_t writer_nice;
+    int32_t producer_nice;
+    uint32_t writer_budget_us;
+    uint32_t busy_poll_us;
+    uint32_t empty_sleep_us;
 } ChannelStorageConfig;
 
 typedef struct {
     char uart_device[STORAGE_CONFIG_UART_PATH_MAX];
+    bool log_enabled;
     CcbLogLevel log_level;
     bool perf_enabled;
     uint32_t perf_interval_ms;

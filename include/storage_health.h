@@ -11,6 +11,13 @@ typedef struct {
     bool pcie_link;
     bool nvme_ready;
     bool capacity_valid;
+    uint32_t logical_block_bytes;
+    uint32_t max_transfer_raw;
+    uint32_t max_transfer_blocks;
+    uint32_t max_transfer_bytes;
+    uint32_t requested_command_bytes;
+    uint32_t effective_command_bytes;
+    uint32_t nvme_qd;
     uint64_t checked_us;
     StorageErrorCode error;
 } StorageHealthSnapshot;
@@ -29,6 +36,8 @@ int storage_health_start(StorageHealthProbeFn probe, void *ctx,
 void storage_health_stop(void);
 void storage_health_set_busy(bool busy);
 void storage_health_request_refresh(void);
+/* End the current multi-channel refresh after its in-flight probe returns. */
+void storage_health_abort_refresh(void);
 StorageHealthResult storage_health_query(uint64_t max_age_us,
                                          StorageHealthSnapshot snapshots[3]);
 

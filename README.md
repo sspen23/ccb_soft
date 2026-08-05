@@ -83,9 +83,7 @@ DMA、尚未写完 NVMe 的 DDR slot。硬件重新获取 BD 前，软件必须�
 
 - CPU 每个数据通路 DDR 只接入 64MiB。
 - DMA 和 NVMe 使用硬件本地 DDR offset。
-- ch0/ch1 数据通路 DDR 硬件容量是 2GiB，但当前软件强制只使用低 1GiB；
-  即使 `SRC_REAL_STORAGE_RING_BYTES_CH0` / `SRC_REAL_STORAGE_RING_BYTES_CH1`
-  请求更大值，也会 warning 并 clamp 回 1GiB。
+- ch0/ch1 数据通路 DDR 硬件容量和软件默认 ring 都是 2GiB。
 - ch2 数据通路 DDR 是 512MiB。
 
 所以软件里把两个概念分开：
@@ -101,14 +99,13 @@ DMA、尚未写完 NVMe 的 DDR slot。硬件重新获取 BD 前，软件必须�
 含义是：
 
 - `ddr_cpu_size`：CPU 可 mmap 的窗口，只有 64MiB。
-- `dma_ring_bytes`：DMA/NVMe 默认使用的 DDR ring，ch0/ch1 1GiB，ch2 512MiB。
-- `dma_ring_bytes_max`：硬件描述仍保留最大窗口；运行时 ch0/ch1 会 clamp 到默认
-  1GiB，ch2 保持 512MiB。
+- `dma_ring_bytes`：DMA/NVMe 默认使用的 DDR ring，ch0/ch1 2GiB，ch2 512MiB。
+- `dma_ring_bytes_max`：允许的最大 DDR ring，与各通道硬件窗口一致。
 
 因此存盘缓冲能力是：
 
 ```text
-ch0/ch1 storage-write 默认: 1GiB / 8MiB = 128 slot
+ch0/ch1 storage-write 默认: 2GiB / 8MiB = 256 slot
 ch2: 512MiB / 16MiB = 32 帧
 ```
 
@@ -158,9 +155,9 @@ if (desc_count == 0u || desc_capacity == 0u || desc_count > desc_capacity) {
 DmaSgDesc = 64 bytes
 
 ch0/ch1:
-  ring = 1GiB runtime clamp
+  ring = 2GiB
   storage-write descriptor size = 8MiB
-  需要 descriptor = 128
+  需要 descriptor = 256
   BRAM = 0x4000 = 16KiB
   BRAM 可放 = 256
   通过
@@ -255,7 +252,7 @@ SSD
   -> TCP/IP 硬件发送通路
 ```
 
-当前网络发送按 16MiB 一帧发送，不再做 64MiB 拼包，也不做 16MiB 尾部补零。这样更贴近你说的“一帧一帧，每帧有 last 信号”。
+当前网络发送每帧为 16MiB。ch0/ch1 会先从 SSD 分两次各读取 8MiB，分别写入同一 DDR 下载 slot 的前、后半区；两次读取都完成后，再用一个 16MiB TCP MM2S descriptor 发送。ch2 仍一次读取 16MiB 后发送。
 
 相关逻辑在 [system.c](system.c:1624) 附近。
 
@@ -296,7 +293,7 @@ desc DMA base   0x10000000
 DDR CPU base    0x10000000
 DDR HW base     0x00000000
 CPU DDR window  64MiB
-DMA ring        1GiB runtime clamp
+DMA ring        2GiB
 ```
 
 ch1：
@@ -310,7 +307,7 @@ desc DMA base   0x10000000
 DDR CPU base    0xd0000000
 DDR HW base     0x00000000
 CPU DDR window  64MiB
-DMA ring        1GiB runtime clamp
+DMA ring        2GiB
 ```
 
 ch2：
@@ -343,6 +340,7 @@ DMA ring        512MiB
 - NVMe write走CID匹配的有界异步QD，read仍走同步CQ completion。
 - 0x71 停止网络时会通知 NVMe read 和 TCP transfer 停止。
 - 存盘停止时不是立刻杀进程，而是让 worker drain 已完成 DMA descriptor，再写 metadata。
+- 监督式存盘在 metadata、`filelist.db` 和 flash 同步处理完成后，会对本次目标通道的 AXI DMA 再执行一次完整复位，避免错误状态影响下一次任务。
 - CPU 不 mmap 完整数据 DDR，避免访问未接入地址导致 `Bus error`。
 
 整体上，当前工程的设计目标是：让 DMA/NVMe 尽量直通数据，CPU 只做控制面；用完整数据 DDR 做存盘突发缓存；同时避免 CPU 访问硬件没有接入的 DDR 区域。
@@ -411,13 +409,13 @@ Persistent database and NVMe metadata copies on the SPI1 user flash mount:
 /mnt/spi1/meta_ch2.bin
 ```
 
-On top-level `storage.elf` startup, standalone `storage-write`, standalone
-`network-send`, and `ddr-pattern-store`, the program restores this flash copy
-to the runtime `filelist.db` and restores the channel metadata files before
-opening SQLite. Internal worker subprocesses do not restore from flash, so an
-active daemon task cannot overwrite its runtime state while it is forking
-workers. Startup fails if the configured flash parent directory is not a real
-mount point; this prevents accidental writes into the root filesystem.
+On top-level daemon `storage.elf` startup, the program restores this flash
+copy to the runtime `filelist.db` and restores the channel metadata files
+before opening SQLite. Internal worker subprocesses do not restore from flash,
+so an active daemon task cannot overwrite its runtime state while it is forking
+workers. The PetaLinux init script requires the configured flash parent
+directory to be mounted before it starts the daemon; this prevents accidental
+writes into the root filesystem.
 
 The flash copies are updated together by `0x41 control=0x22` and by successful
 `ddr-pattern-store`. Keeping metadata with the database is required so the next
@@ -465,10 +463,10 @@ ch0 HIGH_I
   desc DMA       0x10000000
   desc size      0x4000
   storage-write DMA desc bytes 0x00800000
-  storage-write DMA desc count 128 default
+  storage-write DMA desc count 256 default
   DDR CPU        0x10000000
   DDR size       0x04000000
-  DDR ring       0x40000000 default
+  DDR ring       0x80000000 default
   DDR ring max   0x80000000
   DDR HW offset  0x00000000
 
@@ -480,10 +478,10 @@ ch1 HIGH_Q
   desc DMA       0x10000000
   desc size      0x4000
   storage-write DMA desc bytes 0x00800000
-  storage-write DMA desc count 128 default
+  storage-write DMA desc count 256 default
   DDR CPU        0xd0000000
   DDR size       0x04000000
-  DDR ring       0x40000000 default
+  DDR ring       0x80000000 default
   DDR ring max   0x80000000
   DDR HW offset  0x00000000
 
@@ -510,14 +508,12 @@ address stays at the old hardware value `0x10000000`.
 
 The default S2MM descriptor payload size for `storage-write` is 8 MiB on
 ch0/ch1 and 16 MiB on ch2. The CPU maps only a 64 MiB window. The DMA/NVMe
-ring is ch0/ch1 1 GiB and ch2 512 MiB at runtime; larger ch0/ch1 environment
-requests are rejected with `storage_ring_config_error` rather than silently
-running with a smaller ring.
+ring is ch0/ch1 2 GiB and ch2 512 MiB at runtime.
 
-Expected ch0/ch1 1 GiB startup line:
+Expected ch0/ch1 2 GiB startup line:
 
 ```text
-storage_pipeline_config channel=0 ... requested_ring_bytes=1073741824 effective_ring_bytes=1073741824 slot_bytes=8388608 total_slots=128 ring_clamp_reason=none hw_ring_base=0x00000000 hw_ring_end=0x40000000 hw_ddr_span_bytes=1073741824 dma_bd_count=128 ...
+storage_pipeline_config channel=0 ... requested_ring_bytes=2147483648 effective_ring_bytes=2147483648 slot_bytes=8388608 total_slots=256 ring_clamp_reason=none hw_ring_base=0x00000000 hw_ring_end=0x80000000 hw_ddr_span_bytes=2147483648 dma_bd_count=256 ...
 ```
 
 If `requested_ring_bytes` and `effective_ring_bytes` differ, or if
@@ -641,18 +637,32 @@ byte 4 = 0xFF  delete all file records and clear supported-channel metadata
 
 ```text
 0x11  ch0/ch1/ch2 NVMe disks are detected and capabilities are valid
+0x55  storage, transfer, or maintenance work is busy
 0xFF  at least one ch0/ch1/ch2 NVMe disk detection failed
 ```
 
 The check reuses the standalone self-test style logic: open the channel runtime,
 run `nvme_probe()`, then validate `block_size`, `max_dts_bytes`, and `max_lba`.
-ch0, ch1, and ch2 are checked.
+ch0, ch1, and ch2 are checked synchronously when a status command is received;
+the reply is sent only after all three probes finish. There is no periodic
+background health probe. A failed status check reports its normal `0xFF`
+response only and never pulses the SSD reset GPIO automatically. If storage,
+transfer, or maintenance work is active, the command returns `0x55` without
+probing shared channel hardware.
 
 Optional timeout override:
 
 ```sh
 export SRC_REAL_STATUS_TIMEOUT_US=5000000
 ```
+
+The built-in production defaults use `/dev/ttyUL1`, the
+`CROSS_SLOT_EXPERIMENTAL` (QD8) profile, compatibility mode off, performance
+file logging off, a 1000 ms performance interval, and structured logging off.
+In this mode `logs.db` is not initialized and routine debug-UART output,
+including the textual status capability dump, is suppressed; the binary
+protocol ACK is unaffected. Setting `CCB_LOG_LEVEL` explicitly re-enables
+logging, and environment variables can still override the other defaults.
 
 `0x71` stop network send:
 
@@ -815,6 +825,7 @@ ch0 HIGH_I file
   desc CPU base      0x20000000
   desc DMA base      0x10000000
   DDR DMA/NVMe addr  0x00000000
+  SSD read bytes     8 MiB x 2
   TCP desc bytes     16 MiB
 
 ch1 HIGH_Q file
@@ -824,6 +835,7 @@ ch1 HIGH_Q file
   desc CPU base      0x30000000
   desc DMA base      0x10000000
   DDR DMA/NVMe addr  0x00000000
+  SSD read bytes     8 MiB x 2
   TCP desc bytes     16 MiB
 
 ch2 LOW_SPEED/CALIB file
@@ -946,10 +958,6 @@ export SRC_REAL_NVME_BUSY_POLL_US=0
 export SRC_REAL_NVME_POLL_SLEEP_US=10
 export SRC_REAL_NVME_CROSS_SLOT_QD=0
 export SRC_REAL_NVME_CROSS_SLOT_BATCH=8
-export SRC_REAL_PCIE_BRIDGE_BASE_CH0=0xb0000000
-export SRC_REAL_PCIE_BRIDGE_BASE_CH1=0xd0000000
-# export SRC_REAL_PCIE_BRIDGE_BASE_CH2=0x...
-
 export SRC_REAL_NETWORK_DRY_RUN=1
 export SRC_REAL_NETWORK_SKIP_LINK_CHECK=1
 export SRC_REAL_NETWORK_TIMEOUT_US=5000000
@@ -958,8 +966,10 @@ export SRC_REAL_NETWORK_LIMIT_MB_S=0
 export SRC_REAL_NETWORK_VERIFY_DDR_READ=1
 ```
 
-Regular `[DBG]` and UART RX/TX banner output is off by default. Enable only the
-categories needed for the current test:
+Regular `[DBG]` output is off by default. Normal operation always prints one
+compact UART RX line and one UART TX reply line; normal data-transfer details
+remain quiet, while failure lines are retained. Enable debug categories only
+when needed for a test:
 
 ```text
 SRC_REAL_DEBUG=write,nvme
@@ -1017,26 +1027,6 @@ SRC_REAL_ECHO_WORKER_OUTPUT=1
   Echoes all worker stdout/stderr to the parent stdout. Default `0` still
   drains worker pipes but only echoes warning/error/final lines, avoiding pipe
   backpressure and UART overhead.
-
-PCIe bridge link status:
-  The helper reads the Xilinx/AMD AXI Bridge for PCIe Gen3 PHY Status/Control
-  register at `pcie_bridge_base + 0x144` and prints one line per
-  channel/reason during runtime open and after NVMe probe:
-
-  ```text
-  pcie_link_status channel=0 reason=startup bridge_base=0xb0000000 phy_reg=0x0000.... link_up=1 speed=Gen3_8GT width=x4 ltssm=0x..
-  ```
-
-  The bridge control base must be the CPU-visible AXI Bridge for PCIe Gen3
-  AXI-Lite control base, not the NVMe Host Core base such as `0x44a00000`.
-  The current defaults are ch0=`0xb0000000`, ch1=`0xd0000000`, and ch2 unset.
-  Override them per channel with `SRC_REAL_PCIE_BRIDGE_BASE_CH0`,
-  `SRC_REAL_PCIE_BRIDGE_BASE_CH1`, or `SRC_REAL_PCIE_BRIDGE_BASE_CH2`.
-  If no base is available the line contains `error=no_bridge_base`; if the
-  optional MMIO read cannot be performed it contains `error=read_failed`.
-
-  Speed decode: `down`, `Gen1_2p5GT`, `Gen2_5GT`, or `Gen3_8GT`.
-  Width decode: `x1`, `x2`, `x4`, `x8`, or `x16`.
 
 Recommended throughput-test configuration:
 

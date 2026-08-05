@@ -17,8 +17,17 @@ int ddr_addr_validate(const ChannelConfig *cfg, uint64_t cpu_addr, uint64_t size
 int channel_runtime_open(ChannelRuntime *rt, const ChannelConfig *cfg, GlobalOptions gopt);
 void channel_runtime_close(ChannelRuntime *rt);
 uint32_t nvme_default_qd_for_channel(int channel_id);
-void storage_print_pcie_link_status(ChannelRuntime *rt, const char *reason);
-
+int nvme_decode_max_transfer(uint32_t raw_value,
+                             uint32_t logical_block_bytes,
+                             uint32_t *blocks,
+                             uint32_t *bytes);
+int nvme_clamp_command_bytes(uint32_t requested_bytes,
+                             uint32_t nvme_max_transfer_bytes,
+                             uint32_t logical_block_bytes,
+                             uint32_t *effective_bytes);
+uint32_t nvme_poll_backoff_us(uint32_t busy_poll_us,
+                              uint32_t base_sleep_us,
+                              uint32_t waited_us);
 /* Configure data path source and probe NVMe host capabilities. */
 void axis_switch_select(ChannelRuntime *rt, SourceMode src);
 int nvme_probe(ChannelRuntime *rt);
@@ -28,6 +37,8 @@ int nvme_stop_requested(void);
 
 /* Submit segmented NVMe read/write covering the requested sector range. */
 int nvme_rw(ChannelRuntime *rt, bool is_write, uint64_t lba, uint64_t sectors, uint64_t hw_addr);
+/* Read commands intentionally use a smaller diagnostic transfer size than writes. */
+uint32_t nvme_read_command_sectors(const ChannelRuntime *rt);
 /* The return value follows NvmeSubmitResult.  Once the doorbell is written,
  * STOP and timeout are acceptance-unknown, never ordinary cancellation. */
 int nvme_submit_command_async(ChannelRuntime *rt, uint8_t opcode,
@@ -94,6 +105,7 @@ typedef struct {
     uint64_t completion_process_count;
     uint64_t completion_process_max_us;
     uint64_t no_progress_sleep_count;
+    uint64_t full_validation_count;
 } NvmeCrossSlotStats;
 typedef enum {
     NVME_CROSS_SLOT_RUNNING = 0,
@@ -193,6 +205,8 @@ typedef struct {
     bool reset_attempted;
     DmaStopResult result;
     bool safe_reset_confirmed;
+    bool idle_state_stable;
+    uint64_t idle_stable_us;
     uint32_t completed_unharvested;
     char reason[64];
 } DmaStopReport;
@@ -232,5 +246,7 @@ DmaStopResult dma_finalize_stop_s2mm_with_state(ChannelRuntime *rt,
                                                 const uint8_t *software_slot_state,
                                                 DmaStopReport *report);
 DmaStopResult dma_stop_s2mm(ChannelRuntime *rt, DmaStopReport *report);
+/* Reset both AXI DMA channel banks after storage metadata/database commit. */
+int dma_reset_after_storage_task(ChannelRuntime *rt);
 
 #endif

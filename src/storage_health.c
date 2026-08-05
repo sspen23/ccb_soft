@@ -21,6 +21,7 @@ typedef struct {
     bool stop;
     bool busy;
     bool refresh_requested;
+    bool abort_refresh;
 } StorageHealthService;
 
 static StorageHealthService g_health;
@@ -54,6 +55,7 @@ static void *storage_health_thread(void *unused)
         StorageHealthSnapshot refreshed[STORAGE_HEALTH_CHANNELS];
         uint32_t channel;
         bool busy;
+        bool aborted = false;
 
         pthread_mutex_lock(&g_health.lock);
         if (g_health.stop) {
@@ -62,6 +64,7 @@ static void *storage_health_thread(void *unused)
         }
         busy = g_health.busy;
         g_health.refresh_requested = false;
+        g_health.abort_refresh = false;
         pthread_mutex_unlock(&g_health.lock);
 
         if (!busy) {
@@ -69,15 +72,29 @@ static void *storage_health_thread(void *unused)
             for (channel = 0u; channel < STORAGE_HEALTH_CHANNELS; ++channel) {
                 StorageErrorCode error;
 
+                pthread_mutex_lock(&g_health.lock);
+                aborted = g_health.stop || g_health.busy ||
+                          g_health.abort_refresh;
+                pthread_mutex_unlock(&g_health.lock);
+                if (aborted) break;
+
                 refreshed[channel].channel = channel;
                 error = g_health.probe(channel, g_health.ctx,
                                        &refreshed[channel]);
                 refreshed[channel].error = error;
                 refreshed[channel].checked_us = monotonic_us();
+
+                pthread_mutex_lock(&g_health.lock);
+                aborted = g_health.stop || g_health.busy ||
+                          g_health.abort_refresh;
+                pthread_mutex_unlock(&g_health.lock);
+                if (aborted) break;
             }
-            pthread_mutex_lock(&g_health.lock);
-            memcpy(g_health.snapshots, refreshed, sizeof(refreshed));
-            pthread_mutex_unlock(&g_health.lock);
+            if (!aborted) {
+                pthread_mutex_lock(&g_health.lock);
+                memcpy(g_health.snapshots, refreshed, sizeof(refreshed));
+                pthread_mutex_unlock(&g_health.lock);
+            }
         }
 
         pthread_mutex_lock(&g_health.lock);
@@ -143,6 +160,9 @@ void storage_health_set_busy(bool busy)
     pthread_mutex_lock(&g_health.lock);
     was_busy = g_health.busy;
     g_health.busy = busy;
+    if (busy) {
+        g_health.abort_refresh = true;
+    }
     if (was_busy && !busy) {
         g_health.refresh_requested = true;
         pthread_cond_signal(&g_health.wake);
@@ -155,6 +175,15 @@ void storage_health_request_refresh(void)
     if (!g_health.initialized) return;
     pthread_mutex_lock(&g_health.lock);
     g_health.refresh_requested = true;
+    pthread_cond_signal(&g_health.wake);
+    pthread_mutex_unlock(&g_health.lock);
+}
+
+void storage_health_abort_refresh(void)
+{
+    if (!g_health.initialized) return;
+    pthread_mutex_lock(&g_health.lock);
+    g_health.abort_refresh = true;
     pthread_cond_signal(&g_health.wake);
     pthread_mutex_unlock(&g_health.lock);
 }

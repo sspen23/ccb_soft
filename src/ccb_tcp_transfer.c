@@ -247,6 +247,56 @@ static void tcp_log_mm2s_state(const char *prefix,
                last_dmasr);
 }
 
+static void tcp_trace_descriptors(const char *event,
+                                  const TcpTransferConfig *cfg,
+                                  const MappedRegion *dma,
+                                  const DmaSgDesc *desc,
+                                  uint32_t desc_count)
+{
+    uint32_t i;
+
+    if (!tcp_env_flag_enabled("SRC_REAL_TCP_DESC_TRACE") || !cfg || !desc) {
+        return;
+    }
+    printf("tcp_desc_trace event=%s bytes=%" PRIu64 " dma=0x%08" PRIx64
+           " switch=0x%08" PRIx64 " input=%u ddr=0x%08" PRIx64
+           " desc_cpu=0x%08" PRIx64 " desc_dma=0x%08" PRIx64
+           " desc_count=%u dmacr=0x%08x dmasr=0x%08x curdesc=0x%08x"
+           " curdesc_msb=0x%08x taildesc=0x%08x taildesc_msb=0x%08x\n",
+           event ? event : "unknown",
+           cfg->transfer_bytes,
+           cfg->dma_base,
+           cfg->switch_base,
+           (unsigned)cfg->switch_input_select,
+           cfg->ddr_dma_base,
+           cfg->desc_cpu_base,
+           cfg->desc_dma_base,
+           (unsigned)desc_count,
+           dma ? mmio_read32(dma, TCP_MM2S_DMACR) : 0u,
+           dma ? mmio_read32(dma, TCP_MM2S_DMASR) : 0u,
+           dma ? mmio_read32(dma, TCP_MM2S_CURDESC) : 0u,
+           dma ? mmio_read32(dma, TCP_MM2S_CURDESC_MSB) : 0u,
+           dma ? mmio_read32(dma, TCP_MM2S_TAILDESC) : 0u,
+           dma ? mmio_read32(dma, TCP_MM2S_TAILDESC_MSB) : 0u);
+    for (i = 0u; i < desc_count; ++i) {
+        printf("tcp_desc_trace event=%s index=%u desc_cpu=0x%08" PRIx64
+               " desc_dma=0x%08" PRIx64 " next_desc=0x%08x"
+               " next_desc_msb=0x%08x buffer_addr=0x%08x buffer_addr_msb=0x%08x"
+               " control=0x%08x status=0x%08x\n",
+               event ? event : "unknown",
+               (unsigned)i,
+               cfg->desc_cpu_base + (uint64_t)i * sizeof(DmaSgDesc),
+               cfg->desc_dma_base + (uint64_t)i * sizeof(DmaSgDesc),
+               desc[i].next_desc,
+               desc[i].next_desc_msb,
+               desc[i].buffer_addr,
+               desc[i].buffer_addr_msb,
+               desc[i].control,
+               desc[i].status);
+    }
+    fflush(stdout);
+}
+
 static int tcp_open_regions(const TcpTransferConfig *cfg, int *fd_out, MappedRegion *dma, MappedRegion *sw, MappedRegion *desc)
 {
     int fd;
@@ -614,6 +664,8 @@ int tcp_transfer_send(const TcpTransferConfig *cfg)
         goto out;
     }
     desc_count = tcp_prepare_desc(cfg, &desc_region);
+    __sync_synchronize();
+    tcp_trace_descriptors("prepared", cfg, &dma, desc, desc_count);
     dbg_verbose_printf("[DBG][TCP] desc prepared bytes=%" PRIu64 " desc_count=%u"
                        " first_ctrl=0x%08x first_buf=0x%08x tail_desc=0x%08" PRIx64 "\n",
                        cfg->transfer_bytes,
@@ -673,6 +725,17 @@ int tcp_transfer_send(const TcpTransferConfig *cfg)
 
         status = desc[next_desc].status;
         if ((status & TCP_DESC_STS_CMPLT) != 0u) {
+            if (tcp_env_flag_enabled("SRC_REAL_TCP_DESC_TRACE")) {
+                printf("tcp_desc_trace event=descriptor_complete index=%u"
+                       " status=0x%08x dmasr=0x%08x curdesc=0x%08x"
+                       " taildesc=0x%08x\n",
+                       (unsigned)next_desc,
+                       status,
+                       mmio_read32(&dma, TCP_MM2S_DMASR),
+                       mmio_read32(&dma, TCP_MM2S_CURDESC),
+                       mmio_read32(&dma, TCP_MM2S_TAILDESC));
+                fflush(stdout);
+            }
             dbg_verbose_printf("[DBG][TCP] desc complete idx=%u status=0x%08x completed=%u/%u\n",
                                next_desc,
                                status,
@@ -723,6 +786,7 @@ int tcp_transfer_send(const TcpTransferConfig *cfg)
         }
     }
 
+    tcp_trace_descriptors("completed", cfg, &dma, desc, desc_count);
     printf("network_send_done bytes=%" PRIu64 " desc_count=%u ddr_dma=0x%08" PRIx64 "\n",
            cfg->transfer_bytes, desc_count, cfg->ddr_dma_base);
     rc = 0;

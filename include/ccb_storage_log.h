@@ -29,7 +29,10 @@ static inline StorageLogSeverity storage_log_effective_level(void)
 
 static inline bool storage_log_severity_enabled(StorageLogSeverity severity)
 {
-    return severity == STORAGE_LOG_ALWAYS_CRITICAL ||
+    const AppConfig *config = storage_config_get();
+
+    if (severity == STORAGE_LOG_ALWAYS_CRITICAL) return true;
+    return config && config->log_enabled &&
            storage_log_effective_level() >= severity;
 }
 

@@ -58,7 +58,7 @@
 | descriptor DMA 地址 | `0x10000000` |
 | descriptor 大小 | `0x4000` |
 | DDR CPU 窗口 | `0x10000000`, 64MiB |
-| DDR DMA/NVMe 视角 | `0x00000000`, 运行时1GiB |
+| DDR DMA/NVMe 视角 | `0x00000000`, 运行时2GiB |
 | 默认 DMA descriptor payload | 16MiB |
 
 ### ch1 HIGH_Q
@@ -72,7 +72,7 @@
 | descriptor DMA 地址 | `0x10000000` |
 | descriptor 大小 | `0x4000` |
 | DDR CPU 窗口 | `0xd0000000`, 64MiB |
-| DDR DMA/NVMe 视角 | `0x00000000`, 运行时1GiB |
+| DDR DMA/NVMe 视角 | `0x00000000`, 运行时2GiB |
 | 默认 DMA descriptor payload | 16MiB |
 
 ### ch2 LOW_SPEED/CALIB
@@ -543,24 +543,24 @@ storage worker 已停止 producer 且 writer 不再归还 BD 后执行，不改�
 写盘完成后才能归还 DMA”的约束。若 reset 失败但数据已经完整写入 NVMe，则保留
 metadata 和数据库文件记录，同时让任务和 ACK 保持失败。
 
-### 8.1 ch0/ch1 1GiB ring 生效条件
+### 8.1 ch0/ch1 2GiB ring 生效条件
 
 `storage-write` 对 ch0/ch1 默认使用 8MiB slot：
 
 ```text
-1073741824 bytes / 8388608 bytes = 128 slots
+2147483648 bytes / 8388608 bytes = 256 slots
 ```
 
-descriptor BRAM 为 0x4000，`DmaSgDesc=64`，最多 256 个 BD，因此
-128 BD 可以容纳。启动时 `storage_pipeline_config` 必须能看到：
+descriptor BRAM 为 0x4000，`DmaSgDesc=64`，正好容纳 256 个 BD。启动时
+`storage_pipeline_config` 必须能看到：
 
 ```text
-requested_ring_bytes=1073741824
-effective_ring_bytes=1073741824
+requested_ring_bytes=2147483648
+effective_ring_bytes=2147483648
 slot_bytes=8388608
-total_slots=128
+total_slots=256
 ring_clamp_reason=none
-dma_bd_count=128
+dma_bd_count=256
 ```
 
 如果请求值被压小、slot 不能整除 ring、或 BD 数超过 BRAM 容量，worker 会打印
