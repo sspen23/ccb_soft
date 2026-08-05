@@ -47,6 +47,7 @@ SRCS := \
 	src/storage_health.c \
 	src/storage_queue.c \
 	src/storage_process.c \
+	src/ssd_reset.c \
 	src/storage_stop.c \
 	src/storage_worker.c \
 	src/storage_writer.c \
@@ -81,9 +82,15 @@ storage-host-tests:
 	$(CC) $(CFLAGS) -Wformat=2 -Iinclude tests/mock_storage_health_test.c \
 		$(STORAGE_HEALTH_SRC) -lpthread -o /tmp/mock_storage_health_test
 	/tmp/mock_storage_health_test
+	$(CC) $(CFLAGS) -Wformat=2 -Iinclude tests/mock_ssd_reset_test.c \
+		src/ssd_reset.c -o /tmp/mock_ssd_reset_test
+	/tmp/mock_ssd_reset_test
 	$(CC) $(CFLAGS) -Wformat=2 -Iinclude tests/mock_storage_queue_test.c \
-		$(STORAGE_QUEUE_SRC) -o /tmp/mock_storage_queue_test
+		$(STORAGE_QUEUE_SRC) -lpthread -o /tmp/mock_storage_queue_test
 	/tmp/mock_storage_queue_test
+	$(CC) $(CFLAGS) -Wformat=2 -Iinclude tests/mock_storage_requeue_test.c \
+		$(STORAGE_QUEUE_SRC) -lpthread -o /tmp/mock_storage_requeue_test
+	/tmp/mock_storage_requeue_test
 	$(CC) $(CFLAGS) -Wformat=2 -Iinclude tests/mock_storage_worker_state_test.c \
 		$(STORAGE_WORKER_SRC) -o /tmp/mock_storage_worker_state_test
 	/tmp/mock_storage_worker_state_test
@@ -120,6 +127,7 @@ storage-host-tests:
 	$(CC) $(CFLAGS) -Wformat=2 -Iinclude tests/mock_storage_perf_test.c \
 		src/ccb_storage_perf.c src/ccb_storage_ipc.c $(STORAGE_CONFIG_SRC) $(STORAGE_ERROR_SRC) -o /tmp/mock_storage_perf_test
 	/tmp/mock_storage_perf_test
+	sh tests/storage_perf_summary_test.sh
 	$(CC) $(CFLAGS) -Wformat=2 -Iinclude tests/mock_storage_log_test.c $(STORAGE_CONFIG_SRC) \
 		-o /tmp/mock_storage_log_test
 	/tmp/mock_storage_log_test
@@ -139,6 +147,9 @@ storage-host-tests:
 	$(CC) $(CFLAGS) -Wformat=2 -ffunction-sections -fdata-sections -Iinclude \
 		tests/mock_nvme_legacy_submit_test.c src/ccb_hw.c src/debug_uart.c $(STORAGE_CONFIG_SRC) $(STORAGE_ERROR_SRC) -lpthread -Wl,--gc-sections -o /tmp/mock_nvme_legacy_submit_test
 	/tmp/mock_nvme_legacy_submit_test
+	$(CC) $(CFLAGS) -Wformat=2 -ffunction-sections -fdata-sections -Iinclude \
+		tests/mock_nvme_capability_test.c src/ccb_hw.c src/debug_uart.c $(STORAGE_CONFIG_SRC) $(STORAGE_ERROR_SRC) -Wl,--gc-sections -o /tmp/mock_nvme_capability_test
+	/tmp/mock_nvme_capability_test
 	$(CC) $(CFLAGS) -Wformat=2 -ffunction-sections -fdata-sections -Iinclude \
 		tests/mock_dma_harvest_batch_test.c src/ccb_hw.c $(STORAGE_CONFIG_SRC) -Wl,--gc-sections -o /tmp/mock_dma_harvest_batch_test
 	/tmp/mock_dma_harvest_batch_test

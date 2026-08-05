@@ -67,6 +67,12 @@ int main(void)
            STORAGE_FIRST_DMA_DEADLINE_DATA);
     assert(storage_first_dma_deadline_outcome(true, false, true, 0, 0u) ==
            STORAGE_FIRST_DMA_DEADLINE_WAIT);
+    assert(storage_dma_empty_frame_is_ignorable(0u, 0x8c000000u));
+    assert(!storage_dma_empty_frame_is_ignorable(1u, 0x8c000000u));
+    assert(!storage_dma_empty_frame_is_ignorable(0u, 0x88000000u));
+    assert(!storage_dma_empty_frame_is_ignorable(0u, 0x84000000u));
+    assert(!storage_dma_empty_frame_is_ignorable(0u, 0x9c000000u));
+    assert(!storage_dma_empty_frame_is_ignorable(0u, 0u));
     assert(storage_pipeline_init(&p, 2u) == 0);
     assert(storage_harvest_limit_for_remaining(8192u, 4096u, 4u) == 2u);
     assert(storage_harvest_limit_for_remaining(16384u, 4096u, 4u) == 4u);
@@ -74,6 +80,23 @@ int main(void)
     assert(storage_harvest_limit_for_remaining(1u, 4096u, 4u) == 1u);
     assert(storage_harvest_limit_for_remaining(UINT64_MAX, UINT32_MAX, 4u) == 4u);
     assert(storage_harvest_limit_for_remaining(0u, 4096u, 4u) == 0u);
+    assert(storage_dma_harvest_batch_limit(16u, 128u, 0u, 64u) == 16u);
+    assert(storage_dma_harvest_batch_limit(16u, 128u, 32u, 64u) == 32u);
+    assert(storage_dma_harvest_batch_limit(16u, 128u, 64u, 64u) == 64u);
+    assert(storage_dma_harvest_batch_limit(4u, 16u, 8u, 16u) == 16u);
+    assert(storage_dma_emergency_harvest(0u, 1u, 128u));
+    assert(storage_dma_emergency_harvest(64u, 64u, 128u));
+    assert(!storage_dma_emergency_harvest(64u, 16u, 128u));
+    assert(!storage_dma_producer_may_idle(1u, 0u));
+    assert(!storage_dma_producer_may_idle(0u, 1u));
+    assert(storage_dma_producer_may_idle(0u, 0u));
+    assert(storage_metrics_publish_due(1000u, 0u, false));
+    assert(!storage_metrics_publish_due(1001u, 51000u, false));
+    assert(storage_metrics_publish_due(51000u, 51000u, false));
+    assert(storage_metrics_publish_due(1001u, 51000u, true));
+    assert(storage_metrics_next_publish_us(1000u, 50000u) == 51000u);
+    assert(storage_metrics_next_publish_us(UINT64_MAX - 1u, 50000u) ==
+           UINT64_MAX);
     assert(storage_pipeline_mark_completed(&p, 0u) == 0);
     assert(storage_pipeline_mark_completed(&p, 1u) == 0);
     assert(storage_queue_push_batch(&p, a, 2u) == 0);

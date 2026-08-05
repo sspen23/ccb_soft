@@ -61,8 +61,25 @@ bool storage_ring_pressure_should_stop(uint32_t pressure_level,
                                        uint64_t now_us,
                                        uint64_t critical_duration_us,
                                        bool stop_enabled);
+bool storage_ring_pressure_requires_degraded_drain(uint32_t pressure_level,
+                                                   bool drain_requested);
+bool storage_receive_failure_allows_drain(bool safe_discard,
+                                          bool pressure_drain,
+                                          bool dma_error,
+                                          bool descriptor_error);
 StorageFirstDmaDeadlineOutcome storage_first_dma_deadline_outcome(
     bool deadline_due, bool saw_dma_data, bool stop_requested,
     int harvest_rc, uint32_t harvest_count);
+uint32_t storage_dma_harvest_batch_limit(uint32_t base_limit,
+                                         uint32_t total_slots,
+                                         uint32_t completed_unharvested,
+                                         uint32_t available_limit);
+bool storage_dma_emergency_harvest(uint32_t dma_writable,
+                                   uint32_t completed_unharvested,
+                                   uint32_t total_slots);
+bool storage_dma_producer_may_idle(uint32_t harvested,
+                                   uint32_t completed_unharvested);
+bool storage_dma_empty_frame_is_ignorable(uint32_t actual_bytes,
+                                          uint32_t descriptor_status);
 
 #endif

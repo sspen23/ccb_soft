@@ -64,3 +64,21 @@ StorageCrossSlotWriterDecision storage_cross_slot_writer_decide(
     if (producer_done) return STORAGE_CROSS_SLOT_WRITER_DRAINED;
     return STORAGE_CROSS_SLOT_WRITER_WAIT_FOR_QUEUE;
 }
+
+bool storage_metrics_publish_due(uint64_t now_us, uint64_t next_publish_us,
+                                 bool force)
+{
+    return force || next_publish_us == 0u || now_us >= next_publish_us;
+}
+
+uint64_t storage_metrics_next_publish_us(uint64_t now_us,
+                                         uint64_t interval_us)
+{
+    if (UINT64_MAX - now_us < interval_us) return UINT64_MAX;
+    return now_us + interval_us;
+}
+
+uint32_t storage_cross_slot_admission_limit(uint32_t available_contexts)
+{
+    return available_contexts < 4u ? available_contexts : 4u;
+}

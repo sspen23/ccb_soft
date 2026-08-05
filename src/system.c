@@ -19,7 +19,6 @@
 #include <sys/time.h>
 #include <sys/wait.h>
 #include <poll.h>
-#include <dirent.h>
 #ifdef __linux__
 #include <sys/mman.h>
 #endif
@@ -40,7 +39,6 @@
 #include "ccb_storage_perf.h"
 #include "ccb_storage_commit.h"
 #include "ccb_storage_log.h"
-#include "ccb_storage_sync_outbox.h"
 #include "ccb_tcp_transfer.h"
 #include "debug_uart.h"
 #include "storage_config.h"
@@ -75,8 +73,6 @@
 #ifndef STORAGE_META_DIR
 #define STORAGE_META_DIR "/run/ccb_nvme_process_test"
 #endif
-
-#define STORAGE_SYNC_OUTBOX_DIR_DEFAULT DB_STORAGE_DIR "/storage_sync_pending"
 
 /* ================== Configuration ================== */
 
@@ -181,12 +177,18 @@ static void poll_storage_events(Task *task);
 static void finalize_storage_task(Task *task, int exit_code);
 static void storage_try_send_pending_stops(void);
 static void storage_try_send_auto_drains(void);
+static void storage_service_idle_auto_drain(void);
 static void storage_finish_worker_exit(Task *task, int exit_code, int signal_number);
 static void storage_handle_worker_exit(Task *task, int status);
-static int storage_commit_supervised_results(const char *task_id);
+static int storage_commit_supervised_results(const char *task_id,
+                                             TaskStatus final_status);
+static int storage_post_commit_reset_dma(const char *task_id,
+                                         uint32_t target_mask);
+static bool storage_result_fully_drained(const WriteResult *result);
 static void storage_service_pending_stop(void);
 static void storage_service_pending_start(void);
 static void system_emit_line(StorageLogSeverity severity, const char *fmt, ...);
+static bool storage_any_live_worker(void);
 
 static void storage_supervisor_emit_aggregate(void)
 {
@@ -215,16 +217,62 @@ static void storage_supervisor_emit_aggregate(void)
             task_id = storage_tasks[i].task_id;
         }
     }
-    if (status == STORAGE_TASK_SUCCESS && storage_commit_supervised_results(task_id) != 0) {
-        storage_supervisor_protocol_fail(&g_storage_supervisor, NUM_CHANNELS,
-                                         g_storage_commit_state.reason);
-        status = STORAGE_TASK_FAILED;
-        capture_task_fail(&g_capture_task, STORAGE_ERR_COMMIT);
-    } else if (status == STORAGE_TASK_FAILED && task_id[0] != '\0') {
-        (void)task_update_status(task_id, TASK_FAILED);
-        capture_task_fail(&g_capture_task, STORAGE_ERR_WORKER_EXIT);
-    } else if (status == STORAGE_TASK_SUCCESS &&
-               g_capture_task.state == CAPTURE_COMMITTING) {
+    if ((g_storage_supervisor.target_channel_mask & 3u) == 3u &&
+        g_storage_supervisor.final_result[0].dma_received_bytes !=
+            g_storage_supervisor.final_result[1].dma_received_bytes) {
+        uint64_t ch0_bytes =
+            g_storage_supervisor.final_result[0].dma_received_bytes;
+        uint64_t ch1_bytes =
+            g_storage_supervisor.final_result[1].dma_received_bytes;
+        uint64_t difference_bytes = ch0_bytes >= ch1_bytes
+                                        ? ch0_bytes - ch1_bytes
+                                        : ch1_bytes - ch0_bytes;
+
+        system_emit_line(
+            STORAGE_LOG_ALWAYS_CRITICAL,
+            "storage_warning task=%s warning=split_channel_byte_mismatch"
+            " ch0_dma_bytes=%" PRIu64 " ch1_dma_bytes=%" PRIu64
+            " difference_bytes=%" PRIu64,
+            task_id, ch0_bytes, ch1_bytes, difference_bytes);
+    }
+    if (status == STORAGE_TASK_SUCCESS) {
+        if (storage_commit_supervised_results(task_id, TASK_COMPLETED) != 0) {
+            storage_supervisor_protocol_fail(&g_storage_supervisor, NUM_CHANNELS,
+                                             g_storage_commit_state.reason);
+            status = STORAGE_TASK_FAILED;
+            capture_task_fail(&g_capture_task, STORAGE_ERR_COMMIT);
+        }
+    } else if (task_id[0] != '\0') {
+        int partial_commit_rc = storage_commit_supervised_results(
+            task_id, TASK_FAILED);
+
+        if (partial_commit_rc > 0)
+            (void)task_update_status(task_id, TASK_FAILED);
+        else if (partial_commit_rc < 0)
+            LOG_ERROR("FILE_LIST",
+                      "Partial persisted file commit failed: task=%s reason=%s",
+                      task_id, g_storage_commit_state.reason);
+        capture_task_fail(
+            &g_capture_task,
+            g_storage_supervisor.primary_error != STORAGE_ERR_NONE
+                ? g_storage_supervisor.primary_error
+                : STORAGE_ERR_INTEGRITY);
+    }
+    if (g_storage_supervisor.target_channel_mask != 0u &&
+        storage_post_commit_reset_dma(
+            task_id, g_storage_supervisor.target_channel_mask) != 0) {
+        if (status == STORAGE_TASK_SUCCESS) {
+            storage_supervisor_protocol_fail(
+                &g_storage_supervisor, NUM_CHANNELS,
+                "post_commit_dma_reset_failed");
+            status = STORAGE_TASK_FAILED;
+            if (task_id[0] != '\0')
+                (void)task_update_status(task_id, TASK_FAILED);
+            capture_task_fail(&g_capture_task, STORAGE_ERR_DMA_STOP);
+        }
+    }
+    if (status == STORAGE_TASK_SUCCESS &&
+        g_capture_task.state == CAPTURE_COMMITTING) {
         (void)capture_task_transition(&g_capture_task, CAPTURE_COMMITTING,
                                       CAPTURE_DONE);
     }
@@ -315,6 +363,48 @@ static const char *get_flash_filelist_db_path(void)
 
 static int copy_file_path(const char *src_path, const char *dst_path);
 static int sync_metadata_files_to_flash(const char *flash_path);
+static int flash_parent_dir(const char *flash_path, char *out, size_t out_size);
+
+static int flash_fsync_file(const char *path)
+{
+    int fd;
+    int rc;
+    int saved_errno;
+
+    fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return -1;
+    rc = fsync(fd);
+    saved_errno = errno;
+    (void)close(fd);
+    if (rc != 0) {
+        errno = saved_errno;
+        return -1;
+    }
+    return 0;
+}
+
+static int flash_fsync_parent_dir(const char *path)
+{
+    char parent[PATH_MAX];
+    int fd;
+    int rc;
+    int saved_errno;
+
+    if (flash_parent_dir(path, parent, sizeof(parent)) != 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    fd = open(parent, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0) return -1;
+    rc = fsync(fd);
+    saved_errno = errno;
+    (void)close(fd);
+    if (rc != 0) {
+        errno = saved_errno;
+        return -1;
+    }
+    return 0;
+}
 
 static int flash_parent_dir(const char *flash_path, char *out, size_t out_size)
 {
@@ -495,6 +585,11 @@ static uint8_t sync_filelist_db_to_flash(void)
         (void)unlink(tmp_path);
         return ACK_FAILED;
     }
+    if (flash_fsync_file(tmp_path) != 0) {
+        LOG_ERROR("FILE_LIST", "Flash DB fsync failed: %s errno=%d", tmp_path, errno);
+        (void)unlink(tmp_path);
+        return ACK_FAILED;
+    }
     if (sync_metadata_files_to_flash(flash_path) != 0) {
         LOG_ERROR("FILE_LIST", "Flash metadata sync failed: %s", flash_path);
         (void)unlink(tmp_path);
@@ -508,56 +603,16 @@ static uint8_t sync_filelist_db_to_flash(void)
         (void)unlink(tmp_path);
         return ACK_FAILED;
     }
-    sync();
-
+    if (flash_fsync_file(flash_path) != 0 ||
+        flash_fsync_parent_dir(flash_path) != 0) {
+        LOG_ERROR("FILE_LIST", "Flash DB durable commit failed: %s errno=%d",
+                  flash_path, errno);
+        return ACK_FAILED;
+    }
     LOG_INFO("FILE_LIST", "Flash DB sync complete: %s", flash_path);
     dbg_printf("[DBG][FLASH] filelist DB synced runtime=%s flash=%s\n",
                FILELIST_DB_PATH, flash_path);
     return ACK_SUCCESS;
-}
-
-static const char *storage_sync_outbox_dir(void)
-{
-    const char *value = storage_config_compat_getenv("SRC_REAL_STORAGE_SYNC_OUTBOX_DIR");
-    return value && value[0] != '\0' ? value : STORAGE_SYNC_OUTBOX_DIR_DEFAULT;
-}
-
-static void storage_sync_outbox_retry(void)
-{
-    DIR *dir = opendir(storage_sync_outbox_dir());
-    struct dirent *entry;
-    bool pending = false;
-    if (!dir) return;
-    while ((entry = readdir(dir)) != NULL) {
-        size_t n = strlen(entry->d_name);
-        if (n > strlen(".pending") &&
-            strcmp(entry->d_name + n - strlen(".pending"), ".pending") == 0) {
-            pending = true;
-            break;
-        }
-    }
-    (void)closedir(dir);
-    if (!pending) return;
-    if (sync_filelist_db_to_flash() != ACK_SUCCESS) return;
-    dir = opendir(storage_sync_outbox_dir());
-    if (!dir) return;
-    while ((entry = readdir(dir)) != NULL) {
-        size_t n = strlen(entry->d_name);
-        if (n > strlen(".pending") &&
-            strcmp(entry->d_name + n - strlen(".pending"), ".pending") == 0) {
-            char task_id[64];
-            size_t task_length = n - strlen(".pending");
-
-            if (task_length >= sizeof(task_id)) continue;
-            memcpy(task_id, entry->d_name, task_length);
-            task_id[task_length] = '\0';
-            if (storage_sync_outbox_mark_complete(storage_sync_outbox_dir(), task_id) != 0) {
-                LOG_ERROR("STORAGE", "sync outbox marker removal failed task=%s errno=%d",
-                          task_id, errno);
-            }
-        }
-    }
-    (void)closedir(dir);
 }
 
 static int copy_file_path(const char *src_path, const char *dst_path)
@@ -611,6 +666,115 @@ out:
         close(src_fd);
     }
     return rc;
+}
+
+/* The SPI1 copy is the persisted source of truth at daemon startup.  Restore
+ * it before SQLite opens the runtime database, so SQLite never sees a file
+ * replaced underneath an active connection. */
+static int restore_filelist_db_from_flash(void)
+{
+    const char *flash_path = get_flash_filelist_db_path();
+    char tmp_path[PATH_MAX];
+    struct stat st;
+
+    if (!flash_storage_is_mounted(flash_path)) {
+        LOG_WARN("FILE_LIST", "Flash storage is not mounted; skip file-list restore: %s",
+                 flash_path);
+        return 0;
+    }
+    if (strcmp(flash_path, FILELIST_DB_PATH) == 0) {
+        return 0;
+    }
+    if (stat(flash_path, &st) != 0) {
+        if (errno == ENOENT) {
+            LOG_INFO("FILE_LIST", "No persisted file-list database on flash: %s", flash_path);
+            return 0;
+        }
+        LOG_ERROR("FILE_LIST", "Cannot stat persisted file-list database: %s errno=%d",
+                  flash_path, errno);
+        return -1;
+    }
+    if (!S_ISREG(st.st_mode) ||
+        snprintf(tmp_path, sizeof(tmp_path), "%s.restore.tmp", FILELIST_DB_PATH) >=
+            (int)sizeof(tmp_path)) {
+        LOG_ERROR("FILE_LIST", "Invalid persisted file-list database path: %s", flash_path);
+        return -1;
+    }
+
+    (void)unlink(tmp_path);
+    if (copy_file_path(flash_path, tmp_path) != 0 ||
+        rename(tmp_path, FILELIST_DB_PATH) != 0) {
+        LOG_ERROR("FILE_LIST", "File-list restore failed: %s -> %s errno=%d",
+                  flash_path, FILELIST_DB_PATH, errno);
+        (void)unlink(tmp_path);
+        return -1;
+    }
+
+    /* The flash backup is a standalone SQLite database.  Old local WAL files
+     * must not be replayed onto the restored database. */
+    if (snprintf(tmp_path, sizeof(tmp_path), "%s-wal", FILELIST_DB_PATH) <
+        (int)sizeof(tmp_path)) {
+        (void)unlink(tmp_path);
+    }
+    if (snprintf(tmp_path, sizeof(tmp_path), "%s-shm", FILELIST_DB_PATH) <
+        (int)sizeof(tmp_path)) {
+        (void)unlink(tmp_path);
+    }
+    LOG_INFO("FILE_LIST", "Restored file-list database from flash: %s", flash_path);
+    dbg_printf("[DBG][FLASH] filelist DB restored flash=%s runtime=%s\n",
+               flash_path, FILELIST_DB_PATH);
+    return 0;
+}
+
+static int restore_metadata_files_from_flash(void)
+{
+    const char *flash_path = get_flash_filelist_db_path();
+    char flash_dir[PATH_MAX];
+    size_t i;
+
+    if (!flash_storage_is_mounted(flash_path)) {
+        return 0;
+    }
+    if (flash_parent_dir(flash_path, flash_dir, sizeof(flash_dir)) != 0 ||
+        (mkdir(get_storage_meta_dir(), 0775) != 0 && errno != EEXIST)) {
+        LOG_ERROR("FILE_LIST", "Cannot prepare metadata restore directory: %s",
+                  get_storage_meta_dir());
+        return -1;
+    }
+
+    for (i = 0u; i < NUM_CHANNELS; ++i) {
+        char src_path[PATH_MAX];
+        char dst_path[PATH_MAX];
+        char tmp_path[PATH_MAX];
+        struct stat st;
+
+        if (build_metadata_path(src_path, sizeof(src_path), flash_dir, kChannels[i].id, "") != 0 ||
+            build_metadata_path(dst_path, sizeof(dst_path), get_storage_meta_dir(), kChannels[i].id, "") != 0 ||
+            build_metadata_path(tmp_path, sizeof(tmp_path), get_storage_meta_dir(), kChannels[i].id, ".restore.tmp") != 0) {
+            return -1;
+        }
+        if (stat(src_path, &st) != 0) {
+            if (errno == ENOENT) {
+                (void)unlink(dst_path);
+                continue;
+            }
+            LOG_ERROR("FILE_LIST", "Cannot stat persisted metadata: %s errno=%d",
+                      src_path, errno);
+            return -1;
+        }
+        if (!S_ISREG(st.st_mode)) {
+            LOG_ERROR("FILE_LIST", "Persisted metadata is not a regular file: %s", src_path);
+            return -1;
+        }
+        (void)unlink(tmp_path);
+        if (copy_file_path(src_path, tmp_path) != 0 || rename(tmp_path, dst_path) != 0) {
+            LOG_ERROR("FILE_LIST", "Metadata restore failed: %s -> %s errno=%d",
+                      src_path, dst_path, errno);
+            (void)unlink(tmp_path);
+            return -1;
+        }
+    }
+    return 0;
 }
 
 static int sync_metadata_files_to_flash(const char *flash_path)
@@ -896,7 +1060,9 @@ static void storage_try_send_pending_stops(void)
     size_t i;
 
     if (pending != 0u && g_capture_task.stop_epoch == 0u) {
-        uint64_t stop_epoch = storage_ipc_monotonic_us();
+        uint64_t stop_epoch = g_storage_supervisor.auto_drain_epoch != 0u
+                                  ? g_storage_supervisor.auto_drain_epoch
+                                  : storage_ipc_monotonic_us();
         if (stop_epoch == 0u) stop_epoch = 1u;
         (void)capture_task_request_stop(&g_capture_task, stop_epoch);
     }
@@ -973,7 +1139,9 @@ void start_task(Task *task, const char *prog, const char *arg)
 {
     if (task->state == RUNNING) {
         LOG_WARN(task->name, "%s task is busy", task->name);
-        printf("%s busy\n", task->name);
+        if (storage_log_severity_enabled(STORAGE_LOG_SUMMARY)) {
+            printf("%s busy\n", task->name);
+        }
         return;
     }
 
@@ -982,7 +1150,9 @@ void start_task(Task *task, const char *prog, const char *arg)
     task->state = RUNNING;
 
     LOG_INFO(task->name, "Task started: %s (PID=%d)", prog, task->pid);
-    printf("%s start pid=%d\n", task->name, task->pid);
+    if (storage_log_severity_enabled(STORAGE_LOG_SUMMARY)) {
+        printf("%s start pid=%d\n", task->name, task->pid);
+    }
 }
 
 void stop_task(Task *task)
@@ -992,7 +1162,9 @@ void stop_task(Task *task)
         task->state = IDLE;
         storage_task_close_fds(task);
         LOG_INFO(task->name, "Task stopped");
-        printf("%s stopped\n", task->name);
+        if (storage_log_severity_enabled(STORAGE_LOG_SUMMARY)) {
+            printf("%s stopped\n", task->name);
+        }
     }
 }
 
@@ -1023,7 +1195,9 @@ static void storage_finish_worker_exit(Task *task, int exit_code, int signal_num
     } else if (exit_code == 0) {
         task->state = IDLE;
         LOG_INFO(task->name, "Task finished successfully");
-        printf("%s finished OK\n", task->name);
+        if (storage_log_severity_enabled(STORAGE_LOG_SUMMARY)) {
+            printf("%s finished OK\n", task->name);
+        }
     } else {
         task->state = ERROR;
         LOG_ERROR(task->name, "Task failed with status %d", exit_code);
@@ -1557,30 +1731,80 @@ static int storage_commit_db_rollback(void *ctx)
     return file_db_rollback();
 }
 
-static int storage_commit_flash_sync(void *ctx)
+static int storage_post_commit_reset_dma(const char *task_id,
+                                         uint32_t target_mask)
 {
-    (void)ctx;
-    return sync_filelist_db_to_flash() == ACK_SUCCESS ? 0 : -1;
+    const AppConfig *config = storage_config_get();
+    GlobalOptions gopt;
+    uint32_t channel;
+    int failed = 0;
+
+    memset(&gopt, 0, sizeof(gopt));
+    gopt.timeout_us = config &&
+                              config->status_timeout_ms <= UINT32_MAX / 1000u
+                          ? config->status_timeout_ms * 1000u
+                          : DEFAULT_TIMEOUT_US;
+    for (channel = 0u; channel < NUM_CHANNELS; ++channel) {
+        const ChannelConfig *cfg;
+        ChannelRuntime rt;
+        int reset_rc;
+        int saved_errno;
+
+        if ((target_mask & (1u << channel)) == 0u) continue;
+        cfg = find_channel((int)channel);
+        if (!cfg) {
+            failed = -1;
+            system_emit_line(
+                STORAGE_LOG_ALWAYS_CRITICAL,
+                "storage_post_commit_dma_reset task=%s channel=%u"
+                " phase=after_filelist_commit result=failed reason=invalid_channel",
+                task_id && task_id[0] != '\0' ? task_id : "unknown",
+                channel);
+            continue;
+        }
+        memset(&rt, 0, sizeof(rt));
+        if (channel_runtime_open(&rt, cfg, gopt) != 0) {
+            failed = -1;
+            system_emit_line(
+                STORAGE_LOG_ALWAYS_CRITICAL,
+                "storage_post_commit_dma_reset task=%s channel=%u"
+                " phase=after_filelist_commit result=failed reason=runtime_open_failed",
+                task_id && task_id[0] != '\0' ? task_id : "unknown",
+                channel);
+            continue;
+        }
+        reset_rc = dma_reset_after_storage_task(&rt);
+        saved_errno = errno;
+        channel_runtime_close(&rt);
+        if (reset_rc != 0) {
+            failed = -1;
+            system_emit_line(
+                STORAGE_LOG_ALWAYS_CRITICAL,
+                "storage_post_commit_dma_reset task=%s channel=%u"
+                " phase=after_filelist_commit result=failed"
+                " reason=dma_reset_failed errno=%d",
+                task_id && task_id[0] != '\0' ? task_id : "unknown",
+                channel, saved_errno);
+            continue;
+        }
+        system_emit_line(
+            STORAGE_LOG_SUMMARY,
+            "storage_post_commit_dma_reset task=%s channel=%u"
+            " phase=after_filelist_commit result=success reason=reset_complete",
+            task_id && task_id[0] != '\0' ? task_id : "unknown",
+            channel);
+    }
+    return failed;
 }
 
-static int storage_commit_sync_mark_pending(void *ctx, const char *task_id)
-{
-    (void)ctx;
-    return storage_sync_outbox_mark_pending(storage_sync_outbox_dir(), task_id);
-}
-
-static int storage_commit_sync_mark_complete(void *ctx, const char *task_id)
-{
-    (void)ctx;
-    return storage_sync_outbox_mark_complete(storage_sync_outbox_dir(), task_id);
-}
-
-static int storage_commit_supervised_results(const char *task_id)
+static int storage_commit_supervised_results(const char *task_id,
+                                             TaskStatus final_status)
 {
     StorageCommitContext ctx;
     StorageCommitItem items[NUM_CHANNELS];
     StorageCommitOps ops;
     size_t count = 0u;
+    size_t expected_count = 0u;
     uint32_t channel;
 
     memset(&ctx, 0, sizeof(ctx));
@@ -1593,9 +1817,12 @@ static int storage_commit_supervised_results(const char *task_id)
         StorageCommitItem *item;
 
         if ((g_storage_supervisor.target_channel_mask & (1u << channel)) == 0u) continue;
+        ++expected_count;
         task = &storage_tasks[channel];
         planned = &task->planned_file;
         result = &g_storage_supervisor.final_result[channel];
+        if (!storage_result_fully_drained(result) || result->file_bytes == 0u)
+            continue;
         if (!task->has_planned_file || planned->channel_id != (int)channel ||
             result->channel_id != (int)channel || result->metadata_slot >= MAX_FILES_TOTAL ||
             result->file_index > UINT16_MAX || result->sector_count > UINT32_MAX ||
@@ -1637,6 +1864,16 @@ static int storage_commit_supervised_results(const char *task_id)
                  task_id, item->record.file_type, (unsigned)result->file_index);
     }
 
+    if (final_status == TASK_COMPLETED && count != expected_count) {
+        snprintf(g_storage_commit_state.reason,
+                 sizeof(g_storage_commit_state.reason), "%s",
+                 "complete_result_missing_drained_channel");
+        g_storage_commit_state.attempted = true;
+        g_storage_commit_state.success = false;
+        (void)task_update_status(task_id, TASK_FAILED);
+        return -1;
+    }
+    if (count == 0u) return 1;
     ops.ctx = &ctx;
     ops.db_begin = storage_commit_db_begin;
     ops.record_exists = storage_commit_record_exists;
@@ -1648,10 +1885,8 @@ static int storage_commit_supervised_results(const char *task_id)
     ops.task_status_update = storage_commit_status_update;
     ops.db_commit = storage_commit_db_commit;
     ops.db_rollback = storage_commit_db_rollback;
-    ops.flash_sync = storage_commit_flash_sync;
-    ops.sync_mark_pending = storage_commit_sync_mark_pending;
-    ops.sync_mark_complete = storage_commit_sync_mark_complete;
-    return storage_commit_run_once(&g_storage_commit_state, task_id, items, count, &ops);
+    return storage_commit_run_once_status(&g_storage_commit_state, task_id,
+                                          items, count, final_status, &ops);
 }
 
 static void append_task_output(Task *task, const char *buf, size_t len)
@@ -1678,14 +1913,38 @@ static void append_task_output(Task *task, const char *buf, size_t len)
     task->output[task->output_used] = '\0';
 }
 
+static bool system_line_is_failure(const char *line)
+{
+    if (!line) {
+        return false;
+    }
+    return strstr(line, "failed") != NULL ||
+           strstr(line, "failure") != NULL ||
+           strstr(line, "error") != NULL ||
+           strstr(line, "ERROR") != NULL ||
+           strstr(line, "[ERR]") != NULL ||
+           strstr(line, "fatal") != NULL ||
+           strstr(line, "timeout") != NULL ||
+           strstr(line, "unresolved") != NULL ||
+           strstr(line, "integrity_ok=0") != NULL ||
+           strstr(line, "storage_invalid_") != NULL ||
+           strstr(line, "dma_requeue_") != NULL ||
+           strstr(line, "reason=dma_error") != NULL;
+}
+
 static void system_emit_line(StorageLogSeverity severity, const char *fmt, ...)
 {
     char line[1024];
     va_list ap;
     int n;
     size_t len;
+    bool enabled;
 
-    if (!fmt || !storage_log_severity_enabled(severity)) {
+    if (!fmt) {
+        return;
+    }
+    enabled = storage_log_severity_enabled(severity);
+    if (!enabled && severity != STORAGE_LOG_ALWAYS_CRITICAL) {
         return;
     }
     va_start(ap, fmt);
@@ -1702,6 +1961,15 @@ static void system_emit_line(StorageLogSeverity severity, const char *fmt, ...)
         line[len++] = '\n';
     }
     line[len] = '\0';
+    if (!enabled && severity != STORAGE_LOG_ALWAYS_CRITICAL &&
+        !system_line_is_failure(line)) {
+        return;
+    }
+    if ((severity == STORAGE_LOG_ALWAYS_CRITICAL ||
+         system_line_is_failure(line)) &&
+        !isatty(STDOUT_FILENO)) {
+        debug_uart_write(line, len);
+    }
     {
         ssize_t written = write(STDOUT_FILENO, line, len);
         (void)written;
@@ -1723,6 +1991,12 @@ static void system_write_stdout_line(const char *line)
         written = write(STDOUT_FILENO, "\n", 1u);
         (void)written;
     }
+    if (system_line_is_failure(line) && !isatty(STDOUT_FILENO)) {
+        debug_uart_write(line, len);
+        if (len == 0u || line[len - 1u] != '\n') {
+            debug_uart_write("\n", 1u);
+        }
+    }
 }
 
 /* Worker stdout is line-oriented and has no severity field.  The worker has
@@ -1739,12 +2013,9 @@ static bool worker_output_is_quiet_critical(const char *text)
     if (config && config->log_level != CCB_LOG_ERROR) {
         return true;
     }
-    return strstr(text, "storage_ddr_full") != NULL ||
-           strstr(text, "storage_receive_failed") != NULL ||
-           strstr(text, "storage_first_dma_timeout") != NULL ||
-           strstr(text, "storage_ring_config_error") != NULL ||
-           strstr(text, "dma_bd_exhausted") != NULL ||
-           (strstr(text, "storage_result") != NULL && strstr(text, "status=failed") != NULL);
+    return system_line_is_failure(text) ||
+           strstr(text, "storage_ddr_full") != NULL ||
+           strstr(text, "dma_bd_exhausted") != NULL;
 }
 
 static void echo_worker_line(Task *task, const char *line)
@@ -1829,18 +2100,23 @@ static void drain_storage_events(Task *task, bool report_eof)
             task->first_fatal = protocol_fatal;
             continue;
         }
-        if (storage_supervisor_auto_drain_ready(&g_storage_supervisor)) {
+        if (event.type == STORAGE_WORKER_DRAIN_REQUEST &&
+            !g_storage_supervisor.auto_drain_triggered) {
             uint64_t drain_epoch = storage_ipc_monotonic_us();
 
             if (drain_epoch == 0u) drain_epoch = 1u;
-            if (storage_supervisor_begin_auto_drain(&g_storage_supervisor,
-                                                    drain_epoch)) {
+            if (storage_supervisor_begin_forced_drain(
+                    &g_storage_supervisor, drain_epoch)) {
                 system_emit_line(
-                    STORAGE_LOG_SUMMARY,
-                    "storage_input_complete task=%s drain_epoch=%" PRIu64
-                    " target_mask=0x%02X",
+                    STORAGE_LOG_ALWAYS_CRITICAL,
+                    "storage_pressure_drain_start task=%s drain_epoch=%" PRIu64
+                    " target_mask=0x%02X reason=%s trigger_channel=%u",
                     task->task_id, drain_epoch,
-                    g_storage_supervisor.target_channel_mask);
+                    g_storage_supervisor.target_channel_mask,
+                    event.payload.ready.reason[0] != '\0'
+                        ? event.payload.ready.reason
+                        : "storage_pressure_no_upstream_backpressure",
+                    event.channel);
                 storage_try_send_auto_drains();
             }
         }
@@ -1943,8 +2219,49 @@ static void drain_storage_events(Task *task, bool report_eof)
 static void poll_storage_events(Task *task)
 {
     drain_storage_events(task, true);
-    storage_try_send_pending_stops();
     storage_supervisor_emit_aggregate();
+}
+
+static void storage_service_idle_auto_drain(void)
+{
+    const AppConfig *config = storage_config_get();
+    size_t channel;
+    uint64_t now_us;
+    uint64_t stable_us;
+    uint64_t drain_epoch;
+
+    if (!config || !config->auto_input_complete ||
+        g_capture_task.state != CAPTURE_RUNNING)
+        return;
+    now_us = storage_ipc_monotonic_us();
+    stable_us = (uint64_t)config->idle_required_ms * 1000u;
+    if (!storage_supervisor_auto_drain_ready(&g_storage_supervisor,
+                                             now_us, stable_us))
+        return;
+    /* Close the gap between the periodic per-task poll and the irreversible
+     * AUTO_DRAIN command.  A queued INPUT_ACTIVE revocation gets one final
+     * chance to cancel the all-idle barrier before DMA quiesce is committed. */
+    for (channel = 0u; channel < STORAGE_TASK_COUNT; ++channel) {
+        if ((g_storage_supervisor.target_channel_mask & (1u << channel)) != 0u)
+            drain_storage_events(&storage_tasks[channel], false);
+    }
+    now_us = storage_ipc_monotonic_us();
+    if (!storage_supervisor_auto_drain_ready(&g_storage_supervisor,
+                                             now_us, stable_us))
+        return;
+    drain_epoch = now_us != 0u ? now_us : 1u;
+    if (!storage_supervisor_begin_auto_drain(&g_storage_supervisor,
+                                             drain_epoch, now_us,
+                                             stable_us))
+        return;
+    system_emit_line(
+        STORAGE_LOG_SUMMARY,
+        "storage_input_complete task=%s drain_epoch=%" PRIu64
+        " target_mask=0x%02X stable_ms=%u",
+        g_capture_task.task_id, drain_epoch,
+        g_storage_supervisor.target_channel_mask,
+        config->idle_required_ms);
+    storage_try_send_auto_drains();
 }
 
 static int start_storage_worker(const PlannedFile *planned, const char *task_id, time_t overpass_time)
@@ -2773,6 +3090,87 @@ static void network_pipeline_set_error(NetworkPipelineCtx *ctx, int rc)
     pthread_mutex_unlock(&ctx->lock);
 }
 
+static int network_read_ssd_chunk(ChannelRuntime *rt,
+                                  const ChannelConfig *cfg,
+                                  uint64_t start_lba,
+                                  uint64_t read_bytes,
+                                  uint64_t ddr_hw,
+                                  uint32_t send_chunk_index)
+{
+    uint64_t remaining_bytes = read_bytes;
+    uint64_t cur_lba = start_lba;
+    uint64_t ddr_offset = 0u;
+    uint64_t read_chunk_bytes = TCP_MAX_BYTES_PER_DESC;
+    uint32_t read_index = 0u;
+
+    if (!rt || !cfg || read_bytes == 0u || (read_bytes % SECTOR_SIZE) != 0u) {
+        return -1;
+    }
+    if (cfg->id == HIGH_I_CHANNEL_ID || cfg->id == HIGH_Q_CHANNEL_ID) {
+        read_chunk_bytes = SSD_READ_BYTES_PER_CHUNK_HIGH;
+    }
+
+    while (remaining_bytes > 0u) {
+        uint64_t this_bytes = remaining_bytes > read_chunk_bytes
+                                  ? read_chunk_bytes : remaining_bytes;
+        uint64_t this_sectors = bytes_to_sectors(this_bytes);
+        int read_rc;
+
+        if (this_sectors == 0u || this_sectors > UINT32_MAX ||
+            ddr_offset > UINT64_MAX - ddr_hw) {
+            return -1;
+        }
+        if (env_flag_enabled("SRC_REAL_NETWORK_ADDR_TRACE")) {
+            printf("network_addr_trace event=ssd_read_part channel=%d send_chunk=%u"
+                   " read_part=%u slba=0x%08" PRIx64 " sectors=%" PRIu64
+                   " bytes=%" PRIu64 " ddr=0x%08" PRIx64
+                   " next_slba=0x%08" PRIx64 " next_ddr=0x%08" PRIx64 "\n",
+                   cfg->id,
+                   (unsigned)send_chunk_index,
+                   (unsigned)read_index,
+                   cur_lba,
+                   this_sectors,
+                   this_bytes,
+                   ddr_hw + ddr_offset,
+                   cur_lba + this_sectors,
+                   ddr_hw + ddr_offset + this_bytes);
+            fflush(stdout);
+        }
+        dbg_printf("[DBG][NET] ssd read chunk=%u part=%u lba=0x%08" PRIx64
+                   " ddr=0x%08" PRIx64 " bytes=%" PRIu64 " sectors=%" PRIu64 "\n",
+                   (unsigned)send_chunk_index,
+                   (unsigned)read_index,
+                   cur_lba,
+                   ddr_hw + ddr_offset,
+                   this_bytes,
+                   this_sectors);
+        read_rc = nvme_rw(rt, false, cur_lba, this_sectors, ddr_hw + ddr_offset);
+        if (read_rc != 0) {
+            return read_rc;
+        }
+        cur_lba += this_sectors;
+        ddr_offset += this_bytes;
+        remaining_bytes -= this_bytes;
+        ++read_index;
+    }
+    if (env_flag_enabled("SRC_REAL_NETWORK_ADDR_TRACE")) {
+        printf("network_addr_trace event=ssd_read_group_complete channel=%d send_chunk=%u"
+               " start_slba=0x%08" PRIx64 " end_slba=0x%08" PRIx64
+               " ddr_start=0x%08" PRIx64 " ddr_end=0x%08" PRIx64
+               " bytes=%" PRIu64 " parts=%u\n",
+               cfg->id,
+               (unsigned)send_chunk_index,
+               start_lba,
+               cur_lba,
+               ddr_hw,
+               ddr_hw + read_bytes,
+               read_bytes,
+               (unsigned)read_index);
+        fflush(stdout);
+    }
+    return 0;
+}
+
 static void *network_read_thread(void *arg)
 {
     NetworkPipelineCtx *ctx = (NetworkPipelineCtx *)arg;
@@ -2788,7 +3186,8 @@ static void *network_read_thread(void *arg)
         uint64_t send_bytes = chunk_bytes;
         uint64_t file_offset = (uint64_t)chunk_index * ctx->max_payload_bytes;
         uint64_t sectors_before = file_offset / (uint64_t)SECTOR_SIZE;
-        uint64_t read_cmd_sectors = ctx->read_cmd_sectors ? ctx->read_cmd_sectors : 512u;
+        uint64_t read_cmd_sectors = ctx->read_cmd_sectors ? ctx->read_cmd_sectors :
+                                                   nvme_read_command_sectors(ctx->rt);
         uint64_t cmd_first = sectors_before / read_cmd_sectors;
         uint64_t cmd_count = (read_sectors + read_cmd_sectors - 1u) / read_cmd_sectors;
         uint64_t cmd_last = cmd_first + (cmd_count ? cmd_count - 1u : 0u);
@@ -2895,7 +3294,8 @@ static void *network_read_thread(void *arg)
         }
 #endif
 
-        read_rc = nvme_rw(ctx->rt, false, cur_lba, read_sectors, network_ddr_hw);
+        read_rc = network_read_ssd_chunk(ctx->rt, ctx->cfg, cur_lba, read_bytes,
+                                          network_ddr_hw, chunk_index);
         if (read_rc == -2) {
             dbg_printf("[DBG][NET] nvme read stopped task=%s idx=%u chunk=%u lba=0x%08" PRIx64 "\n",
                        ctx->task_no,
@@ -2983,6 +3383,18 @@ static void *network_send_thread(void *arg)
             return NULL;
         }
         tcp_cfg.ddr_dma_base = slot_copy.ddr_hw;
+        if (env_flag_enabled("SRC_REAL_NETWORK_ADDR_TRACE")) {
+            printf("network_addr_trace event=tcp_send channel=%d send_chunk=%u"
+                   " ddr=0x%08" PRIx64 " bytes=%" PRIu64
+                   " desc_cpu=0x%08" PRIx64 " desc_dma=0x%08" PRIx64 "\n",
+                   ctx->cfg->id,
+                   (unsigned)slot_copy.chunk_index,
+                   tcp_cfg.ddr_dma_base,
+                   tcp_cfg.transfer_bytes,
+                   tcp_cfg.desc_cpu_base,
+                   tcp_cfg.desc_dma_base);
+            fflush(stdout);
+        }
         chunk_start_us = system_wall_time_us();
         dbg_verbose_printf("[DBG][NET] tcp route chunk=%u slot=%u ch=%d dma=0x%08" PRIx64
                            " switch=0x%08" PRIx64 " input=%u desc_cpu=0x%08" PRIx64
@@ -3074,7 +3486,7 @@ static int network_send_serial(const ParsedArgs *args,
     }
     remaining_bytes = rec->file_size;
     cur_lba = (uint64_t)rec->start_sector;
-    read_cmd_sectors = rt->nvme_cmd_sectors ? rt->nvme_cmd_sectors : 512u;
+    read_cmd_sectors = nvme_read_command_sectors(rt);
     total_chunks = (uint32_t)((rec->file_size + max_payload_bytes - 1u) / max_payload_bytes);
 
     while (remaining_bytes > 0u) {
@@ -3204,7 +3616,8 @@ static int network_send_serial(const ParsedArgs *args,
         }
 #endif
 
-        read_rc = nvme_rw(rt, false, cur_lba, read_sectors, network_ddr_hw);
+        read_rc = network_read_ssd_chunk(rt, cfg, cur_lba, read_bytes,
+                                         network_ddr_hw, chunk_index);
         if (read_rc == -2) {
             dbg_printf("[DBG][NET] nvme read stopped task=%s idx=%u chunk=%u lba=0x%08" PRIx64 "\n",
                        args->task_no,
@@ -3240,6 +3653,18 @@ static int network_send_serial(const ParsedArgs *args,
             break;
         }
         tcp_cfg.ddr_dma_base = network_ddr_hw;
+        if (env_flag_enabled("SRC_REAL_NETWORK_ADDR_TRACE")) {
+            printf("network_addr_trace event=tcp_send channel=%d send_chunk=%u"
+                   " ddr=0x%08" PRIx64 " bytes=%" PRIu64
+                   " desc_cpu=0x%08" PRIx64 " desc_dma=0x%08" PRIx64 "\n",
+                   cfg->id,
+                   (unsigned)chunk_index,
+                   tcp_cfg.ddr_dma_base,
+                   tcp_cfg.transfer_bytes,
+                   tcp_cfg.desc_cpu_base,
+                   tcp_cfg.desc_dma_base);
+            fflush(stdout);
+        }
 
         send_rc = tcp_transfer_send(&tcp_cfg);
         if (send_rc == -2) {
@@ -3300,6 +3725,155 @@ static int network_send_serial(const ParsedArgs *args,
     return rc;
 }
 
+static int network_diag_read(ChannelRuntime *rt,
+                             const ChannelConfig *cfg,
+                             uint64_t lba,
+                             uint64_t ddr_hw,
+                             uint64_t bytes,
+                             const char *label)
+{
+    uint64_t sectors = bytes_to_sectors(bytes);
+
+    if (!rt || !cfg || bytes == 0u || (bytes % SECTOR_SIZE) != 0u ||
+        !nvme_lba_range_valid(rt, lba, sectors)) {
+        return -1;
+    }
+    printf("network_diag event=read label=%s channel=%d slba=0x%08" PRIx64
+           " sectors=%" PRIu64 " bytes=%" PRIu64 " ddr=0x%08" PRIx64 "\n",
+           label ? label : "unknown",
+           cfg->id,
+           lba,
+           sectors,
+           bytes,
+           ddr_hw);
+    fflush(stdout);
+    return nvme_rw(rt, false, lba, sectors, ddr_hw);
+}
+
+static int network_diag_send(const ChannelConfig *cfg,
+                             GlobalOptions gopt,
+                             uint64_t ddr_hw,
+                             uint64_t bytes,
+                             const char *label)
+{
+    TcpTransferConfig tcp_cfg;
+
+    if (!cfg || bytes == 0u || bytes > TCP_MAX_BYTES_PER_DESC) {
+        return -1;
+    }
+    tcp_transfer_default_config(&tcp_cfg, bytes, gopt);
+    if (configure_tcp_for_channel(cfg, &tcp_cfg) != 0) {
+        return -1;
+    }
+    tcp_cfg.ddr_dma_base = ddr_hw;
+    printf("network_diag event=send label=%s channel=%d ddr=0x%08" PRIx64
+           " bytes=%" PRIu64 " desc_cpu=0x%08" PRIx64 " desc_dma=0x%08" PRIx64 "\n",
+           label ? label : "unknown",
+           cfg->id,
+           ddr_hw,
+           bytes,
+           tcp_cfg.desc_cpu_base,
+           tcp_cfg.desc_dma_base);
+    fflush(stdout);
+    return tcp_transfer_send(&tcp_cfg);
+}
+
+/*
+ * Controlled read/send experiments.  All addresses are hardware-view DDR
+ * addresses; this path never maps or inspects the DDR payload from the CPU.
+ * Return 1 when no diagnostic mode is requested, 0 on a completed test, and
+ * a negative value on failure.
+ */
+static int network_run_download_diagnostic(const FileRecord *rec,
+                                           const ChannelConfig *cfg,
+                                           ChannelRuntime *rt,
+                                           GlobalOptions gopt)
+{
+    const char *mode = storage_config_compat_getenv("SRC_REAL_NETWORK_DIAG_MODE");
+    const uint64_t read_bytes = SSD_READ_BYTES_PER_CHUNK_HIGH;
+    const uint64_t send_bytes = TCP_MAX_BYTES_PER_DESC;
+    const uint64_t read_sectors = read_bytes / SECTOR_SIZE;
+    const uint64_t send_sectors = send_bytes / SECTOR_SIZE;
+    const uint64_t ddr_base = cfg ? cfg->ddr_hw_base + NETWORK_DDR_OFFSET_BYTES : 0u;
+    int rc;
+
+    if (!mode || mode[0] == '\0') {
+        return 1;
+    }
+    if (!rec || !cfg || !rt || rec->file_size < read_bytes ||
+        ddr_base > UINT64_MAX - send_bytes) {
+        return -1;
+    }
+    printf("network_diag event=start mode=%s channel=%d base_lba=0x%08" PRIx64
+           " ddr=0x%08" PRIx64 " read_bytes=%" PRIu64 " send_bytes=%" PRIu64 "\n",
+           mode,
+           cfg->id,
+           (uint64_t)rec->start_sector,
+           ddr_base,
+           read_bytes,
+           send_bytes);
+    fflush(stdout);
+
+    if (strcmp(mode, "A") == 0) {
+        if (rec->file_size < send_bytes ||
+            !nvme_lba_range_valid(rt, (uint64_t)rec->start_sector, send_sectors)) {
+            return -1;
+        }
+        rc = network_diag_read(rt, cfg, (uint64_t)rec->start_sector,
+                               ddr_base, send_bytes, "A_read_16m");
+        if (rc != 0) return rc;
+        rc = network_diag_send(cfg, gopt, ddr_base, send_bytes, "A_send_16m");
+        if (rc != 0) return rc;
+        rc = network_diag_send(cfg, gopt, ddr_base, read_bytes, "A_send_first_8m");
+        if (rc != 0) return rc;
+        return network_diag_send(cfg, gopt, ddr_base + read_bytes,
+                                 read_bytes, "A_send_second_8m");
+    }
+    if (strcmp(mode, "B") == 0) {
+        rc = network_diag_read(rt, cfg, (uint64_t)rec->start_sector,
+                               ddr_base, read_bytes, "B_read_a");
+        if (rc != 0) return rc;
+        rc = network_diag_read(rt, cfg, (uint64_t)rec->start_sector,
+                               ddr_base + read_bytes, read_bytes, "B_read_b_same_lba");
+        if (rc != 0) return rc;
+        rc = network_diag_send(cfg, gopt, ddr_base, read_bytes, "B_send_a");
+        if (rc != 0) return rc;
+        return network_diag_send(cfg, gopt, ddr_base + read_bytes,
+                                 read_bytes, "B_send_b");
+    }
+    if (strcmp(mode, "C") == 0) {
+        if (rec->file_size < send_bytes ||
+            !nvme_lba_range_valid(rt, (uint64_t)rec->start_sector + read_sectors,
+                                  read_sectors)) {
+            return -1;
+        }
+        rc = network_diag_read(rt, cfg, (uint64_t)rec->start_sector,
+                               ddr_base, read_bytes, "C_read_a");
+        if (rc != 0) return rc;
+        rc = network_diag_send(cfg, gopt, ddr_base, read_bytes, "C_send_a");
+        if (rc != 0) return rc;
+        rc = network_diag_read(rt, cfg, (uint64_t)rec->start_sector + read_sectors,
+                               ddr_base, read_bytes, "C_read_b_same_ddr");
+        if (rc != 0) return rc;
+        return network_diag_send(cfg, gopt, ddr_base, read_bytes, "C_send_b");
+    }
+    if (strcmp(mode, "D") == 0) {
+        if (rec->file_size < send_bytes ||
+            !nvme_lba_range_valid(rt, (uint64_t)rec->start_sector, send_sectors)) {
+            return -1;
+        }
+        printf("network_diag event=mode_d note=nvme_reads_match_write_command_size\n");
+        fflush(stdout);
+        rc = network_diag_read(rt, cfg, (uint64_t)rec->start_sector,
+                               ddr_base, send_bytes, "D_read_16m");
+        if (rc != 0) return rc;
+        return network_diag_send(cfg, gopt, ddr_base, send_bytes, "D_send_16m");
+    }
+
+    fprintf(stderr, "Unsupported SRC_REAL_NETWORK_DIAG_MODE=%s; use A, B, C, or D\n", mode);
+    return -1;
+}
+
 static int network_send_existing_file(const ParsedArgs *args, GlobalOptions gopt)
 {
     FileRecord rec;
@@ -3315,6 +3889,7 @@ static int network_send_existing_file(const ParsedArgs *args, GlobalOptions gopt
     uint32_t requested_pipeline_slots;
     uint32_t available_pipeline_slots;
     uint32_t chunk_index = 0u;
+    int diagnostic_rc;
     int rc = -1;
 
     if (!args || !args->has_task_no || !args->has_file_index || !args->has_proto_file_type) {
@@ -3384,16 +3959,15 @@ static int network_send_existing_file(const ParsedArgs *args, GlobalOptions gopt
         return -1;
     }
     /*
-     * Keep one TCP MM2S transaction equal to one source frame.  The downstream
-     * TCP path sees TLAST from the DMA EOF bit, so batching multiple 16 MiB
-     * frames into one 64 MiB DMA transaction would only produce one TLAST.
+     * Keep one TCP MM2S transaction equal to one 16 MiB download packet.  On
+     * ch0/ch1 the packet is filled by two 8 MiB SSD reads before it is sent.
      */
     max_payload_bytes = TCP_MAX_BYTES_PER_DESC;
     /*
-     * The download pipeline only needs a few low-address DDR slots for
-     * double/triple buffering.  Keep the default window inside the CPU-visible
-     * DDR aperture because ch2 high DDR addresses have shown wrap/repeat-like
-     * behavior in the TCP/NVMe download path.
+     * The download pipeline only needs a few low-address hardware DDR slots
+     * for double/triple buffering.  ddr_cpu_size is historical configuration
+     * metadata used here as the default low-address window; the data DDR is
+     * not CPU-accessible on this platform.
      */
     network_ring_bytes = cfg->ddr_cpu_size;
     if (network_ring_bytes == 0u || network_ring_bytes > cfg->dma_ring_bytes) {
@@ -3449,6 +4023,11 @@ static int network_send_existing_file(const ParsedArgs *args, GlobalOptions gopt
     if (rt.nvme_max_lba == 0u) {
         fprintf(stderr, "NVMe capacity unavailable before network send: channel=%d\n", cfg->id);
         dbg_printf("[DBG][NET] nvme max_lba unavailable ch=%d, refuse network send\n", cfg->id);
+        goto out;
+    }
+    diagnostic_rc = network_run_download_diagnostic(&rec, cfg, &rt, gopt);
+    if (diagnostic_rc != 1) {
+        rc = diagnostic_rc;
         goto out;
     }
 
@@ -3516,7 +4095,7 @@ static int network_send_existing_file(const ParsedArgs *args, GlobalOptions gopt
         pipe_ctx.network_ring_bytes = network_ring_bytes;
         pipe_ctx.total_file_bytes = total_file_bytes;
         pipe_ctx.start_lba = cur_lba;
-        pipe_ctx.read_cmd_sectors = rt.nvme_cmd_sectors ? rt.nvme_cmd_sectors : 512u;
+        pipe_ctx.read_cmd_sectors = nvme_read_command_sectors(&rt);
         pipe_ctx.proto_file_type = (uint32_t)rec.proto_file_type_code;
 #ifdef CCB_BUILD_DIAG
         pipe_ctx.verify_ddr_read = env_flag_enabled("SRC_REAL_NETWORK_VERIFY_DDR_READ");
@@ -4100,6 +4679,8 @@ static StorageErrorCode probe_one_storage_channel(
 {
     const ChannelConfig *cfg = find_channel((int)channel);
     const AppConfig *config = storage_config_get();
+    const ChannelStorageConfig *storage =
+        storage_config_channel(config, channel);
     GlobalOptions gopt;
     ChannelRuntime rt;
 
@@ -4107,6 +4688,7 @@ static StorageErrorCode probe_one_storage_channel(
     if (!snapshot) return STORAGE_ERR_INTERNAL;
     memset(snapshot, 0, sizeof(*snapshot));
     snapshot->channel = channel;
+    snapshot->requested_command_bytes = storage ? storage->command_bytes : 0u;
     memset(&gopt, 0, sizeof(gopt));
     gopt.timeout_us = config && config->status_timeout_ms <= UINT32_MAX / 1000u
                            ? config->status_timeout_ms * 1000u
@@ -4123,6 +4705,12 @@ static StorageErrorCode probe_one_storage_channel(
         return STORAGE_ERR_NVME_PROBE;
     }
     snapshot->nvme_ready = true;
+    snapshot->logical_block_bytes = rt.nvme_block_size;
+    snapshot->max_transfer_raw = rt.nvme_max_dts_raw;
+    snapshot->max_transfer_blocks = rt.nvme_max_dts_blocks;
+    snapshot->max_transfer_bytes = rt.nvme_max_dts_bytes;
+    snapshot->effective_command_bytes = rt.nvme_cmd_size_bytes;
+    snapshot->nvme_qd = rt.nvme_qd_effective;
 
     if (rt.nvme_block_size == 0u ||
         rt.nvme_max_dts_bytes < rt.nvme_block_size ||
@@ -4135,17 +4723,53 @@ static StorageErrorCode probe_one_storage_channel(
     return STORAGE_ERR_NONE;
 }
 
+static void emit_storage_status_snapshots(
+    const StorageHealthSnapshot snapshots[NUM_CHANNELS])
+{
+    uint32_t channel;
+
+    for (channel = 0u; channel < NUM_CHANNELS; ++channel) {
+        const StorageHealthSnapshot *snapshot = &snapshots[channel];
+
+        dbg_status_printf(
+            "storage_status_nvme_capability channel=%u valid=%u"
+            " max_transfer_raw=%u max_transfer_blocks=%u"
+            " max_transfer_bytes=%u logical_block_bytes=%u"
+            " requested_command_bytes=%u effective_command_bytes=%u"
+            " nvme_qd=%u error=%s\n",
+            channel,
+            snapshot->nvme_ready && snapshot->capacity_valid ? 1u : 0u,
+            snapshot->max_transfer_raw,
+            snapshot->max_transfer_blocks,
+            snapshot->max_transfer_bytes,
+            snapshot->logical_block_bytes,
+            snapshot->requested_command_bytes,
+            snapshot->effective_command_bytes,
+            snapshot->nvme_qd,
+            storage_error_string(snapshot->error));
+    }
+}
+
 static uint8_t get_status_query_result(void)
 {
     StorageHealthSnapshot snapshots[NUM_CHANNELS];
-    StorageHealthResult result = storage_health_query(15000000ull, snapshots);
+    uint32_t channel;
+    bool failed = false;
 
-    if (result == STORAGE_HEALTH_OK) return ACK_SUCCESS;
-    if (result == STORAGE_HEALTH_RETRYING) {
-        storage_health_request_refresh();
-        return ACK_RETRYING;
+    memset(snapshots, 0, sizeof(snapshots));
+    for (channel = 0u; channel < NUM_CHANNELS; ++channel) {
+        snapshots[channel].channel = channel;
+        snapshots[channel].error = probe_one_storage_channel(
+            channel, NULL, &snapshots[channel]);
+        if (snapshots[channel].error != STORAGE_ERR_NONE ||
+            !snapshots[channel].pcie_link ||
+            !snapshots[channel].nvme_ready ||
+            !snapshots[channel].capacity_valid) {
+            failed = true;
+        }
     }
-    return ACK_FAILED;
+    emit_storage_status_snapshots(snapshots);
+    return failed ? ACK_FAILED : ACK_SUCCESS;
 }
 
 void handle_frame(uint8_t *f)
@@ -4495,7 +5119,17 @@ void handle_frame(uint8_t *f)
 
     case CMD_STATUS:
     {
-        uint8_t disk_result = get_status_query_result();
+        uint8_t disk_result;
+
+        if (storage_any_running() || storage_any_live_worker() ||
+            transfer_task.state == RUNNING || g_maintenance_job.active ||
+            g_pending_storage_start.active || g_pending_storage_stop.active ||
+            g_pending_network_stop.active) {
+            disk_result = ACK_RETRYING;
+        } else {
+            disk_result = get_status_query_result();
+        }
+
         dbg_printf("[DBG][PROTO] RX 0x61 disk_check result=0x%02X storage_state=%d transfer_state=%d\n",
                    disk_result, storage_state_summary(), transfer_task.state);
         proto_send_ack(cmd, disk_result);
@@ -4976,9 +5610,6 @@ static int run_ddr_pattern_store_main(int argc, char **argv)
         (void)task_update_status(args.task_no, TASK_FAILED);
         rc = -1;
     }
-    if (rc == 0) {
-        (void)sync_filelist_db_to_flash();
-    }
     dbg_printf("[DBG][MAIN] ddr-pattern-store done rc=%d task=%s idx=%u\n",
                rc,
                args.task_no,
@@ -5166,6 +5797,15 @@ int main(int argc, char **argv)
         }
     }
 
+    if (restore_filelist_db_from_flash() != 0 ||
+        restore_metadata_files_from_flash() != 0) {
+        /* SPI1 is a best-effort persistence replica.  Do not prevent UART
+         * service or NVMe capture from starting when its filesystem or saved
+         * replica is damaged; the runtime database remains authoritative for
+         * this boot. */
+        LOG_WARN("SYSTEM", "SPI1 persisted storage state restore failed; continuing without flash restore");
+    }
+
     if (file_list_init(FILELIST_DB_PATH) != 0) {
         char cwd[PATH_MAX];
         LOG_ERROR("SYSTEM", "Failed to initialize file list database");
@@ -5176,10 +5816,6 @@ int main(int argc, char **argv)
         logger_close();
         return -1;
     }
-    /* Retry only replica publication.  The outbox never replays metadata or
-     * database inserts, so a restart cannot duplicate committed records. */
-    storage_sync_outbox_retry();
-
     LOG_INFO("SYSTEM", "System starting up");
     LOG_INFO("SYSTEM", "UART device: %s", serial_dev);
     LOG_INFO("SYSTEM", "Log database: %s", LOG_DB_PATH);
@@ -5208,7 +5844,7 @@ int main(int argc, char **argv)
         for (channel = 0u; channel < NUM_CHANNELS; ++channel) {
             const ChannelStorageConfig *storage = &config->channels[channel];
             LOG_INFO("SYSTEM",
-                     "Storage channel config: ch=%u pipeline_mode=%s writer_mode=%s legacy_fallback_enabled=0 ring=%" PRIu64 " descriptor=%u command=%u qd=%u active=%u cq_batch=%u writer_policy=%s writer_priority=%u producer_policy=%s producer_priority=%u",
+                     "Storage channel config: ch=%u pipeline_mode=%s writer_mode=%s legacy_fallback_enabled=0 ring=%" PRIu64 " descriptor=%u command=%u qd=%u active=%u cq_batch=%u writer_policy=%s writer_priority=%u producer_policy=%s producer_priority=%u nominal_input_mib_s=%u writer_scheduler_weight=%u producer_scheduler_weight=%u writer_nice=%d producer_nice=%d writer_budget_us=%u busy_poll_us=%u empty_sleep_us=%u",
                      storage->channel,
                      storage->writer_mode == STORAGE_WRITER_CROSS_SLOT
                          ? "cross_slot" : "legacy",
@@ -5223,11 +5859,17 @@ int main(int argc, char **argv)
                      storage->writer_realtime ? "rr" : "other",
                      storage->writer_priority,
                      storage->producer_realtime ? "rr" : "other",
-                     storage->producer_priority);
+                     storage->producer_priority,
+                     storage->nominal_input_mib_s,
+                     storage->writer_scheduler_weight,
+                     storage->producer_scheduler_weight,
+                     storage->writer_nice,
+                     storage->producer_nice,
+                     storage->writer_budget_us,
+                     storage->busy_poll_us,
+                     storage->empty_sleep_us);
         }
     }
-    if (storage_health_start(probe_one_storage_channel, NULL, 5000u) != 0)
-        LOG_ERROR("SYSTEM", "Failed to start background storage health service");
     dbg_printf("[DBG][MAIN] uart1=%s log_db=%s file_db=%s meta_dir=%s\n",
                serial_dev, LOG_DB_PATH, FILELIST_DB_PATH, get_storage_meta_dir());
 
@@ -5271,19 +5913,18 @@ int main(int argc, char **argv)
                 check_task(&storage_tasks[i]);
             }
         }
+        /* All worker event pipes have been drained for this loop.  Only now
+         * may a stable all-channel idle barrier become INPUT_COMPLETE. */
+        storage_service_idle_auto_drain();
         storage_service_pending_start();
         storage_service_pending_stop();
         check_task(&transfer_task);
         service_pending_network_stop();
         service_maintenance_job();
-        storage_health_set_busy(storage_any_live_worker() ||
-                                transfer_task.state == RUNNING ||
-                                g_maintenance_job.active);
     }
 
     /* Unreachable for current daemon-style loop. */
     close(serial_fd);
-    storage_health_stop();
     file_list_close();
     logger_close();
     debug_uart_close();

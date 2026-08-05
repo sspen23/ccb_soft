@@ -11,11 +11,12 @@ typedef struct {
     unsigned completion_count;
     unsigned completion_index;
     unsigned callbacks;
+    uint32_t callback_slots[32];
     unsigned fail_callback;
     int sq_full_once;
     unsigned poll_count;
     unsigned release_after_polls;
-    int release_on_yield;
+    int release_on_sleep;
     uint16_t delayed_cid;
     unsigned yield_count;
     unsigned sleep_count;
@@ -71,15 +72,15 @@ static void sleep_us(void *opaque, uint32_t us)
     Mock *mock = opaque;
     ++mock->sleep_count;
     mock->now_us += us;
+    if (mock->release_on_sleep && mock->completion_count == 0u) {
+        queue_completion(mock, mock->delayed_cid, 0);
+    }
 }
 
 static void yield_cpu(void *opaque)
 {
     Mock *mock = opaque;
     ++mock->yield_count;
-    if (mock->release_on_yield && mock->completion_count == 0u) {
-        queue_completion(mock, mock->delayed_cid, 0);
-    }
 }
 
 static int reset_engine(void *opaque)
@@ -92,7 +93,9 @@ static int reset_engine(void *opaque)
 static int done(void *opaque, const NvmeWriteSlotReq *req)
 {
     Mock *mock = opaque;
-    (void)req;
+    assert(mock->callbacks <
+           sizeof(mock->callback_slots) / sizeof(mock->callback_slots[0]));
+    mock->callback_slots[mock->callbacks] = req->slot;
     ++mock->callbacks;
     return mock->fail_callback ? -1 : 0;
 }
@@ -161,19 +164,85 @@ static void test_multislot_out_of_order_and_budget(void)
     assert(mock.submitted_count == 4u);
     assert(__atomic_load_n(&rt.nvme_active_qd_max, __ATOMIC_ACQUIRE) == 4u);
     assert(mock.callbacks == 0u);
-    queue_completion(&mock, mock.submitted[2], 0);
     queue_completion(&mock, mock.submitted[1], 0);
-    assert(nvme_cross_slot_engine_step(value, 300u, done, &mock) == 0);
-    assert(mock.callbacks == 0u);
-    queue_completion(&mock, mock.submitted[0], 0);
-    assert(nvme_cross_slot_engine_step(value, 300u, done, &mock) == 0);
-    assert(mock.callbacks == 1u);
-    assert(nvme_cross_slot_engine_active(value) == 1u);
     queue_completion(&mock, mock.submitted[3], 0);
     assert(nvme_cross_slot_engine_step(value, 300u, done, &mock) == 0);
+    /* Slot B is complete, but its callback would advance DMA TAILDESC past
+     * the still-NVMe-owned slot A. */
+    assert(mock.callbacks == 0u);
+    queue_completion(&mock, mock.submitted[0], 0);
+    queue_completion(&mock, mock.submitted[2], 0);
+    assert(nvme_cross_slot_engine_step(value, 300u, done, &mock) == 0);
     assert(mock.callbacks == 2u);
+    assert(mock.callback_slots[0] == a.slot);
+    assert(mock.callback_slots[1] == b.slot);
+    assert(nvme_cross_slot_engine_active(value) == 0u);
+    assert(__atomic_load_n(&rt.nvme_active_us, __ATOMIC_ACQUIRE) > 0u);
+    assert(__atomic_load_n(&rt.nvme_active_qd_observed_us,
+                           __ATOMIC_ACQUIRE) > 0u);
+    nvme_cross_slot_engine_destroy(value);
+}
+
+static void test_reused_context_does_not_bypass_older_slot(void)
+{
+    ChannelRuntime rt;
+    Mock mock;
+    NvmeCrossSlotEngine *value;
+    NvmeWriteSlotReq a = request(4u, 1u);
+    NvmeWriteSlotReq b = request(5u, 1u);
+    NvmeWriteSlotReq c = request(6u, 1u);
+
+    memset(&mock, 0, sizeof(mock));
+    value = engine(&rt, &mock);
+    assert(value);
+    assert(nvme_cross_slot_engine_add(value, &a) == 0);
+    assert(nvme_cross_slot_engine_add(value, &b) == 0);
+    assert(nvme_cross_slot_engine_step(value, 1u, done, &mock) == 0);
+    assert(mock.submitted_count == 2u);
+
+    queue_completion(&mock, mock.submitted[0], 0);
+    assert(nvme_cross_slot_engine_step(value, 300u, done, &mock) == 0);
+    assert(mock.callbacks == 1u && mock.callback_slots[0] == a.slot);
+    assert(nvme_cross_slot_engine_add(value, &c) == 0);
+    assert(nvme_cross_slot_engine_step(value, 1u, done, &mock) == 0);
+    assert(mock.submitted_count == 3u);
+
+    /* C reuses A's lower array index, but B still owns the earlier DMA-ring
+     * position and therefore must receive its callback first. */
+    queue_completion(&mock, mock.submitted[2], 0);
+    assert(nvme_cross_slot_engine_step(value, 300u, done, &mock) == 0);
+    assert(mock.callbacks == 1u);
+    queue_completion(&mock, mock.submitted[1], 0);
+    assert(nvme_cross_slot_engine_step(value, 300u, done, &mock) == 0);
+    assert(mock.callbacks == 3u);
+    assert(mock.callback_slots[1] == b.slot);
+    assert(mock.callback_slots[2] == c.slot);
     assert(nvme_cross_slot_engine_active(value) == 0u);
     nvme_cross_slot_engine_destroy(value);
+}
+
+static void test_reset_clears_active_window(void)
+{
+    ChannelRuntime rt;
+
+    memset(&rt, 0, sizeof(rt));
+    rt.nvme_first_submit_us = 1u;
+    rt.nvme_last_completion_us = 2u;
+    rt.nvme_active_qd_integral_us = 3u;
+    rt.nvme_active_qd_observed_us = 4u;
+    rt.nvme_active_us = 5u;
+    rt.nvme_active_qd_last_update_us = 6u;
+    rt.nvme_active_qd_current = 7u;
+    rt.nvme_active_qd_max = 8u;
+    nvme_reset_sw_timing(&rt);
+    assert(rt.nvme_first_submit_us == 0u);
+    assert(rt.nvme_last_completion_us == 0u);
+    assert(rt.nvme_active_qd_integral_us == 0u);
+    assert(rt.nvme_active_qd_observed_us == 0u);
+    assert(rt.nvme_active_us == 0u);
+    assert(rt.nvme_active_qd_last_update_us == 0u);
+    assert(rt.nvme_active_qd_current == 0u);
+    assert(rt.nvme_active_qd_max == 0u);
 }
 
 static void test_completion_failures(void)
@@ -189,6 +258,7 @@ static void test_completion_failures(void)
     queue_completion(&mock, mock.submitted[0], 0);
     queue_completion(&mock, mock.submitted[0], 0);
     assert(nvme_cross_slot_engine_step(value, 300u, done, &mock) != 0);
+    assert(__atomic_load_n(&rt.nvme_cmd_count, __ATOMIC_ACQUIRE) == 1u);
     assert(strcmp(nvme_cross_slot_engine_last_error(value), "duplicate_completion_cid") == 0);
     assert(rt.nvme_primary_error == STORAGE_ERR_DUPLICATE_CID);
     assert(nvme_cross_slot_engine_state(value) == NVME_CROSS_SLOT_ABORT_REQUESTED);
@@ -283,9 +353,9 @@ static void test_stall_policy_and_stats(void)
     value = engine(&rt, &mock);
     assert(nvme_cross_slot_engine_add(value, &req) == 0);
     mock.delayed_cid = 1u;
-    mock.release_on_yield = 1;
+    mock.release_on_sleep = 1;
     assert(nvme_cross_slot_engine_step(value, 300u, done, &mock) == 0);
-    assert(mock.yield_count > 0u && mock.callbacks == 1u);
+    assert(mock.sleep_count > 0u && mock.yield_count == 0u && mock.callbacks == 1u);
     nvme_cross_slot_engine_destroy(value);
 
     memset(&mock, 0, sizeof(mock));
@@ -297,6 +367,78 @@ static void test_stall_policy_and_stats(void)
     assert(mock.submitted_count == 1u);
     assert(nvme_cross_slot_engine_step(value, 25u, done, &mock) == 0);
     assert(mock.submitted_count == 1u);
+    nvme_cross_slot_engine_destroy(value);
+}
+
+static void test_full_validation_is_not_per_completion(void)
+{
+    ChannelRuntime rt;
+    Mock mock;
+    NvmeCrossSlotEngine *value;
+    NvmeCrossSlotStats before;
+    NvmeCrossSlotStats after;
+    NvmeWriteSlotReq req = request(16u, 8u);
+    unsigned i;
+
+    memset(&mock, 0, sizeof(mock));
+    value = engine(&rt, &mock);
+    assert(value && nvme_cross_slot_engine_add(value, &req) == 0);
+    assert(nvme_cross_slot_engine_step(value, 25u, done, &mock) == 0);
+    assert(mock.submitted_count == 4u);
+    nvme_cross_slot_engine_get_stats(value, &before);
+
+    for (i = 0u; i < 4u; ++i) queue_completion(&mock, mock.submitted[i], 0);
+    assert(nvme_cross_slot_engine_step(value, 25u, done, &mock) == 0);
+    assert(mock.submitted_count == 8u);
+    assert(__atomic_load_n(&rt.nvme_cmd_count, __ATOMIC_ACQUIRE) == 0u);
+    for (i = 4u; i < 8u; ++i) queue_completion(&mock, mock.submitted[i], 0);
+    assert(nvme_cross_slot_engine_step(value, 25u, done, &mock) == 0);
+    assert(mock.callbacks == 1u);
+
+    nvme_cross_slot_engine_get_stats(value, &after);
+    assert(after.completion_process_count == 8u);
+    assert(after.full_validation_count - before.full_validation_count <= 2u);
+    assert(__atomic_load_n(&rt.nvme_cmd_count, __ATOMIC_ACQUIRE) == 8u);
+    assert(__atomic_load_n(&rt.nvme_write_bytes_done,
+                           __ATOMIC_ACQUIRE) == 8u * 512u);
+    nvme_cross_slot_engine_destroy(value);
+}
+
+static void test_qd16_submission_and_completion(void)
+{
+    ChannelRuntime rt;
+    Mock mock;
+    NvmeCrossSlotEngine *value;
+    NvmeCrossSlotConfig value_config = config();
+    NvmeCrossSlotOps ops = { submit, poll_completion, monotonic_us, sleep_us,
+                             yield_cpu, reset_engine };
+    NvmeWriteSlotReq req = request(17u, 16u);
+    unsigned i;
+
+    memset(&mock, 0, sizeof(mock));
+    memset(&rt, 0, sizeof(rt));
+    rt.dma_desc_count = 32u;
+    rt.nvme_qd_effective = 16u;
+    rt.nvme_cmd_sectors = 1u;
+    value_config.target_qd = 16u;
+    value_config.cq_batch = 16u;
+    value = nvme_cross_slot_engine_create_with_ops_config(
+        &rt, &value_config, &ops, &mock);
+    assert(value && nvme_cross_slot_engine_add(value, &req) == 0);
+    assert(nvme_cross_slot_engine_step(value, 25u, done, &mock) == 0);
+    assert(mock.submitted_count == 16u);
+    assert(nvme_cross_slot_engine_inflight(value) == 16u);
+    assert(__atomic_load_n(&rt.nvme_active_qd_max, __ATOMIC_ACQUIRE) == 16u);
+
+    for (i = 0u; i < 16u; ++i)
+        queue_completion(&mock, mock.submitted[i], 0);
+    assert(nvme_cross_slot_engine_step(value, 25u, done, &mock) == 0);
+    assert(mock.completion_index == 16u);
+    assert(nvme_cross_slot_engine_inflight(value) == 0u);
+    assert(mock.callbacks == 1u);
+    assert(__atomic_load_n(&rt.nvme_cmd_count, __ATOMIC_ACQUIRE) == 16u);
+    assert(__atomic_load_n(&rt.nvme_last_completion_us,
+                           __ATOMIC_ACQUIRE) != 0u);
     nvme_cross_slot_engine_destroy(value);
 }
 
@@ -464,10 +606,14 @@ static void test_submit_acceptance_unknown_retains_cid_until_completion(void)
 
 int main(void)
 {
+    test_reset_clears_active_window();
     test_multislot_out_of_order_and_budget();
+    test_reused_context_does_not_bypass_older_slot();
     test_completion_failures();
     test_capacity_sq_full_and_callback();
     test_stall_policy_and_stats();
+    test_full_validation_is_not_per_completion();
+    test_qd16_submission_and_completion();
     test_no_progress_timeout();
     test_abort_reset_and_submit_failure();
     test_multislot_error_drains_without_callbacks();

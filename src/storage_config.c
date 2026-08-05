@@ -184,14 +184,13 @@ static int parse_legacy_us(const char *name, const char *value, uint32_t *out,
 
 static int parse_log_level(const char *value, CcbLogLevel *out)
 {
-    if (!value || value[0] == '\0' || strcmp(value, "info") == 0 ||
-        strcmp(value, "summary") == 0) {
-        *out = CCB_LOG_INFO;
+    if (!value || value[0] == '\0' || strcmp(value, "error") == 0 ||
+        strcmp(value, "critical") == 0 || strcmp(value, "quiet") == 0) {
+        *out = CCB_LOG_ERROR;
         return 0;
     }
-    if (strcmp(value, "error") == 0 || strcmp(value, "critical") == 0 ||
-        strcmp(value, "quiet") == 0) {
-        *out = CCB_LOG_ERROR;
+    if (strcmp(value, "info") == 0 || strcmp(value, "summary") == 0) {
+        *out = CCB_LOG_INFO;
         return 0;
     }
     if (strcmp(value, "perf") == 0) {
@@ -207,9 +206,31 @@ static int parse_log_level(const char *value, CcbLogLevel *out)
 
 static int parse_profile(const char *value, StorageProfile *out)
 {
-    if (!value || value[0] == '\0' || strcmp(value, "PERF_QD8") == 0 ||
+    if (!value || value[0] == '\0') {
+        *out = STORAGE_PROFILE_CROSS_SLOT_EXPERIMENTAL;
+        return 0;
+    }
+    if (strcmp(value, "LEGACY_FAST_BASELINE") == 0 ||
+        strcmp(value, "legacy_fast_baseline") == 0 ||
+        strcmp(value, "legacy") == 0) {
+        *out = STORAGE_PROFILE_LEGACY_FAST_BASELINE;
+        return 0;
+    }
+    if (strcmp(value, "PERF_QD8") == 0 ||
         strcmp(value, "perf_qd8") == 0 || strcmp(value, "perf") == 0) {
         *out = STORAGE_PROFILE_PERF_QD8;
+        return 0;
+    }
+    if (strcmp(value, "CROSS_SLOT_EXPERIMENTAL") == 0 ||
+        strcmp(value, "cross_slot_experimental") == 0 ||
+        strcmp(value, "cross_slot") == 0) {
+        *out = STORAGE_PROFILE_CROSS_SLOT_EXPERIMENTAL;
+        return 0;
+    }
+    if (strcmp(value, "CROSS_SLOT_QD16_EXPERIMENTAL") == 0 ||
+        strcmp(value, "cross_slot_qd16_experimental") == 0 ||
+        strcmp(value, "cross_slot_qd16") == 0) {
+        *out = STORAGE_PROFILE_CROSS_SLOT_QD16_EXPERIMENTAL;
         return 0;
     }
     if (strcmp(value, "SAFE_QD1") == 0 || strcmp(value, "safe_qd1") == 0 ||
@@ -224,30 +245,66 @@ static void set_channel_profile(AppConfig *config)
 {
     uint32_t channel;
     const bool safe = config->storage_profile == STORAGE_PROFILE_SAFE_QD1;
+    const bool cross_slot =
+        config->storage_profile == STORAGE_PROFILE_PERF_QD8 ||
+        config->storage_profile == STORAGE_PROFILE_CROSS_SLOT_EXPERIMENTAL ||
+        config->storage_profile == STORAGE_PROFILE_CROSS_SLOT_QD16_EXPERIMENTAL;
+    const bool qd16 =
+        config->storage_profile == STORAGE_PROFILE_CROSS_SLOT_QD16_EXPERIMENTAL;
 
     for (channel = 0u; channel < NUM_CHANNELS; ++channel) {
         ChannelStorageConfig *storage = &config->channels[channel];
 
         memset(storage, 0, sizeof(*storage));
         storage->channel = channel;
-        storage->writer_mode = channel == LOW_SPEED_CHANNEL_ID
-                                   ? STORAGE_WRITER_LEGACY
-                                   : STORAGE_WRITER_CROSS_SLOT;
+        storage->writer_mode = cross_slot && channel != LOW_SPEED_CHANNEL_ID
+                                   ? STORAGE_WRITER_CROSS_SLOT
+                                   : STORAGE_WRITER_LEGACY;
         storage->ring_bytes = channel == LOW_SPEED_CHANNEL_ID
                                   ? CHANNEL2_DDR_BYTES
                                   : CHANNEL0_DDR_BYTES;
         storage->descriptor_bytes = channel == LOW_SPEED_CHANNEL_ID
                                         ? 16u * MIB
                                         : 8u * MIB;
-        storage->command_bytes = 256u * 1024u;
-        storage->nvme_qd = safe ? 1u : 8u;
-        storage->max_active_slots = safe ? 1u :
+        /* PERF halves command/doorbell traffic.  The hardware layer clamps
+         * this request to the SSD-reported MaxTransferSize before use. */
+        storage->command_bytes = (safe ? 256u : 512u) * 1024u;
+        storage->nvme_qd = safe ? 1u :
+                           (qd16 && channel != LOW_SPEED_CHANNEL_ID ? 16u : 8u);
+        storage->max_active_slots = safe || !cross_slot ? 1u :
                                     (channel == LOW_SPEED_CHANNEL_ID ? 1u : 4u);
-        storage->cq_batch = safe ? 1u : 8u;
+        storage->cq_batch = safe ? 1u : storage->nvme_qd;
         storage->writer_realtime = false;
         storage->writer_priority = 0u;
         storage->producer_realtime = false;
         storage->producer_priority = 0u;
+        storage->nominal_input_mib_s = channel == LOW_SPEED_CHANNEL_ID
+                                          ? 80u : 1200u;
+        storage->producer_scheduler_weight = channel == LOW_SPEED_CHANNEL_ID
+                                                 ? 1u : 15u;
+        storage->writer_scheduler_weight = storage->producer_scheduler_weight;
+        storage->producer_nice = 0;
+        storage->writer_nice = 0;
+        if (safe) {
+            storage->writer_budget_us = 300u;
+            storage->busy_poll_us = 20u;
+            storage->empty_sleep_us = 1u;
+        } else if (cross_slot && channel == LOW_SPEED_CHANNEL_ID) {
+            /* The producer follows the 1200:80 ingress ratio.  The legacy
+             * writer needs a larger service floor so its QD8 queue is not
+             * starved by the two cross-slot writers. */
+            storage->writer_scheduler_weight = 3u;
+            storage->producer_scheduler_weight = 1u;
+            storage->writer_nice = 2;
+            storage->producer_nice = 6;
+            storage->writer_budget_us = 300u;
+            storage->busy_poll_us = 20u;
+            storage->empty_sleep_us = 1u;
+        } else {
+            storage->writer_budget_us = 1000u;
+            storage->busy_poll_us = 50u;
+            storage->empty_sleep_us = 5u;
+        }
     }
 }
 
@@ -264,6 +321,7 @@ int storage_config_load(AppConfig *out, char *error, size_t error_size)
              value && value[0] != '\0' ? value : DEFAULT_UART_DEVICE);
 
     value = read_primary_or_legacy("CCB_LOG_LEVEL", "SRC_REAL_LOG_LEVEL");
+    out->log_enabled = value && value[0] != '\0';
     if (parse_log_level(value, &out->log_level) != 0) {
         if (error && error_size != 0u)
             snprintf(error, error_size, "invalid CCB_LOG_LEVEL=%s", value);
@@ -363,7 +421,16 @@ const ChannelStorageConfig *storage_config_channel(const AppConfig *config,
 
 const char *storage_config_profile_name(StorageProfile profile)
 {
-    return profile == STORAGE_PROFILE_SAFE_QD1 ? "SAFE_QD1" : "PERF_QD8";
+    switch (profile) {
+    case STORAGE_PROFILE_SAFE_QD1: return "SAFE_QD1";
+    case STORAGE_PROFILE_LEGACY_FAST_BASELINE: return "LEGACY_FAST_BASELINE";
+    case STORAGE_PROFILE_PERF_QD8: return "PERF_QD8";
+    case STORAGE_PROFILE_CROSS_SLOT_EXPERIMENTAL:
+        return "CROSS_SLOT_EXPERIMENTAL";
+    case STORAGE_PROFILE_CROSS_SLOT_QD16_EXPERIMENTAL:
+        return "CROSS_SLOT_QD16_EXPERIMENTAL";
+    default: return "UNKNOWN";
+    }
 }
 
 const char *storage_config_log_level_name(CcbLogLevel level)

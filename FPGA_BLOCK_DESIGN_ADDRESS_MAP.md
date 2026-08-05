@@ -146,7 +146,7 @@
   - DDR CPU-visible size: 64 MiB
   - DDR DMA/NVMe hardware-view base: 0x00000000
   - DDR DMA/NVMe hardware-view range: 2 GiB
-  - 软件默认 ring: 1 GiB
+  - 软件默认 ring: 2 GiB
   - 软件允许最大 ring: 2 GiB
   - 默认 DMA descriptor payload: 16 MiB
 
@@ -161,7 +161,7 @@
   - DDR CPU-visible size: 64 MiB
   - DDR DMA/NVMe hardware-view base: 0x00000000
   - DDR DMA/NVMe hardware-view range: 2 GiB
-  - 软件默认 ring: 1 GiB
+  - 软件默认 ring: 2 GiB
   - 软件允许最大 ring: 2 GiB
   - 默认 DMA descriptor payload: 16 MiB
 
@@ -183,7 +183,7 @@
   CPU 看到的 DDR 地址和 DMA/NVMe 看到的 DDR 地址不同。
   CPU 只能 mmap 每通道低 64 MiB。
   DMA descriptor 和 NVMe PRP 必须使用硬件视角地址，也就是 0x00000000 + offset。
-  不能用 CPU 地址判断整个 1 GiB / 2 GiB ring 是否正常。
+  不能用 CPU 地址判断整个 2 GiB ring 是否正常。
 
   ------------------------------------------------------------
   NVMe Host Core
@@ -311,7 +311,7 @@
   1. 上游是 ADC/Aurora 数据流，无法由软件反压或降速。
   2. 如果平均输入速率大于 SSD 写盘速率，DDR ring 迟早会满。
   3. ch0/ch1 当前输入速率约每通道 1.5 GB/s。
-  4. ch0/ch1 软件默认只使用低 1 GiB DDR ring，但可通过环境变量改成 2 GiB。
+  4. ch0/ch1 软件默认使用完整 2 GiB DDR ring。
   5. 当前测试中 raw DDR-to-NVMe 写 64 MiB 大约 65~76 ms，说明纯 DDR->NVMe->SSD 路径可达到约 0.8~1.0 GB/s 级别。
   6. 连续采集路径中，ch0/ch1 仍可能出现 ring_full_count，说明采集写入 DDR 的速度长期高于后台 NVMe drain 速度。
   7. 当前瓶颈更可能在连续采集路径的 DMA ring、DDR 竞争、worker 调度、NVMe Host Core/SSD 持续写组合，而不是单次 raw NVMe 写能力。

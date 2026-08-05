@@ -7,8 +7,7 @@
  * Compared with the older bare-metal table in src_mb, the device tree is the
  * authority here for MMIO bases and descriptor BRAM CPU addresses. The
  * channel DDR CPU windows are only 64 MiB each, while DMA/NVMe are connected
- * to wider data-buffer DDR windows. ch0/ch1 are clamped by software to the
- * stable low 1 GiB window; larger environment requests are rejected at runtime.
+ * to the full 2 GiB ch0/ch1 data-buffer DDR windows.
  *
  * Descriptor BRAM uses the device-tree CPU address for /dev/mem access, while
  * AXI DMA still uses the old descriptor hardware-view base 0x10000000.
@@ -41,7 +40,8 @@ const ChannelConfig kChannels[NUM_CHANNELS] = {
         .dma_base = 0xa0060000ull,
         .axis_switch_base = 0xa0070000ull,
         .nvme_base = 0xa0080000ull,
-        .pcie_bridge_base = 0xd0000000ull,
+        /* 0xd0000000 is the ch1 DDR CPU window, not PCIe bridge control. */
+        .pcie_bridge_base = 0ull,
         .desc_cpu_base = 0x30000000ull,
         .desc_dma_base = 0x10000000ull,
         .desc_cpu_size = 0x4000ull,

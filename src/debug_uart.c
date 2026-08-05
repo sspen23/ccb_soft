@@ -179,6 +179,20 @@ void debug_uart_close(void)
     g_debug_fd = -1;
 }
 
+void debug_uart_write(const char *data, size_t len)
+{
+    ssize_t written;
+
+    if (!data || len == 0u) {
+        return;
+    }
+    if (g_debug_fd < 0 && debug_uart_init() != 0) {
+        return;
+    }
+    written = write(g_debug_fd, data, len);
+    (void)written;
+}
+
 void dbg_printf(const char *fmt, ...)
 {
     char buf[DEBUG_BUF_BYTES];
@@ -197,6 +211,34 @@ void dbg_printf(const char *fmt, ...)
     n = vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
 
+    if (n <= 0) {
+        return;
+    }
+    if (n > (int)sizeof(buf)) {
+        n = (int)sizeof(buf);
+    }
+    written = write(g_debug_fd, buf, (size_t)n);
+    (void)written;
+}
+
+void dbg_status_printf(const char *fmt, ...)
+{
+    const AppConfig *config = storage_config_get();
+    char buf[DEBUG_BUF_BYTES];
+    va_list ap;
+    int n;
+    ssize_t written;
+
+    if (!fmt || !config || !config->log_enabled ||
+        config->log_level == CCB_LOG_ERROR) {
+        return;
+    }
+    if (g_debug_fd < 0 && debug_uart_init() != 0) {
+        return;
+    }
+    va_start(ap, fmt);
+    n = vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
     if (n <= 0) {
         return;
     }

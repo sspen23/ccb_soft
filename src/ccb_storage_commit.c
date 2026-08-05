@@ -42,9 +42,11 @@ static int rollback_failure(StorageCommitState *state, const char *task_id,
     return -1;
 }
 
-int storage_commit_run_once(StorageCommitState *state, const char *task_id,
-                            const StorageCommitItem *items, size_t count,
-                            const StorageCommitOps *ops)
+int storage_commit_run_once_status(StorageCommitState *state,
+                                   const char *task_id,
+                                   const StorageCommitItem *items,
+                                   size_t count, TaskStatus final_status,
+                                   const StorageCommitOps *ops)
 {
     size_t i;
     size_t metadata_count = 0u;
@@ -59,7 +61,8 @@ int storage_commit_run_once(StorageCommitState *state, const char *task_id,
         count > NUM_CHANNELS || !ops || !ops->db_begin || !ops->record_exists ||
         !ops->metadata_write || !ops->record_insert || !ops->record_count ||
         !ops->task_total_update || !ops->task_status_update || !ops->db_commit ||
-        !ops->db_rollback) {
+        !ops->db_rollback ||
+        (final_status != TASK_COMPLETED && final_status != TASK_FAILED)) {
         set_reason(state, "invalid_commit_input");
         return -1;
     }
@@ -99,9 +102,12 @@ int storage_commit_run_once(StorageCommitState *state, const char *task_id,
         return rollback_failure(state, task_id, items, metadata_count, ops,
                                 transaction_open, "total_files_update_failed");
     }
-    if (ops->task_status_update(ops->ctx, task_id, TASK_COMPLETED) != 0) {
+    if (ops->task_status_update(ops->ctx, task_id, final_status) != 0) {
         return rollback_failure(state, task_id, items, metadata_count, ops,
-                                transaction_open, "task_completed_update_failed");
+                                transaction_open,
+                                final_status == TASK_COMPLETED
+                                    ? "task_completed_update_failed"
+                                    : "task_failed_update_failed");
     }
     if (ops->db_commit(ops->ctx) != 0) {
         return rollback_failure(state, task_id, items, metadata_count, ops,
@@ -134,4 +140,12 @@ int storage_commit_run_once(StorageCommitState *state, const char *task_id,
     state->success = true;
     set_reason(state, "none");
     return 0;
+}
+
+int storage_commit_run_once(StorageCommitState *state, const char *task_id,
+                            const StorageCommitItem *items, size_t count,
+                            const StorageCommitOps *ops)
+{
+    return storage_commit_run_once_status(state, task_id, items, count,
+                                          TASK_COMPLETED, ops);
 }

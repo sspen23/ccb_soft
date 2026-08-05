@@ -187,6 +187,15 @@ static void test_ring_pressure_policy_is_bounded(void)
                                              100000u, true));
     assert(!storage_ring_pressure_should_stop(2u, 1000u, 101000u,
                                               100000u, false));
+    assert(!storage_ring_pressure_requires_degraded_drain(1u, false));
+    assert(storage_ring_pressure_requires_degraded_drain(2u, false));
+    assert(storage_ring_pressure_requires_degraded_drain(3u, false));
+    assert(!storage_ring_pressure_requires_degraded_drain(2u, true));
+    assert(storage_receive_failure_allows_drain(true, false, false, false));
+    assert(storage_receive_failure_allows_drain(false, true, false, false));
+    assert(!storage_receive_failure_allows_drain(false, false, false, false));
+    assert(!storage_receive_failure_allows_drain(true, false, true, false));
+    assert(!storage_receive_failure_allows_drain(true, false, false, true));
 }
 
 static void test_short_perf_window_is_invalid(void)
